@@ -1,0 +1,39 @@
+1.MediaMTX 的绝对路径（一字不能差）
+我的路径是：F:\programming projiect\SmallTerm\sophomore\MediaMIX\mediamtx.exe
+你们需要修改这个路径（就是看mediamtx.exe在哪里）
+
+2.FFmpeg 必须加到系统环境变量（且必须生效）
+必须保证 PyCharm 里的 Python 进程能找到 ffmpeg 命令。
+
+3.保证安装了opencv-python
+
+4.注意端口占用问题，如果出现端口占用，修改端口或者在任务管理器把占用端口的关掉（可能是mediamtx之前运行的没关掉）
+
+5.最后运行stream_core.py结果应该如下（我没有放test.mp4视频，所以最后拉流失败）：
+C:\Users\Lenovo\Desktop\car-vision-agent-system\venv-vision\Scripts\python.exe C:\Users\Lenovo\Desktop\car-vision-agent-system\stream_core.py 
+2026/07/07 11:26:34 INF MediaMTX v1.19.2, windows, amd64
+2026/07/07 11:26:34 INF configuration loaded from F:\programming projiect\SmallTerm\sophomore\MediaMIX\mediamtx.yml
+2026/07/07 11:26:34 INF [RTSP] started with listeners on :8554 (TCP/RTSP), :8000 (UDP/RTP), :8001 (UDP/RTCP)
+2026/07/07 11:26:34 INF [RTMP] started with listener on :1935 (TCP/RTMP)
+2026/07/07 11:26:34 INF [HLS] started with listener on :8888 (TCP/HTTP)
+2026/07/07 11:26:34 INF [WebRTC] started with listeners on :8889 (TCP/HTTP), :8189 (UDP/ICE)
+2026/07/07 11:26:34 INF [SRT] started with listener on :8890 (UDP/SRT)
+2026/07/07 11:26:34 INF [MoQ] started with listeners on :8892 (TCP/HTTP2), :8892 (UDP/HTTP3)
+✅ MediaMTX 启动成功，PID为: 36760
+✅ FFmpeg 开始推流，地址: rtsp://127.0.0.1:8554/test
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52524] opened
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52524] closed: no stream is available on path 'test'
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52525] opened
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52525] closed: no stream is available on path 'test'
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52526] opened
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52526] closed: no stream is available on path 'test'
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52527] opened
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52527] closed: invalid HTTP request
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52528] opened
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52528] closed: no stream is available on path 'test'
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52529] opened
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52529] closed: invalid HTTP request
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52531] opened
+2026/07/07 11:26:41 INF [RTSP] [conn 127.0.0.1:52531] closed: invalid HTTP request
+❌ 拉流失败，请检查是否已有视频在推流。
+[rtsp @ 00000205df067100] method DESCRIBE failed: 404 Not Found
