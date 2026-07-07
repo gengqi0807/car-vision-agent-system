@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_name: str = Field(default="Car Vision Agent System")
     app_env: str = Field(default="development")
@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     llm_api_base: str = Field(default="")
     llm_api_key: str = Field(default="")
     allowed_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    hyperlpr_detect_level: str = Field(default="high")
+    hyperlpr_home_dir: str = Field(default="runtime")
+    plate_confidence_threshold: float = Field(default=0.5)
+    plate_history_limit: int = Field(default=50)
+    plate_save_uploads: bool = Field(default=False)
+    plate_upload_dir: str = Field(default="uploads/plate")
 
 
 @lru_cache
