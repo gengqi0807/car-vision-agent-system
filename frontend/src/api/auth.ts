@@ -12,6 +12,21 @@ export interface RegisterPayload {
   phone?: string;
 }
 
+export interface EmailCodePayload {
+  email: string;
+}
+
+export interface EmailLoginPayload {
+  email: string;
+  code: string;
+}
+
+export interface UpdateProfilePayload {
+  username: string;
+  email?: string;
+  phone?: string;
+}
+
 export interface UserProfile {
   id: number;
   username: string;
@@ -31,3 +46,6 @@ export interface LoginResponse {
 export const loginApi = (payload: LoginPayload) => request.post<LoginResponse>("/auth/login", payload);
 export const registerApi = (payload: RegisterPayload) => request.post<UserProfile>("/auth/register", payload);
 export const fetchProfileApi = () => request.get<UserProfile>("/auth/me");
+export const sendEmailCodeApi = (payload: EmailCodePayload) => request.post("/auth/email-code", payload);
+export const emailLoginApi = (payload: EmailLoginPayload) => request.post<LoginResponse>("/auth/email-login", payload);
+export const updateProfileApi = (payload: UpdateProfilePayload) => request.put<UserProfile>("/auth/profile", payload);

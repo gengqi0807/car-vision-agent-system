@@ -15,6 +15,21 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class EmailCodeRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=128)
+
+
+class EmailLoginRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=128)
+    code: str = Field(min_length=4, max_length=6)
+
+
+class UpdateProfileRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+    email: str | None = Field(default=None, max_length=128)
+    phone: str | None = Field(default=None, max_length=20)
+
+
 class UserProfile(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

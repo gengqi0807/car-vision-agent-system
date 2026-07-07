@@ -45,6 +45,16 @@ class Settings(BaseSettings):
     llm_api_base: str = Field(default="")
     llm_api_key: str = Field(default="")
 
+    # ---------- 邮件验证码配置 ----------
+    smtp_host: str = Field(default="smtp.163.com")
+    smtp_port: int = Field(default=465)
+    smtp_user: str = Field(default="")
+    smtp_password: str = Field(default="")
+    smtp_sender_name: str = Field(default="Car Vision System")
+    smtp_use_ssl: bool = Field(default=True)
+    email_code_expire_minutes: int = Field(default=5)
+    email_code_cooldown_seconds: int = Field(default=60)
+
     allowed_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
     hyperlpr_detect_level: str = Field(default="high")
     hyperlpr_home_dir: str = Field(default="runtime")
