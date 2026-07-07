@@ -13,8 +13,11 @@
 - Backend engine: the project now uses `HyperLPR3`, a Chinese license plate recognition framework that can be installed directly with `pip`.
 - Model files: `hyperlpr3` packages its own runtime assets, so you do not need to place a separate `.pt` file under `backend/weights`.
 - Runtime cache: the first import writes model assets under `backend/runtime/.hyperlpr3`. You can change that with `HYPERLPR_HOME_DIR`.
-- Detection level: set `HYPERLPR_DETECT_LEVEL=high` for better accuracy or `low` for faster CPU inference.
+- Detection level: set `HYPERLPR_DETECT_LEVEL=low` for faster CPU inference or `high` for better recall.
+- Large image optimization: `PLATE_MAX_IMAGE_SIDE=1600` downsizes oversized uploads before inference and maps boxes back to the original image.
 - Confidence threshold: set `PLATE_CONFIDENCE_THRESHOLD` to filter weak recognition results.
+- RTSP stream: the backend can pull an RTSP stream and push processed frames through `/api/v1/plate/ws/stream`.
+- Stream performance: tune `PLATE_STREAM_MAX_FPS`, `PLATE_STREAM_PROCESS_EVERY_N_FRAMES`, and `PLATE_STREAM_JPEG_QUALITY` for latency and CPU usage.
 - History: recognized plates are stored in `plate_records` and exposed via `/api/v1/plate/history`.
 - Optional upload retention: set `PLATE_SAVE_UPLOADS=true` to keep original uploaded images under `backend/uploads/plate`.
 
