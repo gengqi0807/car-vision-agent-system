@@ -1,36 +1,23 @@
 <template>
-  <div class="layout">
-    <aside class="sidebar card">
-      <div>
-        <p class="brand-kicker">CMS</p>
-        <h1>智能车载视觉感知与交互系统</h1>
-      </div>
-      <nav class="nav">
-        <RouterLink v-for="item in navItems" :key="item.to" class="nav-link" :to="item.to">
-          <span class="status-dot"></span>
-          <span>{{ item.label }}</span>
-        </RouterLink>
-      </nav>
-      <div class="sidebar-footer">
-        <p class="muted">Day 1 基础框架</p>
-        <p>当前阶段以页面骨架与接口联调为主</p>
-      </div>
-    </aside>
+  <div class="app-shell">
+    <header class="top-nav">
+      <span class="brand">Car Vision System</span>
+      <RouterLink
+        v-for="item in navItems"
+        :key="item.to"
+        :to="item.to"
+        class="nav-link"
+        :class="{ active: route.name === item.name }"
+      >
+        {{ item.label }}
+      </RouterLink>
+      <span class="spacer"></span>
+      <button type="button" class="avatar" title="退出登录" @click="logout">
+        {{ avatarText }}
+      </button>
+    </header>
 
-    <main class="main">
-      <header class="topbar card">
-        <div>
-          <p class="muted">Vehicle Vision Workspace</p>
-          <h2>{{ pageTitle }}</h2>
-        </div>
-        <div class="topbar-actions">
-          <div class="status-chip">
-            <span class="status-dot"></span>
-            <span>系统在线</span>
-          </div>
-          <button class="ghost-btn" type="button" @click="logout">退出</button>
-        </div>
-      </header>
+    <main class="main-content">
       <RouterView />
     </main>
   </div>
@@ -40,145 +27,111 @@
 import { computed } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
+import { useUserStore } from "../stores/user";
+
 const route = useRoute();
 const router = useRouter();
+const userStore = useUserStore();
 
 const navItems = [
-  { label: "系统总览", to: "/" },
-  { label: "车牌识别", to: "/plate-recognition" },
-  { label: "交警手势", to: "/police-gesture" },
-  { label: "车主手势控车", to: "/owner-gesture" },
-  { label: "告警监控", to: "/alert-monitor" }
+  { label: "仪表盘", to: "/", name: "dashboard" },
+  { label: "车牌识别", to: "/plate-recognition", name: "plate-recognition" },
+  { label: "交警手势", to: "/police-gesture", name: "police-gesture" },
+  { label: "手势控车", to: "/owner-gesture", name: "owner-gesture" },
+  { label: "告警监控", to: "/alert-monitor", name: "alert-monitor" }
 ];
 
-const titleMap: Record<string, string> = {
-  dashboard: "系统总览",
-  "plate-recognition": "道路车辆车牌识别",
-  "police-gesture": "交警手势识别",
-  "owner-gesture": "车主手势控车",
-  "alert-monitor": "日志监控与告警智能体"
-};
-
-const pageTitle = computed(() => titleMap[String(route.name)] ?? "智能车载视觉平台");
+const avatarText = computed(() => {
+  const base = (userStore.username || "A").trim();
+  return base.slice(0, 1).toUpperCase();
+});
 
 function logout() {
-  localStorage.removeItem("cvms_token");
+  userStore.logout();
   router.push({ name: "login" });
 }
 </script>
 
 <style scoped lang="scss">
-.layout {
-  display: grid;
-  grid-template-columns: 300px 1fr;
+.app-shell {
+  max-width: 1360px;
   min-height: 100vh;
-  gap: 20px;
-  padding: 20px;
+  margin: 0 auto;
+  padding: 24px 32px;
 }
 
-.sidebar,
-.topbar {
-  padding: 24px;
-}
-
-.sidebar {
-  display: grid;
+.top-nav {
+  display: flex;
+  align-items: center;
   gap: 28px;
-  align-content: start;
+  margin-bottom: 28px;
+  padding: 14px 28px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  flex-wrap: wrap;
 }
 
-.brand-kicker {
-  margin: 0 0 8px;
-  color: var(--accent);
-  letter-spacing: 0.28em;
-  font-size: 12px;
-  text-transform: uppercase;
-}
-
-.sidebar h1,
-.topbar h2 {
-  margin: 0;
-}
-
-.nav {
-  display: grid;
-  gap: 10px;
+.brand {
+  margin-right: 16px;
+  font-size: 19px;
+  font-weight: 700;
+  cursor: default;
 }
 
 .nav-link {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 14px 16px;
-  border: 1px solid transparent;
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.02);
+  padding: 4px 0;
+  font-size: 14px;
+  color: var(--muted);
+  border-bottom: 2px solid transparent;
   transition: 0.2s ease;
 }
 
-.nav-link.router-link-active {
-  border-color: rgba(45, 212, 191, 0.3);
-  background: var(--accent-soft);
+.nav-link:hover {
+  color: var(--text-soft);
 }
 
-.sidebar-footer {
-  padding: 18px;
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.03);
+.nav-link.active {
+  color: var(--accent);
+  font-weight: 600;
+  border-bottom-color: var(--accent);
 }
 
-.sidebar-footer p {
-  margin: 0;
+.spacer {
+  flex: 1;
 }
 
-.sidebar-footer p + p {
-  margin-top: 8px;
-}
-
-.main {
-  display: grid;
-  gap: 20px;
-  align-content: start;
-}
-
-.topbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.topbar-actions {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-.status-chip,
-.ghost-btn {
+.avatar {
+  width: 36px;
+  height: 36px;
   display: inline-flex;
   align-items: center;
-  gap: 10px;
-  height: 42px;
-  padding: 0 16px;
-  border-radius: 999px;
-}
-
-.status-chip {
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--line);
-}
-
-.ghost-btn {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: transparent;
-  color: var(--text);
+  justify-content: center;
+  color: #8a7a6a;
+  font-size: 14px;
+  font-weight: 600;
+  background: #f0ece5;
+  border-radius: 50%;
   cursor: pointer;
 }
 
-@media (max-width: 1080px) {
-  .layout {
-    grid-template-columns: 1fr;
+.avatar:hover {
+  background: #e5ddd5;
+}
+
+@media (max-width: 720px) {
+  .app-shell {
+    padding: 20px 16px;
+  }
+
+  .top-nav {
+    gap: 16px;
+    padding: 14px 16px;
+  }
+
+  .brand {
+    width: 100%;
+    margin-right: 0;
   }
 }
 </style>
