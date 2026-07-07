@@ -12,17 +12,17 @@ class StreamManager:
             raise FileNotFoundError(f"FFmpeg 路径不存在，请修改 self.ffmpeg_path: {self.ffmpeg_path}")
 
     def start_mediamtx(self):
-        process = subprocess.Popen(
+        self.mediamtx_process = subprocess.Popen(
             self.mediamtx_path,
             cwd=os.path.dirname(self.mediamtx_path),
             stderr=subprocess.PIPE,
             creationflags=subprocess.CREATE_NO_WINDOW
         )
         time.sleep(1.5)
-        if process.poll() is None:
-            print("✅ MediaMTX 启动成功，PID为:", process.pid)
+        if self.mediamtx_process.poll() is None:
+            print("✅ MediaMTX 启动成功，PID为:", self.mediamtx_process.pid)
         else:
-            stderr_output = process.stderr.read().decode("utf-8", errors="replace")
+            stderr_output = self.mediamtx_process.stderr.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"MediaMTX 启动失败，错误原因:\n{stderr_output}")
 
     def start_push(self, video_source, stream_name="carview"):
@@ -57,5 +57,14 @@ if __name__ == "__main__":
     manager.start_mediamtx()
     time.sleep(2)
     manager.start_push(video_source="test.mp4", stream_name="test")
-    time.sleep(3)
-    manager.test_pull_stream()
+    print("🚀 推流服务已启动，按 Ctrl+C 停止...")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n正在停止服务...")
+        manager.mediamtx_process.terminate()
+        manager.ffmpeg_process.terminate()
+        manager.mediamtx_process.wait()
+        manager.ffmpeg_process.wait()
+        print("✅ 所有子进程已终止。")
