@@ -7,7 +7,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from app.models_infer import MediaPipeHands
+from app.models_infer import MediaPipeHands, GestureClassifier
 from app.schemas.gesture import ControlPanelState, GestureFrameResult, Keypoint
 
 logger = logging.getLogger(__name__)
@@ -17,6 +17,7 @@ class OwnerGestureService:
     """Owner (in-cabin) gesture service backed by MediaPipe Hands."""
 
     _hands: Optional[MediaPipeHands] = None
+    _classifier: Optional[GestureClassifier] = None
 
     # ------------------------------------------------------------------
     # Lazy-load helpers
@@ -30,6 +31,12 @@ class OwnerGestureService:
             self._hands = MediaPipeHands()
             logger.info("OwnerGestureService – MediaPipeHands loaded")
         return self._hands
+
+    @property
+    def classifier(self) -> GestureClassifier:
+        if self._classifier is None:
+            self._classifier = GestureClassifier()
+        return self._classifier
 
     # ------------------------------------------------------------------
     # Public API
@@ -58,16 +65,25 @@ class OwnerGestureService:
 
         result = self.hands.infer(frame)
 
+        raw_kps = result["keypoints"]
+        num_hands = result.get("num_hands_detected", 0)
+
+        # ----- Rule-based gesture classification -----
+        cls_result = self.classifier.classify(raw_kps, domain="owner")
+        gesture_label = cls_result["gesture"]
+        cls_conf = cls_result["confidence"]
+        if num_hands == 0:
+            gesture_label = "未检测到手部"
+            cls_conf = 0.0
+
         keypoints = [
             Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0))
-            for kp in result["keypoints"]
+            for kp in raw_kps
         ]
-        num_hands = result.get("num_hands_detected", 0)
-        gesture_label = f"检测到 {num_hands} 只手" if num_hands > 0 else "未检测到手部"
 
         return GestureFrameResult(
             gesture=gesture_label,
-            confidence=0.99 if num_hands > 0 else 0.0,
+            confidence=round(cls_conf, 4),
             keypoints=keypoints,
             updated_at=datetime.utcnow(),
         )
