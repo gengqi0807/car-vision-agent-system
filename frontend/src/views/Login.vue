@@ -52,9 +52,11 @@
 </template>
 
 <script setup lang="ts">
+import axios from "axios";
 import { reactive } from "vue";
 import { useRouter } from "vue-router";
 
+import { loginApi } from "../api/auth";
 import { useUserStore } from "../stores/user";
 
 const router = useRouter();
@@ -70,8 +72,21 @@ function submit() {
     return;
   }
 
-  userStore.setSession(form.username, "demo-token");
-  router.push({ name: "dashboard" });
+  void handleLogin();
+}
+
+async function handleLogin() {
+  try {
+    const { data } = await loginApi(form);
+    userStore.setSession(data.user.username, data.access_token);
+    router.push({ name: "dashboard" });
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      window.alert(String(error.response?.data?.detail ?? "登录失败，请检查后端服务和账号密码。"));
+    } else {
+      window.alert("登录失败，请稍后重试。");
+    }
+  }
 }
 </script>
 
