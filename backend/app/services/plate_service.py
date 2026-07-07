@@ -15,9 +15,9 @@ from app.models.plate_record import PlateRecord
 from app.models.user_operation_log import UserOperationLog
 from app.models_infer.errors import InferenceTimeoutError, PlateInferenceError
 from app.models_infer.hyperlpr_recognizer import HyperLPRRecognizer
-from app.schemas.alert import AlertEventCreate
 from app.schemas.plate import PlateDetection, PlateRecognitionResponse, PlateRecordSummary
 from app.services.alert_service import AlertService
+from app.services.monitor_service import MonitorService
 
 logger = get_logger(__name__)
 
@@ -39,10 +39,11 @@ class PlateService:
         user_id: int | None = None,
     ) -> PlateRecognitionResponse:
         if not image_bytes:
-            raise ValueError("上传文件为空，请重新选择图片。")
+            raise ValueError("上传文件为空。")
 
         image_path = self._persist_upload(image_bytes, filename) if settings.plate_save_uploads else None
         started_at = perf_counter()
+        trace_id = uuid4().hex
 
         try:
             detections = await asyncio.wait_for(
@@ -55,24 +56,24 @@ class PlateService:
                 user_id=user_id,
                 filename=filename,
                 elapsed_ms=elapsed_ms,
+                trace_id=trace_id,
                 title="车牌识别超时",
                 summary=(
-                    f"文件 {filename} 的车牌识别超过 {settings.plate_inference_timeout_seconds:.1f} 秒，"
-                    "系统已判定为识别失败。"
+                    f"文件 {filename} 的车牌识别耗时超过 "
+                    f"{settings.plate_inference_timeout_seconds:.1f} 秒。"
                 ),
                 response_status="Timeout",
             )
-            raise InferenceTimeoutError(
-                f"车牌识别超时，请稍后重试或检查模型资源。超时阈值：{settings.plate_inference_timeout_seconds:.1f} 秒。"
-            ) from exc
+            raise InferenceTimeoutError("车牌识别超时。") from exc
         except PlateInferenceError as exc:
             elapsed_ms = int((perf_counter() - started_at) * 1000)
             await self._record_failure(
                 user_id=user_id,
                 filename=filename,
                 elapsed_ms=elapsed_ms,
+                trace_id=trace_id,
                 title="车牌识别依赖异常",
-                summary=f"文件 {filename} 的识别流程失败：{exc}",
+                summary=f"文件 {filename} 的识别流程执行失败：{exc}",
                 response_status="Failed",
             )
             raise
@@ -82,20 +83,30 @@ class PlateService:
                 user_id=user_id,
                 filename=filename,
                 elapsed_ms=elapsed_ms,
+                trace_id=trace_id,
                 title="车牌识别服务异常",
                 summary=f"文件 {filename} 的识别流程出现未预期错误：{exc}",
                 response_status="Failed",
             )
-            raise PlateInferenceError("车牌识别服务异常，请检查模型依赖与输入数据。") from exc
+            raise PlateInferenceError("车牌识别服务异常。") from exc
 
         if detections and save_history and user_id is not None:
             self._save_history(detections, image_path=image_path, user_id=user_id)
 
         elapsed_ms = int((perf_counter() - started_at) * 1000)
-        self._record_operation(user_id, "plate_recognition", "Success" if detections else "NoDetection")
+        operation_status = "Success" if detections else "NoDetection"
+        self._record_operation(user_id, "plate_recognition", operation_status)
+        summary = self._build_behavior_summary(filename, detections, elapsed_ms)
         self._record_behavior(
-            title="车牌识别完成" if detections else "车牌识别未检测到结果",
-            summary=self._build_behavior_summary(filename, detections, elapsed_ms),
+            title="车牌识别完成" if detections else "车牌识别未命中结果",
+            summary=summary,
+        )
+        await self._record_monitor_success(
+            user_id=user_id,
+            filename=filename,
+            elapsed_ms=elapsed_ms,
+            trace_id=trace_id,
+            detections=detections,
         )
         return PlateRecognitionResponse(frame_id=filename, detections=detections)
 
@@ -108,7 +119,7 @@ class PlateService:
         user_id: int | None = None,
     ) -> PlateRecognitionResponse:
         if not image_bytes:
-            raise ValueError("上传文件为空，请重新选择图片。")
+            raise ValueError("上传文件为空。")
 
         image_path = self._persist_upload(image_bytes, filename) if settings.plate_save_uploads else None
         detections = self._detect_plates(image_bytes)
@@ -130,7 +141,7 @@ class PlateService:
             return [
                 PlateRecordSummary(
                     id=1,
-                    plate_number="沪A12345",
+                    plate_number="测试123",
                     plate_color="蓝牌",
                     created_at=datetime.utcnow(),
                 )
@@ -191,30 +202,69 @@ class PlateService:
         user_id: int | None,
         filename: str,
         elapsed_ms: int,
+        trace_id: str,
         title: str,
         summary: str,
         response_status: str,
     ) -> None:
-        full_summary = f"{summary} 处理耗时 {elapsed_ms} ms。"
+        full_summary = f"{summary} 处理耗时：{elapsed_ms} ms。"
         try:
             self._record_operation(user_id, "plate_recognition", response_status)
-            self._record_behavior(
-                title=title,
-                summary=full_summary,
-            )
-
+            self._record_behavior(title=title, summary=full_summary)
             with SessionLocal() as session:
-                alert_service = AlertService(session)
-                await alert_service.create_event(
-                    payload=AlertEventCreate(
-                        level="warning",
-                        source="plate-recognition",
-                        title=title,
-                        summary=full_summary,
-                    )
+                await MonitorService(session).capture_event(
+                    category="plate",
+                    source="plate-recognition",
+                    event_type=(
+                        "plate_recognition_timeout"
+                        if response_status.lower() == "timeout"
+                        else "plate_recognition_failure"
+                    ),
+                    title=title,
+                    summary=full_summary,
+                    level="warning",
+                    status=response_status,
+                    trace_id=trace_id,
+                    user_id=user_id,
+                    details={
+                        "filename": filename,
+                        "elapsed_ms": elapsed_ms,
+                        "response_status": response_status,
+                    },
                 )
         except Exception as exc:
             logger.warning("Failed to persist plate failure log for %s: %s", filename, exc)
+
+    async def _record_monitor_success(
+        self,
+        *,
+        user_id: int | None,
+        filename: str,
+        elapsed_ms: int,
+        trace_id: str,
+        detections: list[PlateDetection],
+    ) -> None:
+        event_type = "plate_recognition_success" if detections else "plate_recognition_no_detection"
+        with SessionLocal() as session:
+            await MonitorService(session).capture_event(
+                category="plate",
+                source="plate-recognition",
+                event_type=event_type,
+                title="车牌识别完成" if detections else "车牌识别未命中结果",
+                summary=self._build_behavior_summary(filename, detections, elapsed_ms),
+                level="info" if detections else "warning",
+                status="success" if detections else "no_detection",
+                trace_id=trace_id,
+                user_id=user_id,
+                confidence=detections[0].confidence if detections else None,
+                details={
+                    "filename": filename,
+                    "elapsed_ms": elapsed_ms,
+                    "detection_count": len(detections),
+                    "plates": [item.plate_number for item in detections],
+                },
+                trigger_alert=not detections,
+            )
 
     def _record_operation(self, user_id: int | None, operation_type: str, response_status: str) -> None:
         if user_id is None:
@@ -245,11 +295,11 @@ class PlateService:
         elapsed_ms: int,
     ) -> str:
         if not detections:
-            return f"文件 {filename} 已完成识别，但未检测到有效车牌。处理耗时 {elapsed_ms} ms。"
+            return f"{filename} 已完成识别，但未匹配到有效车牌。处理耗时：{elapsed_ms} ms。"
 
         first_detection = detections[0]
         return (
-            f"文件 {filename} 共识别到 {len(detections)} 个车牌，"
-            f"首个结果为 {first_detection.plate_number}（{first_detection.plate_color}），"
-            f"处理耗时 {elapsed_ms} ms。"
+            f"{filename} 共识别到 {len(detections)} 个车牌结果。"
+            f"首个结果为：{first_detection.plate_number}（{first_detection.plate_color}）。"
+            f"处理耗时：{elapsed_ms} ms。"
         )

@@ -192,10 +192,18 @@ def _ensure_alert_logs_columns(inspector) -> None:
         statements.append(
             "ALTER TABLE alert_logs ADD COLUMN updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP"
         )
+    if "event_type" not in columns:
+        statements.append("ALTER TABLE alert_logs ADD COLUMN event_type VARCHAR(64) NULL")
+    if "impact_scope" not in columns:
+        statements.append("ALTER TABLE alert_logs ADD COLUMN impact_scope VARCHAR(255) NULL")
+    if "root_cause" not in columns:
+        statements.append("ALTER TABLE alert_logs ADD COLUMN root_cause TEXT NULL")
+    if "suggested_action" not in columns:
+        statements.append("ALTER TABLE alert_logs ADD COLUMN suggested_action TEXT NULL")
+    if "analysis_json" not in columns:
+        statements.append("ALTER TABLE alert_logs ADD COLUMN analysis_json TEXT NULL")
 
     if engine.dialect.name == "mysql":
-        if "event_type" in columns and not columns["event_type"].get("nullable", True):
-            statements.append("ALTER TABLE alert_logs MODIFY COLUMN event_type VARCHAR(64) NULL")
         if "message" in columns and not columns["message"].get("nullable", True):
             statements.append("ALTER TABLE alert_logs MODIFY COLUMN message VARCHAR(255) NULL")
 

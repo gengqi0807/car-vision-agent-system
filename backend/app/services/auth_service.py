@@ -5,6 +5,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.security import create_access_token, hash_password, verify_password
+from app.models.monitor_log import MonitorLog
 from app.models.user import User
 from app.models.user_operation_log import UserOperationLog
 from app.schemas.auth import EmailLoginRequest, LoginRequest, RegisterRequest, TokenResponse, UpdateProfileRequest, UserProfile
@@ -29,6 +30,13 @@ class AuthService:
         self.db.add(user)
         self.db.flush()
         self._log_operation(user.id, "register", "Success")
+        self._log_monitor_event(
+            user_id=user.id,
+            operation_type="register",
+            response_status="Success",
+            title="用户注册完成",
+            summary=f"用户 {payload.username} 完成了注册。",
+        )
         self.db.commit()
         self.db.refresh(user)
         return UserProfile.model_validate(user)
@@ -36,10 +44,26 @@ class AuthService:
     def login(self, payload: LoginRequest) -> TokenResponse:
         user = self.db.scalar(select(User).where(User.username == payload.username))
         if user is None or not verify_password(payload.password, user.password_hash):
+            self._log_monitor_event(
+                user_id=user.id if user else None,
+                operation_type="login",
+                response_status="Rejected",
+                title="登录尝试被拒绝",
+                summary=f"用户名 {payload.username} 的登录请求被拒绝。",
+                level="warning",
+            )
+            self.db.commit()
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
 
         user.last_login = datetime.utcnow()
         self._log_operation(user.id, "login", "Success")
+        self._log_monitor_event(
+            user_id=user.id,
+            operation_type="login",
+            response_status="Success",
+            title="用户登录成功",
+            summary=f"用户 {user.username} 登录成功。",
+        )
         self.db.commit()
         self.db.refresh(user)
 
@@ -49,18 +73,34 @@ class AuthService:
     def send_email_login_code(self, email: str) -> None:
         user = self.db.scalar(select(User).where(User.email_hash == User.build_email_hash(email)))
         if user is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="该邮箱尚未绑定账号")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="该邮箱未绑定账号")
         self.email_code_service.send_code(email=email, username=user.username)
 
     def email_login(self, payload: EmailLoginRequest) -> TokenResponse:
         user = self.db.scalar(select(User).where(User.email_hash == User.build_email_hash(payload.email)))
         if user is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="该邮箱尚未绑定账号")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="该邮箱未绑定账号")
         if not self.email_code_service.verify_code(payload.email, payload.code):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="验证码错误或已过期")
+            self._log_monitor_event(
+                user_id=user.id,
+                operation_type="email_login",
+                response_status="Rejected",
+                title="邮箱登录被拒绝",
+                summary=f"用户 {user.username} 的邮箱登录被拒绝。",
+                level="warning",
+            )
+            self.db.commit()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="验证码无效或已过期")
 
         user.last_login = datetime.utcnow()
         self._log_operation(user.id, "email_login", "Success")
+        self._log_monitor_event(
+            user_id=user.id,
+            operation_type="email_login",
+            response_status="Success",
+            title="邮箱登录成功",
+            summary=f"用户 {user.username} 通过邮箱验证码登录成功。",
+        )
         self.db.commit()
         self.db.refresh(user)
 
@@ -84,6 +124,13 @@ class AuthService:
         user.email = payload.email
         user.phone = payload.phone
         self._log_operation(user.id, "update_profile", "Success")
+        self._log_monitor_event(
+            user_id=user.id,
+            operation_type="update_profile",
+            response_status="Success",
+            title="个人资料已更新",
+            summary=f"用户 {user.username} 更新了个人资料。",
+        )
         self.db.commit()
         self.db.refresh(user)
         return UserProfile.model_validate(user)
@@ -126,5 +173,28 @@ class AuthService:
                 user_id=user_id,
                 operation_type=operation_type,
                 response_status=response_status,
+            )
+        )
+
+    def _log_monitor_event(
+        self,
+        *,
+        user_id: int | None,
+        operation_type: str,
+        response_status: str,
+        title: str,
+        summary: str,
+        level: str = "info",
+    ) -> None:
+        self.db.add(
+            MonitorLog(
+                category="user_operation",
+                source="auth",
+                event_type=operation_type,
+                level=level,
+                title=title,
+                summary=summary,
+                status=response_status,
+                user_id=user_id,
             )
         )
