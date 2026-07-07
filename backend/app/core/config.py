@@ -1,29 +1,35 @@
 import os
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import quote_plus           # ← 保留 HEAD 的导入（用于 SQLAlchemy URL 编码）
+from urllib.parse import quote_plus           # HEAD 保留，用于 SQLAlchemy URL 编码
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# HEAD 定义的环境变量文件位置
+# HEAD 定义：明确指定 .env 文件位置（项目根目录）
 ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
-# wangxiaoyan 定义的 backend 目录（用于构建模型路径）
+# wangxiaoyan 定义：用于构建默认模型目录
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent  # backend/
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=ENV_FILE, env_file_encoding="utf-8")
+    # ===== 合并后的 model_config =====
+    # 使用 HEAD 的 ENV_FILE 路径，同时保留 wangxiaoyan 的 extra="ignore"
+    model_config = SettingsConfigDict(
+        env_file=ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
 
-    # ---------- 基础应用配置（HEAD 原有） ----------
+    # ---------- 基础应用配置（HEAD） ----------
     app_name: str = Field(default="Car Vision Agent System")
     app_env: str = Field(default="development")
     api_v1_prefix: str = Field(default="/api/v1")
     secret_key: str = Field(default="change-me")
     access_token_expire_minutes: int = Field(default=120)
 
-    # ---------- 数据库配置（HEAD 原有） ----------
+    # ---------- 数据库配置（HEAD） ----------
     database_url: str | None = Field(default=None)
     mysql_host: str = Field(default="127.0.0.1")
     mysql_port: int = Field(default=3306)
@@ -34,14 +40,20 @@ class Settings(BaseSettings):
 
     redis_url: str = Field(default="redis://localhost:6379/0")
 
-    # ---------- LLM 配置（HEAD 原有） ----------
+    # ---------- LLM 配置（HEAD） ----------
     llm_provider: str = Field(default="openai-compatible")
     llm_api_base: str = Field(default="")
     llm_api_key: str = Field(default="")
 
     allowed_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    hyperlpr_detect_level: str = Field(default="high")
+    hyperlpr_home_dir: str = Field(default="runtime")
+    plate_confidence_threshold: float = Field(default=0.5)
+    plate_history_limit: int = Field(default=50)
+    plate_save_uploads: bool = Field(default=False)
+    plate_upload_dir: str = Field(default="uploads/plate")
 
-    # ---------- 模型路径配置（来自 wangxiaoyan） ----------
+    # ---------- 模型路径配置（wangxiaoyan） ----------
     models_dir: str = Field(
         default=str(_BACKEND_DIR / "models"),
         description="Directory containing downloaded .task / .onnx model files",
