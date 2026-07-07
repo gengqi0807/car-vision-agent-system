@@ -21,11 +21,18 @@ class PlateService:
     async def recognize_image(self, filename: str, image_bytes: bytes | None = None) -> PlateRecognitionResponse:
         return self.recognize_image_bytes(image_bytes or b"", filename)
 
-    def recognize_image_bytes(self, image_bytes: bytes, filename: str = "unknown.jpg") -> PlateRecognitionResponse:
+    def recognize_image_bytes(
+        self,
+        image_bytes: bytes,
+        filename: str = "unknown.jpg",
+        *,
+        save_history: bool = False,
+        user_id: int | None = None,
+    ) -> PlateRecognitionResponse:
         if not image_bytes:
             return PlateRecognitionResponse(frame_id=filename, detections=[])
 
-        source_path = self._persist_upload(image_bytes, filename) if settings.plate_save_uploads else None
+        image_path = self._persist_upload(image_bytes, filename) if settings.plate_save_uploads else None
         detections = [
             PlateDetection(
                 plate_number=item.plate_number,
@@ -36,18 +43,17 @@ class PlateService:
             for item in self.recognizer.recognize_all(image_bytes)
         ]
 
-        if detections:
-            self._save_history(detections, source_path)
+        if detections and save_history and user_id is not None:
+            self._save_history(detections, image_path=image_path, user_id=user_id)
 
         return PlateRecognitionResponse(frame_id=filename, detections=detections)
 
-    def list_history(self) -> list[PlateRecordSummary]:
+    def list_history(self, user_id: int | None = None) -> list[PlateRecordSummary]:
         with SessionLocal() as session:
-            statement = (
-                select(PlateRecord)
-                .order_by(PlateRecord.created_at.desc())
-                .limit(settings.plate_history_limit)
-            )
+            statement = select(PlateRecord)
+            if user_id is not None:
+                statement = statement.where(PlateRecord.user_id == user_id)
+            statement = statement.order_by(PlateRecord.created_at.desc()).limit(settings.plate_history_limit)
             records = session.scalars(statement).all()
 
         if not records:
@@ -70,13 +76,15 @@ class PlateService:
             for record in records
         ]
 
-    def _save_history(self, detections: list[PlateDetection], source_path: str | None) -> None:
+    def _save_history(self, detections: list[PlateDetection], image_path: str | None, user_id: int) -> None:
         records = [
             PlateRecord(
+                user_id=user_id,
                 plate_number=detection.plate_number,
                 plate_color=detection.plate_color,
+                bbox=detection.bbox,
                 confidence=detection.confidence,
-                source_path=source_path,
+                image_path=image_path,
             )
             for detection in detections
             if detection.plate_number
