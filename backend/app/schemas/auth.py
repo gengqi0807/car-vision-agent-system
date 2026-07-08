@@ -14,7 +14,6 @@ class RegisterRequest(BaseModel):
             }
         }
     )
-
     username: str = Field(min_length=3, max_length=64)
     password: str = Field(min_length=6, max_length=128)
     email: str | None = Field(default=None, max_length=128)
@@ -25,7 +24,6 @@ class LoginRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={"example": {"username": "demo_user", "password": "SecurePass123"}}
     )
-
     username: str
     password: str
 
@@ -61,8 +59,6 @@ class UpdateProfileRequest(BaseModel):
     username: str = Field(min_length=3, max_length=64)
     email: str | None = Field(default=None, max_length=128)
     phone: str | None = Field(default=None, max_length=20)
-
-
 class UserProfile(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -93,7 +89,6 @@ class TokenResponse(BaseModel):
             }
         }
     )
-
     access_token: str
     token_type: str = "bearer"
     user: UserProfile

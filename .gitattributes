@@ -1,0 +1,10 @@
+*.db binary
+*.sqlite3 binary
+*.onnx binary
+*.pt binary
+*.task binary
+*.tflite binary
+*.zip binary
+*.jpg binary
+*.jpeg binary
+*.png binary

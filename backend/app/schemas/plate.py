@@ -26,7 +26,6 @@ class PlateRecognitionResponse(BaseModel):
             }
         }
     )
-
     frame_id: str
     detections: list[PlateDetection]
 

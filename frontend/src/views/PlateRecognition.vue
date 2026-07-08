@@ -22,6 +22,9 @@
             </div>
           </div>
 
+          <div v-if="showNoDetectionFeedback" class="empty-state plate-feedback">
+            未检测到有效车牌，请尝试上传更清晰的道路场景图片。
+          </div>
           <div
             v-for="(item, index) in detectionRows"
             :key="`${item.plate}-${index}`"
@@ -48,6 +51,7 @@
           <span>车型</span>
           <span class="time">时间</span>
         </div>
+        <div v-if="filteredRecords.length === 0" class="empty-state">暂无识别记录</div>
         <div v-for="record in filteredRecords" :key="record.id" class="history-row record">
           <span>{{ record.plate }}</span>
           <span>{{ record.color }}</span>
@@ -60,6 +64,7 @@
 </template>
 
 <script setup lang="ts">
+import axios from "axios";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import {
@@ -80,27 +85,13 @@ interface HistoryRecordView {
 const keyword = ref("");
 const previewUrl = ref("");
 const requestError = ref("");
+const isRecognizing = ref(false);
+const hasRecognitionResult = ref(false);
 const detections = ref<PlateDetection[]>([]);
 const historyRecords = ref<PlateRecordSummary[]>([]);
 
-const fallbackRecords: HistoryRecordView[] = [
-  { id: 1, plate: "京A·88888", color: "蓝色", vehicleType: "轿车", time: "14:23" },
-  { id: 2, plate: "沪B·66666", color: "绿色", vehicleType: "SUV", time: "14:15" },
-  { id: 3, plate: "粤C·12345", color: "蓝色", vehicleType: "货车", time: "13:50" },
-  { id: 4, plate: "京A·99999", color: "黄色", vehicleType: "客车", time: "13:20" }
-];
-
-const fallbackDetections = [
-  { plate: "京A · 88888", confidence: "99.2%", meta: "蓝色 · 轿车" },
-  { plate: "沪B · 66666", confidence: "97.8%", meta: "绿色 · SUV" }
-];
-
-const displayHistory = computed<HistoryRecordView[]>(() => {
-  if (historyRecords.value.length === 0) {
-    return fallbackRecords;
-  }
-
-  return historyRecords.value.map((record) => ({
+const displayHistory = computed<HistoryRecordView[]>(() =>
+  historyRecords.value.map((record) => ({
     id: record.id,
     plate: record.plate_number,
     color: record.plate_color,
@@ -108,8 +99,8 @@ const displayHistory = computed<HistoryRecordView[]>(() => {
     time: new Date(record.created_at).toLocaleTimeString("zh-CN", {
       hour12: false
     })
-  }));
-});
+  }))
+);
 
 const filteredRecords = computed(() => {
   const term = keyword.value.trim();
@@ -120,19 +111,33 @@ const filteredRecords = computed(() => {
   return displayHistory.value.filter((record) => `${record.plate}${record.vehicleType}`.includes(term));
 });
 
-const detectionRows = computed(() => {
-  if (detections.value.length === 0) {
-    return fallbackDetections;
-  }
-
-  return detections.value.map((item) => ({
+const detectionRows = computed(() =>
+  detections.value.map((item) => ({
     plate: item.plate_number,
     confidence: `${(item.confidence * 100).toFixed(1)}%`,
     meta: `${item.plate_color} · 轿车`
-  }));
-});
+  }))
+);
 
-const resultMeta = computed(() => `检测到 ${detectionRows.value.length} 辆车牌 · 处理耗时 1.23 秒`);
+const showNoDetectionFeedback = computed(
+  () => hasRecognitionResult.value && detections.value.length === 0 && !requestError.value
+);
+
+const resultMeta = computed(() => {
+  if (isRecognizing.value) {
+    return "正在识别中...";
+  }
+  if (!previewUrl.value) {
+    return "上传图片后展示识别结果";
+  }
+  if (requestError.value) {
+    return "识别失败，请检查提示信息";
+  }
+  if (showNoDetectionFeedback.value) {
+    return "本次识别未检测到有效车牌";
+  }
+  return `检测到 ${detectionRows.value.length} 辆车牌`;
+});
 
 function resetPreviewUrl() {
   if (previewUrl.value) {
@@ -156,20 +161,31 @@ async function handleFileChange(event: Event) {
 
   resetPreviewUrl();
   requestError.value = "";
+  detections.value = [];
+  hasRecognitionResult.value = false;
 
   if (!file) {
     return;
   }
 
   previewUrl.value = URL.createObjectURL(file);
+  isRecognizing.value = true;
 
   try {
     const { data } = await recognizePlateImageApi(file);
     detections.value = data.detections;
+    hasRecognitionResult.value = true;
     await loadHistory();
-  } catch {
+  } catch (error) {
     detections.value = [];
-    requestError.value = "后端未连接，当前展示原型数据。";
+    hasRecognitionResult.value = false;
+    if (axios.isAxiosError(error)) {
+      requestError.value = String(error.response?.data?.detail ?? "识别失败，当前展示原型数据。");
+      return;
+    }
+    requestError.value = "识别失败，当前展示原型数据。";
+  } finally {
+    isRecognizing.value = false;
   }
 }
 
@@ -218,5 +234,9 @@ onBeforeUnmount(() => {
   font-size: 13px;
   color: #b27f75;
   text-align: center;
+}
+
+.plate-feedback {
+  margin-bottom: 12px;
 }
 </style>

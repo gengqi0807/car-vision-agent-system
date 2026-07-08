@@ -325,7 +325,6 @@ form label {
 .icon.clickable:hover {
   background: #ede7df;
 }
-
 .icon span {
   font-size: 10px;
   font-weight: 400;
@@ -405,7 +404,6 @@ form label {
   margin-top: 0;
   padding: 10px 22px;
 }
-
 @media (max-width: 900px) {
   .login-container {
     flex-direction: column;

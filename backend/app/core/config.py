@@ -1,28 +1,21 @@
 import os
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import quote_plus           # HEAD 保留，用于 SQLAlchemy URL 编码
+from urllib.parse import quote_plus
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# HEAD 定义：明确指定 .env 文件位置（项目根目录）
 ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
-
-# wangxiaoyan 定义：用于构建默认模型目录
-_BACKEND_DIR = Path(__file__).resolve().parent.parent.parent  # backend/
+BACKEND_DIR = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
-    # ===== 合并后的 model_config =====
-    # 使用 HEAD 的 ENV_FILE 路径，同时保留 wangxiaoyan 的 extra="ignore"
     model_config = SettingsConfigDict(
         env_file=ENV_FILE,
         env_file_encoding="utf-8",
-        extra="ignore"
+        extra="ignore",
     )
-
-    # ---------- 基础应用配置（HEAD） ----------
     app_name: str = Field(default="Car Vision Agent System")
     app_env: str = Field(default="development")
     api_v1_prefix: str = Field(default="/api/v1")
@@ -39,8 +32,6 @@ class Settings(BaseSettings):
     openapi_url: str = Field(default="/openapi.json")
     api_contact_name: str = Field(default="Car Vision Team")
     api_contact_email: str = Field(default="team@example.com")
-
-    # ---------- 数据库配置（HEAD） ----------
     database_url: str | None = Field(default=None)
     mysql_host: str = Field(default="127.0.0.1")
     mysql_port: int = Field(default=3306)
@@ -51,12 +42,10 @@ class Settings(BaseSettings):
 
     redis_url: str = Field(default="redis://localhost:6379/0")
 
-    # ---------- LLM 配置（HEAD） ----------
     llm_provider: str = Field(default="openai-compatible")
     llm_api_base: str = Field(default="")
     llm_api_key: str = Field(default="")
 
-    # ---------- 数据加密配置 ----------
     data_encryption_key: str = Field(
         default="",
         description="Base64-encoded AES key for encrypting sensitive fields.",
@@ -65,8 +54,6 @@ class Settings(BaseSettings):
         default="",
         description="Optional secret used for HMAC-based lookup hashes.",
     )
-
-    # ---------- 邮件验证码配置 ----------
     smtp_host: str = Field(default="smtp.163.com")
     smtp_port: int = Field(default=465)
     smtp_user: str = Field(default="")
@@ -75,34 +62,38 @@ class Settings(BaseSettings):
     smtp_use_ssl: bool = Field(default=True)
     email_code_expire_minutes: int = Field(default=5)
     email_code_cooldown_seconds: int = Field(default=60)
-
     allowed_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
     hyperlpr_detect_level: str = Field(default="high")
     hyperlpr_home_dir: str = Field(default="runtime")
     plate_confidence_threshold: float = Field(default=0.5)
+    plate_inference_timeout_seconds: float = Field(default=10.0)
     plate_history_limit: int = Field(default=50)
     plate_save_uploads: bool = Field(default=False)
     plate_upload_dir: str = Field(default="uploads/plate")
 
-    # ---------- 模型路径配置（wangxiaoyan） ----------
     models_dir: str = Field(
-        default=str(_BACKEND_DIR / "models"),
-        description="Directory containing downloaded .task / .onnx model files",
+        default=str(BACKEND_DIR / "models"),
+        description="Directory containing downloaded model files.",
     )
     hand_landmarker_model: str = Field(
         default="",
-        description="Path to hand_landmarker.task; falls back to {models_dir}/hand_landmarker.task",
+        description="Optional override for hand_landmarker.task.",
     )
     pose_landmarker_model: str = Field(
         default="",
-        description="Path to pose_landmarker_lite.task; falls back to {models_dir}/pose_landmarker_lite.task",
+        description="Optional override for pose_landmarker_lite.task.",
     )
 
-    # ---------- 属性方法 ----------
     @property
     def sqlalchemy_database_url(self) -> str:
-        """HEAD 原有的 SQLAlchemy 数据库连接 URL（使用 pymysql）"""
         if self.database_url:
+            if self.database_url.startswith("sqlite") and self.database_url != "sqlite:///:memory:":
+                prefix, _, database_path = self.database_url.partition(":///")
+                if database_path.startswith("file:"):
+                    return self.database_url
+                if database_path and not Path(database_path).is_absolute():
+                    resolved_path = (ENV_FILE.parent / database_path).resolve()
+                    return f"{prefix}:///{resolved_path.as_posix()}"
             return self.database_url
 
         username = quote_plus(self.mysql_user)
@@ -115,14 +106,12 @@ class Settings(BaseSettings):
 
     @property
     def resolved_hand_model_path(self) -> str:
-        """wangxiaoyan 添加的模型路径解析"""
         return self.hand_landmarker_model or os.path.join(
             self.models_dir, "hand_landmarker.task"
         )
 
     @property
     def resolved_pose_model_path(self) -> str:
-        """wangxiaoyan 添加的模型路径解析"""
         return self.pose_landmarker_model or os.path.join(
             self.models_dir, "pose_landmarker_lite.task"
         )

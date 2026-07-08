@@ -160,8 +160,189 @@ def _migrate_legacy_user_sensitive_data() -> None:
             )
 
 
+def _ensure_alert_table_compatibility() -> None:
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+
+    if "alert_logs" in table_names:
+        _ensure_alert_logs_columns(inspector)
+        _backfill_alert_logs()
+
+    if "alert_push_logs" in table_names:
+        _ensure_alert_push_logs_columns(inspector)
+        _backfill_alert_push_logs()
+
+    if "user_operation_logs" in table_names:
+        _ensure_updated_at_column("user_operation_logs")
+        _backfill_updated_at_from_created_at("user_operation_logs")
+
+
+def _ensure_alert_logs_columns(inspector) -> None:
+    columns = {column["name"]: column for column in inspector.get_columns("alert_logs")}
+    statements: list[str] = []
+
+    if "source" not in columns:
+        statements.append("ALTER TABLE alert_logs ADD COLUMN source VARCHAR(64) NULL")
+    if "title" not in columns:
+        statements.append("ALTER TABLE alert_logs ADD COLUMN title VARCHAR(128) NULL")
+    if "updated_at" not in columns:
+        statements.append(
+            "ALTER TABLE alert_logs ADD COLUMN updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP"
+        )
+
+    if engine.dialect.name == "mysql":
+        if "event_type" in columns and not columns["event_type"].get("nullable", True):
+            statements.append("ALTER TABLE alert_logs MODIFY COLUMN event_type VARCHAR(64) NULL")
+        if "message" in columns and not columns["message"].get("nullable", True):
+            statements.append("ALTER TABLE alert_logs MODIFY COLUMN message VARCHAR(255) NULL")
+
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+def _backfill_alert_logs() -> None:
+    inspector = inspect(engine)
+    columns = {column["name"] for column in inspector.get_columns("alert_logs")}
+    if not {"id", "created_at", "summary", "source", "title", "updated_at"}.issubset(columns):
+        return
+
+    select_columns = ["id", "created_at", "summary", "source", "title", "updated_at"]
+    if "event_type" in columns:
+        select_columns.append("event_type")
+    if "message" in columns:
+        select_columns.append("message")
+
+    with engine.begin() as connection:
+        rows = connection.execute(
+            text(f"SELECT {', '.join(select_columns)} FROM alert_logs")
+        ).mappings()
+
+        for row in rows:
+            updates: dict[str, object] = {}
+            source = str(row.get("source") or "").strip()
+            legacy_source = str(row.get("event_type") or "").strip()
+            title = str(row.get("title") or "").strip()
+            legacy_title = str(row.get("message") or "").strip()
+
+            if not source:
+                updates["source"] = legacy_source or "system"
+            if not title:
+                updates["title"] = legacy_title or f"告警事件 #{row['id']}"
+            if row.get("updated_at") is None:
+                updates["updated_at"] = row["created_at"]
+
+            if not updates:
+                continue
+
+            assignments = ", ".join(f"{column} = :{column}" for column in updates)
+            connection.execute(
+                text(f"UPDATE alert_logs SET {assignments} WHERE id = :id"),
+                {"id": row["id"], **updates},
+            )
+
+
+def _ensure_alert_push_logs_columns(inspector) -> None:
+    columns = {column["name"]: column for column in inspector.get_columns("alert_push_logs")}
+    statements: list[str] = []
+
+    if "target" not in columns:
+        statements.append("ALTER TABLE alert_push_logs ADD COLUMN target VARCHAR(128) NULL")
+    if "success" not in columns:
+        statements.append("ALTER TABLE alert_push_logs ADD COLUMN success BOOLEAN NULL DEFAULT 0")
+    if "updated_at" not in columns:
+        statements.append(
+            "ALTER TABLE alert_push_logs ADD COLUMN updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP"
+        )
+
+    if engine.dialect.name == "mysql":
+        if "alert_id" in columns and not columns["alert_id"].get("nullable", True):
+            statements.append("ALTER TABLE alert_push_logs MODIFY COLUMN alert_id INT NULL")
+        if "push_status" in columns and not columns["push_status"].get("nullable", True):
+            statements.append("ALTER TABLE alert_push_logs MODIFY COLUMN push_status VARCHAR(16) NULL")
+
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+
+
+def _backfill_alert_push_logs() -> None:
+    inspector = inspect(engine)
+    columns = {column["name"] for column in inspector.get_columns("alert_push_logs")}
+    if not {"id", "channel", "target", "success", "created_at", "updated_at"}.issubset(columns):
+        return
+
+    select_columns = ["id", "channel", "target", "success", "created_at", "updated_at"]
+    if "push_status" in columns:
+        select_columns.append("push_status")
+
+    with engine.begin() as connection:
+        rows = connection.execute(
+            text(f"SELECT {', '.join(select_columns)} FROM alert_push_logs")
+        ).mappings()
+
+        for row in rows:
+            updates: dict[str, object] = {}
+            target = str(row.get("target") or "").strip()
+            push_status = str(row.get("push_status") or "").strip().lower()
+
+            if not target:
+                updates["target"] = str(row["channel"])
+            if row.get("success") is None:
+                updates["success"] = push_status in {"success", "ok", "delivered"}
+            if row.get("updated_at") is None:
+                updates["updated_at"] = row["created_at"]
+
+            if not updates:
+                continue
+
+            assignments = ", ".join(f"{column} = :{column}" for column in updates)
+            connection.execute(
+                text(f"UPDATE alert_push_logs SET {assignments} WHERE id = :id"),
+                {"id": row["id"], **updates},
+            )
+
+
+def _ensure_updated_at_column(table_name: str) -> None:
+    inspector = inspect(engine)
+    columns = {column["name"] for column in inspector.get_columns(table_name)}
+    if "updated_at" in columns:
+        return
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                f"ALTER TABLE {table_name} "
+                "ADD COLUMN updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP"
+            )
+        )
+
+
+def _backfill_updated_at_from_created_at(table_name: str) -> None:
+    inspector = inspect(engine)
+    columns = {column["name"] for column in inspector.get_columns(table_name)}
+    if not {"id", "created_at", "updated_at"}.issubset(columns):
+        return
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                f"UPDATE {table_name} "
+                "SET updated_at = created_at "
+                "WHERE updated_at IS NULL"
+            )
+        )
+
+
 def init_database() -> None:
     ensure_database_exists()
     Base.metadata.create_all(bind=engine)
     _ensure_user_security_columns()
     _migrate_legacy_user_sensitive_data()
+    _ensure_alert_table_compatibility()

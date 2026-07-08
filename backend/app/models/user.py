@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from datetime import datetime
 
 from sqlalchemy import DateTime, Enum, String, text
@@ -16,7 +15,6 @@ class User(BaseModel):
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
 
-    # Legacy plaintext columns are kept for one-step migration/backfill.
     _legacy_email: Mapped[str | None] = mapped_column("email", String(128), unique=True, nullable=True)
     _legacy_phone: Mapped[str | None] = mapped_column("phone", String(20), unique=True, nullable=True)
     _legacy_wechat_openid: Mapped[str | None] = mapped_column("wechat_openid", String(128), unique=True, nullable=True)
@@ -27,7 +25,6 @@ class User(BaseModel):
     phone_hash: Mapped[str | None] = mapped_column(String(64), unique=True, index=True, nullable=True)
     wechat_openid_encrypted: Mapped[str | None] = mapped_column(String(512), nullable=True)
     wechat_openid_hash: Mapped[str | None] = mapped_column(String(64), unique=True, index=True, nullable=True)
-
     role: Mapped[str] = mapped_column(
         Enum("admin", "user", name="user_role"),
         nullable=False,

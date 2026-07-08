@@ -8,7 +8,7 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 python-multipart==0.0.20
 websockets==15.0.1
-mediapipe==0.10.21
+mediapipe==0.10.30
 opencv-python-headless==4.11.0.86
 numpy==1.26.4
 aiofiles==24.1.0

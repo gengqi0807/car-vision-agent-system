@@ -28,7 +28,7 @@ async def recognize_plate_image(
 ) -> PlateRecognitionResponse:
     image_bytes = await file.read()
     try:
-        return service.recognize_image_bytes(
+        return await service.recognize_image_bytes_async(
             image_bytes,
             file.filename or "unknown.jpg",
             save_history=True,
