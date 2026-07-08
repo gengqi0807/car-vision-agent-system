@@ -4,22 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="d266786f-ee78-41ea-9080-d512dbeddab5" name="更改" comment="">
-      <change afterPath="$PROJECT_DIR$/.idea/.name" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/backend/models/hand_landmarker.task" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/backend/models/pose_landmarker_lite.task" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/app/api/v1/owner_gesture.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/api/v1/owner_gesture.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/app/core/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/core/config.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/app/models_infer/gesture_classifier.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/models_infer/gesture_classifier.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/app/models_infer/mediapipe_hands.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/models_infer/mediapipe_hands.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/app/schemas/gesture.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/schemas/gesture.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/app/services/owner_gesture_service.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/services/owner_gesture_service.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/backend/requirements.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stream_core.py" beforeDir="false" afterPath="$PROJECT_DIR$/stream_core.py" afterDir="false" />
-    </list>
+    <list default="true" id="d266786f-ee78-41ea-9080-d512dbeddab5" name="更改" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
