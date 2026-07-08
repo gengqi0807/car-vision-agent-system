@@ -1,13 +1,16 @@
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.schemas.alert import (
+    AlertDashboard,
     AlertEvent,
     AlertEventCreate,
     AlertOverview,
     AlertPushRecord,
+    AlertReplay,
     BehaviorLogRecord,
+    MonitorLogRecord,
     OperationLogRecord,
 )
 from app.services.alert_service import AlertService
@@ -51,6 +54,18 @@ async def get_alert_push_logs(
     return service.list_push_logs(limit=limit)
 
 
+@router.get("/monitor-logs", response_model=list[MonitorLogRecord])
+async def get_monitor_logs(
+    limit: int = Query(default=30, ge=1, le=100),
+    category: str | None = Query(default=None),
+    source: str | None = Query(default=None),
+    level: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> list[MonitorLogRecord]:
+    service = AlertService(db)
+    return service.list_monitor_logs(limit=limit, category=category, source=source, level=level)
+
+
 @router.get("/behavior-logs", response_model=list[BehaviorLogRecord])
 async def get_behavior_logs(
     limit: int = Query(default=12, ge=1, le=50),
@@ -69,6 +84,25 @@ async def get_operation_logs(
 ) -> list[OperationLogRecord]:
     service = AlertService(db)
     return service.list_operation_logs(limit=limit, user_id=user_id, operation_type=operation_type)
+
+
+@router.get("/replay/{alert_id}", response_model=AlertReplay)
+async def get_alert_replay(alert_id: int, db: Session = Depends(get_db)) -> AlertReplay:
+    service = AlertService(db)
+    try:
+        return service.replay(alert_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.get("/dashboard", response_model=AlertDashboard)
+async def get_alert_dashboard(
+    latest_limit: int = Query(default=6, ge=1, le=20),
+    log_limit: int = Query(default=12, ge=1, le=50),
+    db: Session = Depends(get_db),
+) -> AlertDashboard:
+    service = AlertService(db)
+    return service.dashboard(latest_limit=latest_limit, log_limit=log_limit)
 
 
 @router.websocket("/ws")

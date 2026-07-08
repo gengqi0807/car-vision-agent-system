@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     llm_provider: str = Field(default="openai-compatible")
     llm_api_base: str = Field(default="")
     llm_api_key: str = Field(default="")
+    llm_request_timeout_seconds: float = Field(default=10.0)
 
     data_encryption_key: str = Field(
         default="",
@@ -62,7 +63,14 @@ class Settings(BaseSettings):
     smtp_use_ssl: bool = Field(default=True)
     email_code_expire_minutes: int = Field(default=5)
     email_code_cooldown_seconds: int = Field(default=60)
+    alert_email_recipients: list[str] = Field(default_factory=list)
+    alert_webhook_url: str = Field(default="")
+    alert_webhook_timeout_seconds: float = Field(default=8.0)
     allowed_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    alert_consecutive_failures_threshold: int = Field(default=3)
+    alert_low_confidence_threshold: float = Field(default=0.6)
+    alert_low_confidence_window_size: int = Field(default=3)
+    alert_replay_window_minutes: int = Field(default=20)
     hyperlpr_detect_level: str = Field(default="high")
     hyperlpr_home_dir: str = Field(default="runtime")
     plate_confidence_threshold: float = Field(default=0.5)
