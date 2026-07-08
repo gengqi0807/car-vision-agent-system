@@ -6,8 +6,8 @@ import cv2
 
 class StreamManager:
     def __init__(self):
-        self.mediamtx_path = r"F:\programming projiect\SmallTerm\sophomore\MediaMIX\mediamtx.exe"
-        self.ffmpeg_path = r"F:\programming projiect\SmallTerm\sophomore\ffmpeg\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe"
+        self.mediamtx_path = r"D:\py_projects\mediamtx\mediamtx.exe"
+        self.ffmpeg_path = r"D:\py_projects\ffmpeg\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe"
         if not os.path.exists(self.ffmpeg_path):
             raise FileNotFoundError(f"FFmpeg 路径不存在，请修改 self.ffmpeg_path: {self.ffmpeg_path}")
 

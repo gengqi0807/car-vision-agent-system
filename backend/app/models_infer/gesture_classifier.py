@@ -1,206 +1,268 @@
-"""Rule-based hand / pose gesture classifier.
+"""
+手势分类器 — 静态手势（基于 21 关键点手指伸展度） + 动态手势状态机。
 
-Classifies MediaPipe keypoints into named gestures using geometric
-rules (no ML model required).  Supports two domains:
+静态手势:
+  - palm      : 五指全伸展 → 唤醒
+  - fist      : 五指全弯曲 → 确认
+  - thumb_up  : 仅拇指伸展且朝上 → 接听
+  - thumb_down: 仅拇指伸展且朝下 → 挂断
+  - pointing  : 仅食指伸展 → 用于触发动态追踪
 
-- ``owner`` — hand landmarks (21 points per hand)
-- ``police`` — pose landmarks (33 body keypoints)
+动态手势（通过 HandGestureTracker 时序状态机）:
+  - circle_cw : 食指尖顺时针画圈 → 音量+
+  - circle_ccw: 食指尖逆时针画圈 → 音量-
+  - swipe_left : 手腕向左滑动 → 上一个功能
+  - swipe_right: 手腕向右滑动 → 下一个功能
+  - wave       : 手腕往复摆动 → 返回主页
+
+接口预留:
+  - GestureClassifier(domain="police") → 交警手势复用同一分类器框架
 """
 
-from __future__ import annotations
-
-import logging
-from typing import Literal, Optional
-
-logger = logging.getLogger(__name__)
-
-_Domain = Literal["owner", "police"]
+import math
 
 
 class GestureClassifier:
-    """Rule-based gesture classifier for two domains."""
+    """手势分类器，支持 domain="owner" / "police" 两种模式。"""
 
-    # ----------------------------------------------------------------
-    # Public API
-    # ----------------------------------------------------------------
+    def __init__(self, domain: str = "owner"):
+        self.domain = domain
+        self.tracker: HandGestureTracker | None = (
+            HandGestureTracker() if domain == "owner" else None
+        )
 
-    def classify(self, keypoints: list[dict], domain: _Domain) -> dict:
-        """Classify a set of keypoints into a gesture label.
-
-        Parameters
-        ----------
-        keypoints:
-            Raw MediaPipe keypoints, each ``{"x": float, "y": float, "z": float}``.
-            For hands: 21 points per hand (21, 42, 63 … total).
-            For pose:  33 points per person.
-        domain:
-            ``"owner"`` → in-cabin hand gestures (6 types).
-            ``"police"`` → traffic police body-gesture rules (8 types).
-
-        Returns
-        -------
-        dict
-            ``{"domain": ..., "gesture": ..., "confidence": ...}``
+    def classify_static(self, keypoints: list[dict]) -> tuple[str, float]:
         """
-        if not keypoints:
-            return {"domain": domain, "gesture": "unknown", "confidence": 0.0}
+        根据 21 个手部关键点判定静态手势。
 
-        if domain == "owner":
-            return self._classify_hand(keypoints)
-        elif domain == "police":
-            return self._classify_police(keypoints)
-        return {"domain": domain, "gesture": "unknown", "confidence": 0.0}
+        Returns:
+            (gesture_name, confidence)
+        """
+        if len(keypoints) != 21:
+            return "unknown", 0.0
 
-    # ----------------------------------------------------------------
-    # Hand (owner) – 21 landmarks per hand
-    # ----------------------------------------------------------------
-    # Landmark indices
-    _WRIST = 0
-    _THUMB_TIP = 4
-    _INDEX_TIP = 8
-    _MIDDLE_TIP = 12
-    _RING_TIP = 16
-    _PINKY_TIP = 20
-    # MCP (knuckle) for each finger
-    _THUMB_MCP = 2
-    _INDEX_MCP = 5
-    _MIDDLE_MCP = 9
-    _RING_MCP = 13
-    _PINKY_MCP = 17
-    # PIP for each finger
-    _THUMB_IP = 3
-    _INDEX_PIP = 6
-    _MIDDLE_PIP = 10
-    _RING_PIP = 14
-    _PINKY_PIP = 18
+        fingers = self._finger_states(keypoints)
+        extended_count = sum(fingers)
 
-    _PER_HAND = 21
+        # 全部弯曲 → 握拳
+        if extended_count == 0:
+            return "fist", 0.95
 
-    def _classify_hand(self, keypoints: list[dict]) -> dict:
-        n_hands = len(keypoints) // self._PER_HAND
-        if n_hands == 0:
-            return {"domain": "owner", "gesture": "unknown", "confidence": 0.0}
+        # 全部伸展 → 手掌张开
+        if extended_count >= 4:  # 容忍 1 指误判
+            return "palm", 0.92
 
-        # Use first detected hand
-        hand = keypoints[: self._PER_HAND]
+        # 仅拇指伸展 → thumb_up / thumb_down
+        if extended_count == 1 and fingers[0]:
+            thumb_tip = keypoints[4]
+            thumb_mcp = keypoints[2]
+            if thumb_tip["y"] < thumb_mcp["y"] - 0.03:
+                return "thumb_up", 0.88
+            elif thumb_tip["y"] > thumb_mcp["y"] + 0.03:
+                return "thumb_down", 0.88
+            else:
+                return "thumb_up", 0.70  # 默认向上
 
-        # Helper: is a finger *extended*?  True if tip_y < mcp_y (image coords: y ↓)
-        def _is_extended(tip_idx: int, mcp_idx: int) -> bool:
-            return hand[tip_idx]["y"] <= hand[mcp_idx]["y"]
+        # 仅食指伸展 → pointing（用于触发画圈/滑动追踪）
+        if extended_count == 1 and fingers[1]:
+            return "pointing", 0.90
 
-        # Helper: is a finger *curled*?  True if tip_y > pip_y
-        def _is_curled(tip_idx: int, pip_idx: int) -> bool:
-            return hand[tip_idx]["y"] > hand[pip_idx]["y"]
+        # 仅食指+中指伸展 → 可能是 V 手势，暂归为 pointing
+        if extended_count == 2 and fingers[1] and fingers[2]:
+            return "pointing", 0.78
 
-        index_ext = _is_extended(self._INDEX_TIP, self._INDEX_MCP)
-        middle_ext = _is_extended(self._MIDDLE_TIP, self._MIDDLE_MCP)
-        ring_ext = _is_extended(self._RING_TIP, self._RING_MCP)
-        pinky_ext = _is_extended(self._PINKY_TIP, self._PINKY_MCP)
-        thumb_ext = _is_extended(self._THUMB_TIP, self._THUMB_MCP)
-
-        index_curled = _is_curled(self._INDEX_TIP, self._INDEX_PIP)
-        middle_curled = _is_curled(self._MIDDLE_TIP, self._MIDDLE_PIP)
-        ring_curled = _is_curled(self._RING_TIP, self._RING_PIP)
-        pinky_curled = _is_curled(self._PINKY_TIP, self._PINKY_PIP)
-
-        all_four_ext = index_ext and middle_ext and ring_ext and pinky_ext
-        all_four_curled = index_curled and middle_curled and ring_curled and pinky_curled
-
-        # Thumb direction relative to wrist
-        thumb_y = hand[self._THUMB_TIP]["y"]
-        wrist_y = hand[self._WRIST]["y"]
-        thumb_x = hand[self._THUMB_TIP]["x"]
-        wrist_x = hand[self._WRIST]["x"]
-
-        if thumb_ext and all_four_curled and (thumb_y < wrist_y - 0.05):
-            return {"domain": "owner", "gesture": "thumbs_up", "confidence": 0.88}
-        if thumb_ext and all_four_curled and (thumb_y > wrist_y + 0.05):
-            return {"domain": "owner", "gesture": "thumbs_down", "confidence": 0.88}
-
-        if all_four_ext:
-            return {"domain": "owner", "gesture": "open_palm", "confidence": 0.92}
-
-        if all_four_curled:
-            return {"domain": "owner", "gesture": "fist", "confidence": 0.90}
-
-        # Fallback – partial extension
-        ext_count = sum([index_ext, middle_ext, ring_ext, pinky_ext])
-        if ext_count >= 3:
-            return {"domain": "owner", "gesture": "open_palm", "confidence": 0.65}
-        if ext_count <= 1:
-            return {"domain": "owner", "gesture": "fist", "confidence": 0.60}
-
-        return {"domain": "owner", "gesture": "unknown", "confidence": 0.40}
+        return "unknown", 0.40
 
     # ----------------------------------------------------------------
-    # Police (pose) – 33 landmarks
+    # 手指伸展判定
     # ----------------------------------------------------------------
-    # Key landmark indices (MediaPipe Pose)
-    _NOSE = 0
-    _LEFT_SHOULDER = 11
-    _RIGHT_SHOULDER = 12
-    _LEFT_ELBOW = 13
-    _RIGHT_ELBOW = 14
-    _LEFT_WRIST = 15
-    _RIGHT_WRIST = 16
-    _LEFT_HIP = 23
-    _RIGHT_HIP = 24
-    _PER_PERSON = 33
 
-    def _classify_police(self, keypoints: list[dict]) -> dict:
-        n_poses = len(keypoints) // self._PER_PERSON
-        if n_poses == 0:
-            return {"domain": "police", "gesture": "unknown", "confidence": 0.0}
+    def _finger_states(self, kp: list[dict]) -> list[bool]:
+        """
+        返回 5 个布尔值: [thumb, index, middle, ring, pinky]
 
-        pose = keypoints[: self._PER_PERSON]
+        判定逻辑: 指尖到腕距 > 第二关节到腕距 × 1.2 表示伸展。
+        拇指特殊处理: 指尖-IP距 > IP-MCP距 × 1.2。
+        """
+        wrist = kp[0]
+        # 每根手指: (tip, pip/ip, mcp)
+        fingers_def = [
+            (4, 3, 2),   # thumb:  tip=4,  ip=3,  mcp=2
+            (8, 6, 5),   # index:  tip=8,  pip=6,  mcp=5
+            (12, 10, 9), # middle: tip=12, pip=10, mcp=9
+            (16, 14, 13),# ring:   tip=16, pip=14, mcp=13
+            (20, 18, 17),# pinky:  tip=20, pip=18, mcp=17
+        ]
 
-        def _pt(idx: int) -> dict:
-            return pose[idx]
+        results: list[bool] = []
+        for tip_i, pip_i, mcp_i in fingers_def:
+            if tip_i == 4:  # 拇指特殊判定
+                tip_pip = GestureClassifier._dist(kp[tip_i], kp[pip_i])
+                pip_mcp = GestureClassifier._dist(kp[pip_i], kp[mcp_i])
+                results.append(tip_pip > pip_mcp * 1.2 if pip_mcp > 1e-8 else False)
+            else:
+                tip_wrist = GestureClassifier._dist(kp[tip_i], wrist)
+                pip_wrist = GestureClassifier._dist(kp[pip_i], wrist)
+                results.append(tip_wrist > pip_wrist * 1.2 if pip_wrist > 1e-8 else False)
 
-        # Arm raised high: wrist_y < shoulder_y by a margin
-        l_wrist_y = _pt(self._LEFT_WRIST)["y"]
-        r_wrist_y = _pt(self._RIGHT_WRIST)["y"]
-        l_shoulder_y = _pt(self._LEFT_SHOULDER)["y"]
-        r_shoulder_y = _pt(self._RIGHT_SHOULDER)["y"]
+        return results
 
-        l_raised = l_wrist_y < (l_shoulder_y - 0.08)
-        r_raised = r_wrist_y < (r_shoulder_y - 0.08)
+    @staticmethod
+    def _dist(a: dict, b: dict) -> float:
+        return math.hypot(a["x"] - b["x"], a["y"] - b["y"])
 
-        # Arm extended horizontally (elbow ≈ wrist_x far from shoulder)
-        l_wrist_x = _pt(self._LEFT_WRIST)["x"]
-        r_wrist_x = _pt(self._RIGHT_WRIST)["x"]
-        l_shoulder_x = _pt(self._LEFT_SHOULDER)["x"]
-        r_shoulder_x = _pt(self._RIGHT_SHOULDER)["x"]
-        l_elbow_x = _pt(self._LEFT_ELBOW)["x"]
-        r_elbow_x = _pt(self._RIGHT_ELBOW)["x"]
 
-        # Left arm extended to left
-        l_ext_left = (l_wrist_x < l_elbow_x < l_shoulder_x) and (
-            l_shoulder_x - l_wrist_x > 0.12
+# ================================================================
+# HandGestureTracker — 动态手势时序状态机
+# ================================================================
+
+class HandGestureTracker:
+    """
+    追踪手部运动轨迹，识别动态手势。
+
+    三种动态手势:
+      - 画圈 (circle_cw / circle_ccw): 食指尖累积转角 ≥ 300° 且轨道半径稳定
+      - 滑动 (swipe_left / swipe_right): 手腕 x 方向位移超阈值
+      - 挥手 (wave): 手腕 x 方向往复反转 ≥ 2 次
+
+    每帧调用 update()，识别成功后自动 reset。
+    """
+
+    def __init__(self):
+        self.history: list[tuple[int, float, float, float, float]] = []
+        # (frame_idx, wrist_x, wrist_y, index_tip_x, index_tip_y)
+        self.frame_count: int = 0
+        self._max_history: int = 60
+
+    def reset(self) -> None:
+        self.history.clear()
+        self.frame_count = 0
+
+    def update(self, keypoints: list[dict]) -> str | None:
+        """
+        输入 21 关键点，返回识别的动态手势名称或 None。
+
+        手势优先级: 挥手 > 画圈 > 滑动
+        """
+        if len(keypoints) != 21:
+            return None
+
+        self.frame_count += 1
+
+        wrist = keypoints[0]
+        index_tip = keypoints[8]
+        entry = (
+            self.frame_count,
+            wrist["x"], wrist["y"],
+            index_tip["x"], index_tip["y"],
         )
-        # Right arm extended to right
-        r_ext_right = (r_wrist_x > r_elbow_x > r_shoulder_x) and (
-            r_wrist_x - r_shoulder_x > 0.12
-        )
+        self.history.append(entry)
+        if len(self.history) > self._max_history:
+            self.history = self.history[-self._max_history:]
 
-        # Both arms raised forward-ish
-        both_raised = l_raised and r_raised
+        if len(self.history) < 8:
+            return None
 
-        # Classification priority
-        if both_raised:
-            return {"domain": "police", "gesture": "stop", "confidence": 0.82}
-        if l_raised and not r_raised:
-            return {"domain": "police", "gesture": "left_turn", "confidence": 0.75}
-        if r_raised and not l_raised:
-            return {"domain": "police", "gesture": "right_turn", "confidence": 0.75}
-        if l_ext_left and not r_ext_right:
-            return {"domain": "police", "gesture": "left_turn", "confidence": 0.70}
-        if r_ext_right and not l_ext_left:
-            return {"domain": "police", "gesture": "right_turn", "confidence": 0.70}
+        # 挥手优先级最高
+        wave = self._detect_wave()
+        if wave:
+            self.reset()
+            return wave
 
-        # Go-straight: both arms somewhere forward, not raised
-        if not l_raised and not r_raised:
-            # Check if arms are reasonably forward
-            return {"domain": "police", "gesture": "go_straight", "confidence": 0.55}
+        # 画圈
+        circle = self._detect_circle()
+        if circle:
+            self.reset()
+            return circle
 
-        return {"domain": "police", "gesture": "unknown", "confidence": 0.40}
+        # 滑动
+        swipe = self._detect_swipe()
+        if swipe:
+            self.reset()
+            return swipe
+
+        return None
+
+    # ------------------------------------------------------------
+    # 画圈检测
+    # ------------------------------------------------------------
+
+    def _detect_circle(self) -> str | None:
+        if len(self.history) < 15:
+            return None
+
+        points = [(h[3], h[4]) for h in self.history[-30:]]  # (tip_x, tip_y)
+
+        cx = sum(p[0] for p in points) / len(points)
+        cy = sum(p[1] for p in points) / len(points)
+
+        # 累积转角
+        total_angle = 0.0
+        for i in range(1, len(points)):
+            a1 = math.atan2(points[i - 1][1] - cy, points[i - 1][0] - cx)
+            a2 = math.atan2(points[i][1] - cy, points[i][0] - cx)
+            d = a2 - a1
+            while d > math.pi:
+                d -= 2 * math.pi
+            while d < -math.pi:
+                d += 2 * math.pi
+            total_angle += d
+
+        # 半径稳定性
+        radii = [math.hypot(p[0] - cx, p[1] - cy) for p in points]
+        mean_r = sum(radii) / len(radii)
+        if mean_r < 0.015:  # 轨道太小不可靠
+            return None
+        max_dev = max(abs(r - mean_r) for r in radii) / mean_r
+
+        if abs(total_angle) >= math.radians(300) and max_dev < 0.55:
+            return "circle_cw" if total_angle > 0 else "circle_ccw"
+
+        return None
+
+    # ------------------------------------------------------------
+    # 滑动检测
+    # ------------------------------------------------------------
+
+    def _detect_swipe(self) -> str | None:
+        if len(self.history) < 8:
+            return None
+
+        start_x = self.history[0][1]   # wrist_x
+        end_x = self.history[-1][1]
+        displacement = end_x - start_x
+
+        threshold = 0.06  # 归一化坐标阈值
+
+        if displacement > threshold:
+            return "swipe_right"
+        elif displacement < -threshold:
+            return "swipe_left"
+
+        return None
+
+    # ------------------------------------------------------------
+    # 挥手检测
+    # ------------------------------------------------------------
+
+    def _detect_wave(self) -> str | None:
+        if len(self.history) < 15:
+            return None
+
+        wrist_x = [h[1] for h in self.history]
+
+        # 每隔 5 帧采样方向，统计反转次数
+        reversals = 0
+        prev_dir = 0
+        for i in range(5, len(wrist_x)):
+            diff = wrist_x[i] - wrist_x[i - 5]
+            if abs(diff) < 0.012:
+                continue
+            curr_dir = 1 if diff > 0 else -1
+            if prev_dir != 0 and curr_dir != prev_dir:
+                reversals += 1
+                if reversals >= 2:
+                    return "wave"
+            prev_dir = curr_dir
+
+        return None
