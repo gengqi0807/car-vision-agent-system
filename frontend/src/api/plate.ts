@@ -12,11 +12,30 @@ export interface PlateRecognitionResponse {
   detections: PlateDetection[];
 }
 
+export interface PlateVideoRecognitionResponse {
+  source_filename: string;
+  processed_video_url: string;
+  detections: PlateDetection[];
+  processed_frame_count: number;
+  duration_seconds?: number | null;
+}
+
 export interface PlateRecordSummary {
   id: number;
   plate_number: string;
   plate_color: string;
   created_at: string;
+}
+
+export interface PlateStreamControlResponse {
+  running: boolean;
+  published?: boolean;
+  rtsp_url?: string | null;
+  stream_name?: string | null;
+  publish_rtsp_url?: string | null;
+  playback_url?: string | null;
+  last_error?: string | null;
+  started_at?: string | null;
 }
 
 export const fetchPlateHistoryApi = () => request.get<PlateRecordSummary[]>("/plate/history");
@@ -27,18 +46,21 @@ export function recognizePlateImageApi(file: File) {
   return request.post<PlateRecognitionResponse>("/plate/image", formData);
 }
 
-function normalizeBasePath(path: string) {
-  if (!path) {
-    return "";
-  }
-  return path.startsWith("/") ? path.replace(/\/$/, "") : `/${path.replace(/\/$/, "")}`;
+export function recognizePlateVideoApi(file: File) {
+  const formData = new FormData();
+  formData.append("file", file);
+  return request.post<PlateVideoRecognitionResponse>("/plate/video", formData, {
+    timeout: 10 * 60 * 1000
+  });
 }
 
-export function buildPlateStreamWebSocketUrl(rtspUrl: string) {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const apiBase = normalizeBasePath((import.meta.env.VITE_API_BASE as string) || "/api/v1");
-  const explicitWsBase = (import.meta.env.VITE_WS_BASE as string | undefined)?.replace(/\/$/, "");
-  const defaultOrigin = import.meta.env.DEV ? `${protocol}//127.0.0.1:8000` : `${protocol}//${window.location.host}`;
-  const origin = explicitWsBase || defaultOrigin;
-  return `${origin}${apiBase}/plate/ws/stream?rtsp_url=${encodeURIComponent(rtspUrl)}`;
+export function startPlatePushStreamApi(rtspUrl: string, streamName?: string) {
+  return request.post<PlateStreamControlResponse>("/plate/stream/start", {
+    rtsp_url: rtspUrl,
+    stream_name: streamName
+  });
 }
+
+export const stopPlatePushStreamApi = () => request.post<PlateStreamControlResponse>("/plate/stream/stop");
+
+export const fetchPlatePushStreamStatusApi = () => request.get<PlateStreamControlResponse>("/plate/stream/status");

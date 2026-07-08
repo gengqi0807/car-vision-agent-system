@@ -1,8 +1,7 @@
 <template>
   <section class="page-shell">
-    <header class="page-header">
+    <header class="page-header compact-header">
       <h1>车牌识别</h1>
-      <p>以实时监控画面为主，支持道路场景图片识别与 RTSP 视频流连续识别。</p>
     </header>
 
     <section class="two-col plate-layout">
@@ -11,25 +10,33 @@
           <button type="button" class="mode-btn" :class="{ active: mode === 'image' }" @click="setMode('image')">
             图片识别
           </button>
+          <button type="button" class="mode-btn" :class="{ active: mode === 'video' }" @click="setMode('video')">
+            视频识别
+          </button>
           <button type="button" class="mode-btn" :class="{ active: mode === 'stream' }" @click="setMode('stream')">
-            视频流识别
+            实时推流识别
           </button>
         </article>
 
         <label v-if="mode === 'image'" class="upload-zone">
-          <input class="hidden-input" accept="image/*" type="file" @change="handleFileChange" />
-          <div class="main">点击上传图片</div>
+          <input class="hidden-input" accept="image/*" type="file" @change="handleImageFileChange" />
+          <div class="main">点击上传道路场景图片</div>
           <div class="sub">支持 JPG、PNG、WEBP</div>
+        </label>
+
+        <label v-else-if="mode === 'video'" class="upload-zone">
+          <input class="hidden-input" accept="video/*" type="file" @change="handleVideoFileChange" />
+          <div class="main">点击上传道路场景视频</div>
+          <div class="sub">处理后会生成标注视频并保留识别结果</div>
         </label>
 
         <article v-else class="panel stream-panel">
           <div class="stream-topbar">
             <div>
-              <h4>实时视频流</h4>
-              <p class="stream-subtext">优先展示监控画面，识别结果会叠加在视频帧上。</p>
+              <h4>推流控制</h4>
             </div>
-            <span class="stream-badge" :class="{ live: streamStatus === 'connected' }">
-              {{ streamStatus === "connected" ? "LIVE" : "STREAM" }}
+            <span class="stream-badge" :class="{ live: streamStatus === 'running' }">
+              {{ streamStatus === "running" ? "LIVE" : streamStatus === "starting" ? "STARTING" : "IDLE" }}
             </span>
           </div>
 
@@ -42,39 +49,59 @@
             </select>
             <input v-model="streamInput" type="text" placeholder="输入 RTSP 地址..." />
             <div class="stream-actions">
-              <button type="button" class="btn-video" @click="startStream">开启识别</button>
+              <button type="button" class="btn-video" :disabled="streamStatus === 'starting'" @click="startStream">
+                开启识别并推流
+              </button>
               <button type="button" class="btn-video secondary" @click="stopStream">停止</button>
             </div>
           </div>
 
           <div class="video-status">
-            <span v-if="streamStatus === 'idle'" class="off">未连接</span>
-            <span v-else-if="streamStatus === 'connecting'">连接中...</span>
-            <span v-else>已连接，实时识别中</span>
+            <span v-if="streamStatus === 'idle'" class="off">未启动推流</span>
+            <span v-else-if="streamStatus === 'starting'">正在等待视频流发布...</span>
+            <span v-else>视频流已发布，可以直接查看实时标注画面</span>
+          </div>
+
+          <div v-if="streamControl?.publish_rtsp_url" class="stream-links">
+            <span>推流地址：{{ streamControl.publish_rtsp_url }}</span>
+            <a
+              v-if="streamControl.playback_url"
+              :href="streamControl.playback_url"
+              target="_blank"
+              rel="noreferrer"
+              class="stream-link"
+            >
+              新窗口打开播放页
+            </a>
           </div>
         </article>
 
         <article class="panel monitor-panel">
           <div class="monitor-panel-head">
             <div>
-              <h4>{{ mode === "stream" ? "监控主画面" : "识别结果预览" }}</h4>
-              <p class="monitor-subtext">
-                {{ mode === "stream" ? "识别框和车牌文字会实时叠加在监控画面上。" : "上传图片后会在这里显示检测框和车牌结果。" }}
-              </p>
+              <h4>{{ monitorTitle }}</h4>
             </div>
-            <span class="monitor-badge" :class="{ live: mode === 'stream' && streamStatus === 'connected' }">
-              {{ mode === "stream" ? (streamStatus === "connected" ? "LIVE" : "STREAM") : "IMAGE" }}
+            <span class="monitor-badge" :class="{ live: mode === 'stream' && streamStatus === 'running' }">
+              {{ monitorBadge }}
             </span>
           </div>
 
           <div class="preview-shell">
-            <div v-if="displayFrameUrl" class="preview-stage">
+            <div v-if="mode === 'stream' && streamPlaybackUrl" class="preview-stage stream-viewer-shell">
+              <iframe :src="streamPlaybackUrl" class="stream-viewer" title="实时推流识别画面" allowfullscreen />
+            </div>
+
+            <div v-else-if="mode === 'video' && processedVideoUrl" class="preview-stage">
+              <video class="preview-video" :src="processedVideoUrl" controls playsinline />
+            </div>
+
+            <div v-else-if="mode === 'image' && imagePreviewUrl" class="preview-stage">
               <div class="image-frame">
                 <img
                   ref="previewImageRef"
-                  :src="displayFrameUrl"
-                  :alt="mode === 'image' ? '车牌识别预览' : '车牌实时识别画面'"
-                  :class="['preview-image', { stream: mode === 'stream' }]"
+                  :src="imagePreviewUrl"
+                  alt="车牌识别预览"
+                  class="preview-image"
                   @load="handlePreviewImageLoad"
                 />
 
@@ -93,22 +120,34 @@
             </div>
 
             <div v-else class="image-placeholder">
-              {{ mode === "image" ? "道路场景图像" : "实时监控画面" }}
-              <div class="small">
-                {{ mode === "image" ? "检测框和车牌号会直接叠加在这里。" : "连接 RTSP 流后，这里会连续显示识别画面。" }}
-              </div>
+              {{ placeholderTitle }}
+              <div class="small">{{ placeholderDescription }}</div>
             </div>
           </div>
 
-          <div v-if="isLoading" class="status-note">正在识别，请稍候...</div>
-          <div v-else-if="mode === 'image' && detections.length === 0 && displayFrameUrl && !requestError" class="status-note">
+          <div v-if="isLoading" class="status-note">{{ loadingText }}</div>
+          <div
+            v-else-if="mode === 'image' && imagePreviewUrl && currentDetections.length === 0 && !requestError"
+            class="status-note"
+          >
             当前图片未识别到车牌。
           </div>
-          <div v-else-if="mode === 'stream' && streamStatus === 'connected'" class="status-note">
-            实时识别中，当前已检测到 {{ detections.length }} 个车牌。
+          <div
+            v-else-if="mode === 'video' && processedVideoUrl && currentDetections.length === 0 && !requestError"
+            class="status-note"
+          >
+            视频已处理完成，但没有识别到可用车牌。
+          </div>
+          <div v-else-if="mode === 'stream'" class="status-note">
+            {{ streamMetaText }}
           </div>
 
-          <div class="detection-list" v-if="detectionRows.length > 0">
+          <div v-if="mode === 'video' && processedVideoUrl" class="result-links">
+            <a :href="processedVideoUrl" target="_blank" rel="noreferrer" class="stream-link">打开处理后视频</a>
+            <a :href="processedVideoUrl" download class="stream-link">下载标注视频</a>
+          </div>
+
+          <div class="detection-list" v-if="currentDetections.length > 0">
             <div
               v-for="(item, index) in detectionRows"
               :key="`${item.plate}-${index}`"
@@ -131,7 +170,6 @@
         <div class="history-head">
           <div>
             <h4>识别记录</h4>
-            <p class="history-subtext">保留最近识别结果，支持搜索和翻页查看。</p>
           </div>
           <span class="history-count">{{ filteredRecords.length }} 条</span>
         </div>
@@ -173,12 +211,19 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import {
-  buildPlateStreamWebSocketUrl,
   fetchPlateHistoryApi,
+  fetchPlatePushStreamStatusApi,
   recognizePlateImageApi,
+  recognizePlateVideoApi,
+  startPlatePushStreamApi,
+  stopPlatePushStreamApi,
   type PlateDetection,
-  type PlateRecordSummary
+  type PlateRecordSummary,
+  type PlateStreamControlResponse,
+  type PlateVideoRecognitionResponse
 } from "../api/plate";
+
+type Mode = "image" | "video" | "stream";
 
 interface HistoryRecordView {
   id: number;
@@ -195,12 +240,23 @@ interface OverlayDetection extends PlateDetection {
   height: number;
 }
 
-interface StreamMessage {
-  frame: string;
-  frame_width: number;
-  frame_height: number;
-  detections: PlateDetection[];
-  error?: string;
+const PLATE_MODE_STORAGE_KEY = "plate-recognition-mode";
+const PLATE_STREAM_INPUT_STORAGE_KEY = "plate-stream-input";
+const PLATE_STREAM_PRESET_STORAGE_KEY = "plate-stream-preset";
+
+function readStoredMode(): Mode {
+  if (typeof window === "undefined") {
+    return "image";
+  }
+  const storedMode = window.sessionStorage.getItem(PLATE_MODE_STORAGE_KEY);
+  return storedMode === "video" || storedMode === "stream" ? storedMode : "image";
+}
+
+function readStoredValue(key: string) {
+  if (typeof window === "undefined") {
+    return "";
+  }
+  return window.sessionStorage.getItem(key) ?? "";
 }
 
 const streamPresets = [
@@ -214,30 +270,47 @@ const streamPresets = [
   { label: "道路1 · live12", url: "rtsp://10.126.59.120:8554/live/live12" }
 ];
 
-const mode = ref<"image" | "stream">("image");
+const mode = ref<Mode>(readStoredMode());
 const keyword = ref("");
 const currentPage = ref(1);
-const imagePreviewUrl = ref("");
-const streamFrameUrl = ref("");
 const requestError = ref("");
+const loadingText = ref("正在识别，请稍候...");
 const isLoading = ref(false);
-const detections = ref<PlateDetection[]>([]);
-const historyRecords = ref<PlateRecordSummary[]>([]);
+
+const imagePreviewUrl = ref("");
 const previewImageRef = ref<HTMLImageElement | null>(null);
+const imageDetections = ref<PlateDetection[]>([]);
 const sourceFrameSize = ref({ width: 0, height: 0 });
-const selectedPreset = ref("");
-const streamInput = ref("");
-const streamStatus = ref<"idle" | "connecting" | "connected">("idle");
-const streamSocket = ref<WebSocket | null>(null);
-const streamOpened = ref(false);
+
+const videoResult = ref<PlateVideoRecognitionResponse | null>(null);
+
+const historyRecords = ref<PlateRecordSummary[]>([]);
+
+const selectedPreset = ref(readStoredValue(PLATE_STREAM_PRESET_STORAGE_KEY));
+const streamInput = ref(readStoredValue(PLATE_STREAM_INPUT_STORAGE_KEY));
+const streamControl = ref<PlateStreamControlResponse | null>(null);
+const streamStatus = ref<"idle" | "starting" | "running">("idle");
+const playbackRefreshKey = ref(Date.now());
+let statusTimer: number | null = null;
+
 const historyPageSize = 6;
 
 const fallbackRecords: HistoryRecordView[] = [
-  { id: 1, plate: "沪A12345", color: "蓝牌", vehicleType: "小型车", time: "14:23" },
-  { id: 2, plate: "浙B67890", color: "绿牌", vehicleType: "新能源", time: "14:15" }
+  { id: 1, plate: "沪A12345", color: "蓝牌", vehicleType: "识别记录", time: "14:23" },
+  { id: 2, plate: "沪B67890", color: "绿牌", vehicleType: "识别记录", time: "14:15" }
 ];
 
-const displayFrameUrl = computed(() => (mode.value === "image" ? imagePreviewUrl.value : streamFrameUrl.value));
+const processedVideoUrl = computed(() => videoResult.value?.processed_video_url ?? "");
+
+const currentDetections = computed(() => {
+  if (mode.value === "image") {
+    return imageDetections.value;
+  }
+  if (mode.value === "video") {
+    return videoResult.value?.detections ?? [];
+  }
+  return [];
+});
 
 const displayHistory = computed<HistoryRecordView[]>(() => {
   if (historyRecords.value.length === 0) {
@@ -249,9 +322,7 @@ const displayHistory = computed<HistoryRecordView[]>(() => {
     plate: record.plate_number,
     color: record.plate_color,
     vehicleType: "识别记录",
-    time: new Date(record.created_at).toLocaleTimeString("zh-CN", {
-      hour12: false
-    })
+    time: new Date(record.created_at).toLocaleTimeString("zh-CN", { hour12: false })
   }));
 });
 
@@ -260,7 +331,6 @@ const filteredRecords = computed(() => {
   if (!term) {
     return displayHistory.value;
   }
-
   return displayHistory.value.filter((record) => `${record.plate}${record.color}${record.vehicleType}`.includes(term));
 });
 
@@ -272,7 +342,7 @@ const paginatedRecords = computed(() => {
 });
 
 const detectionRows = computed(() =>
-  detections.value.map((item) => ({
+  currentDetections.value.map((item) => ({
     plate: item.plate_number || "未识别",
     color: item.plate_color,
     confidence: formatConfidence(item.confidence),
@@ -281,12 +351,16 @@ const detectionRows = computed(() =>
 );
 
 const overlayDetections = computed<OverlayDetection[]>(() => {
+  if (mode.value !== "image") {
+    return [];
+  }
+
   const { width, height } = sourceFrameSize.value;
   if (!width || !height) {
     return [];
   }
 
-  return detections.value.map((item) => {
+  return imageDetections.value.map((item) => {
     const [x, y, boxWidth, boxHeight] = item.bbox;
     return {
       ...item,
@@ -298,24 +372,89 @@ const overlayDetections = computed<OverlayDetection[]>(() => {
   });
 });
 
+const streamPlaybackUrl = computed(() => {
+  if (streamStatus.value !== "running" || !streamControl.value?.published || !streamControl.value?.playback_url) {
+    return "";
+  }
+  const separator = streamControl.value.playback_url.includes("?") ? "&" : "?";
+  return `${streamControl.value.playback_url}${separator}ts=${playbackRefreshKey.value}`;
+});
+
+const monitorTitle = computed(() => {
+  if (mode.value === "stream") {
+    return "实时监控主画面";
+  }
+  if (mode.value === "video") {
+    return "标注视频预览";
+  }
+  return "识别结果预览";
+});
+
+const monitorBadge = computed(() => {
+  if (mode.value === "stream") {
+    return streamStatus.value === "running" ? "PUSH LIVE" : "STREAM";
+  }
+  if (mode.value === "video") {
+    return "VIDEO";
+  }
+  return "IMAGE";
+});
+
+const placeholderTitle = computed(() => {
+  if (mode.value === "stream") {
+    return "实时推流监控画面";
+  }
+  if (mode.value === "video") {
+    return "道路场景视频";
+  }
+  return "道路场景图像";
+});
+
+const placeholderDescription = computed(() => {
+  if (mode.value === "stream") {
+    return "启动推流后，这里会显示 mediamtx 提供的实时播放页。";
+  }
+  if (mode.value === "video") {
+    return "上传视频后，这里会显示处理完成的标注视频。";
+  }
+  return "上传图片后，这里会显示识别框和车牌号。";
+});
+
+const streamMetaText = computed(() => {
+  if (streamStatus.value === "starting") {
+    return "正在启动并等待视频流就绪，请稍候...";
+  }
+  if (streamStatus.value === "running") {
+    return "视频流已发布，当前主画面显示的是 mediamtx 提供的实时播放页。";
+  }
+  return "选择摄像头并启动后，系统会拉取 RTSP 流、识别标注并重新推送到本地流媒体服务。";
+});
+
 const resultMeta = computed(() => {
   if (mode.value === "stream") {
-    if (streamStatus.value === "connecting") {
-      return "正在连接视频流...";
+    if (streamStatus.value === "starting") {
+      return "正在等待 mediamtx 中的播放流准备完成。";
     }
-    if (streamStatus.value === "connected") {
-      return `实时识别中，当前画面检测到 ${detections.value.length} 个车牌。`;
+    if (streamControl.value?.playback_url) {
+      return `播放地址：${streamControl.value.playback_url}`;
     }
-    return "输入 RTSP 地址后可开始连续识别。";
+    return "当前尚未生成播放地址。";
+  }
+
+  if (mode.value === "video") {
+    if (videoResult.value) {
+      return `已处理 ${videoResult.value.processed_frame_count} 帧，识别到 ${videoResult.value.detections.length} 个唯一车牌。`;
+    }
+    return "上传视频后，会在这里显示处理完成的标注视频和识别结果。";
   }
 
   if (isLoading.value) {
     return "正在处理图片...";
   }
   if (!imagePreviewUrl.value) {
-    return "上传图片后会在这里显示识别结果。";
+    return "上传图片后，会在这里显示识别结果。";
   }
-  return `共识别到 ${detections.value.length} 个车牌。`;
+  return `共识别到 ${imageDetections.value.length} 个车牌。`;
 });
 
 function clampToPercent(value: number) {
@@ -342,17 +481,27 @@ function resetImagePreviewUrl() {
   }
 }
 
-function clearStreamFrame() {
-  streamFrameUrl.value = "";
+function resetImageState() {
+  resetImagePreviewUrl();
+  imageDetections.value = [];
+  sourceFrameSize.value = { width: 0, height: 0 };
 }
 
-function setMode(nextMode: "image" | "stream") {
+function resetVideoState() {
+  videoResult.value = null;
+}
+
+function setMode(nextMode: Mode) {
   mode.value = nextMode;
+  if (typeof window !== "undefined") {
+    window.sessionStorage.setItem(PLATE_MODE_STORAGE_KEY, nextMode);
+  }
   requestError.value = "";
-  detections.value = [];
-  sourceFrameSize.value = { width: 0, height: 0 };
-  if (nextMode === "image") {
-    stopStream();
+  if (nextMode !== "image") {
+    resetImageState();
+  }
+  if (nextMode !== "video") {
+    resetVideoState();
   }
 }
 
@@ -361,7 +510,6 @@ function handlePreviewImageLoad() {
   if (!image) {
     return;
   }
-
   sourceFrameSize.value = {
     width: image.naturalWidth,
     height: image.naturalHeight
@@ -392,14 +540,40 @@ async function loadHistory() {
   currentPage.value = 1;
 }
 
-async function handleFileChange(event: Event) {
+async function refreshStreamStatus() {
+  try {
+    const previousRunning = streamControl.value?.running ?? false;
+    const previousPlaybackUrl = streamControl.value?.playback_url ?? "";
+    const { data } = await fetchPlatePushStreamStatusApi();
+    streamControl.value = data;
+    streamStatus.value = data.running ? (data.published ? "running" : "starting") : "idle";
+    if (data.running) {
+      if (mode.value !== "stream") {
+        mode.value = "stream";
+      }
+      requestError.value = "";
+    }
+    if (data.running && data.published && data.playback_url && (!previousRunning || previousPlaybackUrl !== data.playback_url)) {
+      playbackRefreshKey.value = Date.now();
+    }
+    if (data.last_error && !data.running) {
+      requestError.value = data.last_error;
+    } else if (!data.running) {
+      requestError.value = "";
+    }
+  } catch {
+    if (streamStatus.value === "running" || streamStatus.value === "starting") {
+      requestError.value = "无法获取推流状态，请确认后端服务仍在运行。";
+    }
+  }
+}
+
+async function handleImageFileChange(event: Event) {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
 
-  resetImagePreviewUrl();
+  resetImageState();
   requestError.value = "";
-  detections.value = [];
-  sourceFrameSize.value = { width: 0, height: 0 };
 
   if (!file) {
     return;
@@ -407,96 +581,140 @@ async function handleFileChange(event: Event) {
 
   imagePreviewUrl.value = URL.createObjectURL(file);
   isLoading.value = true;
+  loadingText.value = "正在识别图片，请稍候...";
 
   try {
     await nextTick();
     const { data } = await recognizePlateImageApi(file);
-    detections.value = data.detections;
+    imageDetections.value = data.detections;
     await loadHistory();
   } catch (error) {
-    detections.value = [];
-    requestError.value = "识别失败，请确认后端服务已启动，或稍后重试。";
-    if (typeof error === "object" && error && "response" in error) {
-      const response = (error as { response?: { data?: { detail?: string } } }).response;
-      if (response?.data?.detail) {
-        requestError.value = response.data.detail;
-      }
-    }
+    imageDetections.value = [];
+    requestError.value = extractErrorMessage(error, "图片识别失败，请确认后端服务已启动后重试。");
   } finally {
     isLoading.value = false;
+    input.value = "";
   }
 }
 
-function stopStream() {
-  streamSocket.value?.close();
-  streamSocket.value = null;
-  streamOpened.value = false;
-  streamStatus.value = "idle";
-  clearStreamFrame();
-  if (mode.value === "stream") {
-    detections.value = [];
-    sourceFrameSize.value = { width: 0, height: 0 };
+async function handleVideoFileChange(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+
+  resetVideoState();
+  requestError.value = "";
+
+  if (!file) {
+    return;
+  }
+
+  isLoading.value = true;
+  loadingText.value = "正在处理视频并生成标注结果，请稍候...";
+
+  try {
+    const { data } = await recognizePlateVideoApi(file);
+    videoResult.value = data;
+    await loadHistory();
+  } catch (error) {
+    videoResult.value = null;
+    requestError.value = extractErrorMessage(error, "视频识别失败，请确认视频格式可读取并稍后重试。");
+  } finally {
+    isLoading.value = false;
+    input.value = "";
   }
 }
 
-function startStream() {
+async function startStream() {
   const rtspUrl = streamInput.value.trim();
   if (!rtspUrl) {
     requestError.value = "请输入 RTSP 地址。";
     return;
   }
 
-  stopStream();
-  mode.value = "stream";
+  setMode("stream");
   requestError.value = "";
-  streamStatus.value = "connecting";
+  streamStatus.value = "starting";
 
-  const socket = new WebSocket(buildPlateStreamWebSocketUrl(rtspUrl));
-  streamSocket.value = socket;
-  streamOpened.value = false;
-
-  socket.onopen = () => {
-    streamOpened.value = true;
-    streamStatus.value = "connected";
-  };
-
-  socket.onmessage = (event) => {
-    const payload = JSON.parse(event.data) as StreamMessage;
-    if (payload.error) {
-      requestError.value = payload.error;
-      stopStream();
-      return;
-    }
-
-    streamFrameUrl.value = `data:image/jpeg;base64,${payload.frame}`;
-    detections.value = payload.detections || [];
-    sourceFrameSize.value = {
-      width: payload.frame_width,
-      height: payload.frame_height
-    };
-  };
-
-  socket.onerror = () => {
-    requestError.value = "视频流连接失败，请确认 RTSP 地址和后端服务。";
+  try {
+    const { data } = await startPlatePushStreamApi(rtspUrl);
+    streamControl.value = data;
+    streamStatus.value = data.running ? (data.published ? "running" : "starting") : "idle";
+    playbackRefreshKey.value = Date.now();
+    await loadHistory();
+  } catch (error) {
     streamStatus.value = "idle";
-  };
-
-  socket.onclose = () => {
-    if (streamSocket.value === socket) {
-      streamSocket.value = null;
-      if (streamStatus.value !== "idle") {
-        streamStatus.value = "idle";
-      }
-    }
-  };
+    requestError.value = extractErrorMessage(
+      error,
+      "启动推流失败，请确认 mediamtx 已启动、ffmpeg 可用，并检查 RTSP 地址。"
+    );
+  }
 }
 
-onMounted(() => {
-  void loadHistory();
+async function stopStream() {
+  try {
+    const { data } = await stopPlatePushStreamApi();
+    streamControl.value = data;
+  } catch {
+    // Ignore stop errors and just reset local state.
+  } finally {
+    streamStatus.value = "idle";
+    requestError.value = "";
+  }
+}
+
+function extractErrorMessage(error: unknown, fallback: string) {
+  if (typeof error === "object" && error && "response" in error) {
+    const response = (error as { response?: { data?: { detail?: string } } }).response;
+    if (response?.data?.detail) {
+      return response.data.detail;
+    }
+  }
+  return fallback;
+}
+
+function startStatusPolling() {
+  stopStatusPolling();
+  statusTimer = window.setInterval(async () => {
+    await refreshStreamStatus();
+    if (mode.value === "stream") {
+      await loadHistory();
+    }
+  }, 3000);
+}
+
+function stopStatusPolling() {
+  if (statusTimer !== null) {
+    window.clearInterval(statusTimer);
+    statusTimer = null;
+  }
+}
+
+onMounted(async () => {
+  await loadHistory();
+  await refreshStreamStatus();
+  startStatusPolling();
 });
 
 watch(keyword, () => {
   currentPage.value = 1;
+});
+
+watch(mode, (value) => {
+  if (typeof window !== "undefined") {
+    window.sessionStorage.setItem(PLATE_MODE_STORAGE_KEY, value);
+  }
+});
+
+watch(selectedPreset, (value) => {
+  if (typeof window !== "undefined") {
+    window.sessionStorage.setItem(PLATE_STREAM_PRESET_STORAGE_KEY, value);
+  }
+});
+
+watch(streamInput, (value) => {
+  if (typeof window !== "undefined") {
+    window.sessionStorage.setItem(PLATE_STREAM_INPUT_STORAGE_KEY, value);
+  }
 });
 
 watch(totalPages, (value) => {
@@ -506,7 +724,7 @@ watch(totalPages, (value) => {
 });
 
 onBeforeUnmount(() => {
-  stopStream();
+  stopStatusPolling();
   resetImagePreviewUrl();
 });
 </script>
@@ -523,19 +741,18 @@ onBeforeUnmount(() => {
   margin-right: -18px;
 }
 
-.page-header {
+.compact-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
 }
 
-.page-header :deep(h1) {
+.compact-header :deep(h1) {
   margin: 0;
   font-size: 24px;
 }
 
-.page-header :deep(p) {
+.compact-header :deep(p) {
   display: none;
 }
 
@@ -584,12 +801,6 @@ onBeforeUnmount(() => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-}
-
-.stream-subtext,
-.monitor-subtext,
-.history-subtext {
-  display: none;
 }
 
 .stream-badge,
@@ -643,6 +854,19 @@ onBeforeUnmount(() => {
   padding: 9px 15px;
 }
 
+.stream-links,
+.result-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  font-size: 13px;
+  color: var(--text-soft);
+}
+
+.stream-link {
+  color: var(--accent-strong);
+}
+
 .monitor-panel {
   display: grid;
   gap: 8px;
@@ -662,6 +886,19 @@ onBeforeUnmount(() => {
   background: linear-gradient(180deg, rgba(11, 16, 32, 0.58), rgba(11, 16, 32, 0.44));
 }
 
+.stream-viewer-shell {
+  min-height: 720px;
+}
+
+.stream-viewer,
+.preview-video {
+  width: 100%;
+  min-height: 720px;
+  border: 0;
+  border-radius: 10px;
+  background: #0b1020;
+}
+
 .image-frame {
   position: relative;
   display: inline-block;
@@ -675,10 +912,6 @@ onBeforeUnmount(() => {
   max-height: 500px;
   object-fit: contain;
   border-radius: 10px;
-}
-
-.preview-image.stream {
-  max-height: 760px;
 }
 
 .plate-box {
@@ -810,8 +1043,16 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 820px) {
-  .page-header {
+  .compact-header {
     display: block;
+  }
+
+  .mode-panel {
+    flex-wrap: wrap;
+  }
+
+  .mode-btn {
+    min-width: calc(50% - 5px);
   }
 
   .stream-input-row {
@@ -826,8 +1067,10 @@ onBeforeUnmount(() => {
     flex: 1;
   }
 
-  .preview-image.stream {
-    max-height: 520px;
+  .stream-viewer-shell,
+  .stream-viewer,
+  .preview-video {
+    min-height: 480px;
   }
 }
 

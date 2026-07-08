@@ -1,0 +1,21 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "C:\\Users\\13520\\Desktop\\\u5c0f\u5b66\u671f2\\car-vision-agent-system\\datasets",
+  "weights_dir": "weights",
+  "runs_dir": "runs",
+  "uuid": "0140d75c5115c30ca0af1067ab4110ab388778c51b42eb6a2570baf180289125",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": true
+}
