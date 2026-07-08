@@ -159,3 +159,132 @@ with MediaPipePose() as pose:
 2. **YOLO / OCR 推理层**：`YoloDetector`、`OCRRecognizer` 仍为占位桩，需后续实现。
 3. **WebSocket 视频流模式**：当前为单帧 HTTP POST 推理；如需连续视频流可改为 `VIDEO` 模式 + WebSocket 推送以提升吞吐。
 4. **history 接口**：`PoliceGestureService.history()` 目前仍为 mock，需接入持久化存储后返回真实的推理历史。
+
+---
+
+# 改动说明 — 手势分类器 + 流媒体配置 + 前端手势页真实联调
+
+> 日期：2026-07-07  
+> 分支：`合并视频流处理`  
+> 范围：`backend/` · `frontend/` · `stream_core.py` · `docker-compose.yml` · `docs/`
+
+---
+
+## 改动概览
+
+1. **手势分类器规则化实现**：从占位桩 → 基于 MediaPipe 关键点的几何规则分类（手部 4 类 + 交警 5 类）
+2. **流媒体服务器配置**：`stream_core.py` 路径可配置（环境变量）+ `docker-compose.yml` 加入 MediaMTX 容器
+3. **前端手势页真实联调**：文件上传 → POST multipart → 关键点骨架画布叠加 → 识别置信度展示
+
+---
+
+## 文件变更清单
+
+### 修改
+
+| 文件 | 改动类型 | 说明 |
+|------|----------|------|
+| `backend/app/models_infer/gesture_classifier.py` | **完整重写** | 从 3 行占位 → 160+ 行基于关键点的规则分类器 |
+| `backend/app/services/owner_gesture_service.py` | 接入分类器 | 新增 `GestureClassifier` lazy-load；`process_frame()` 先调用 MediaPipe 再调用规则分类 |
+| `backend/app/services/police_gesture_service.py` | 接入分类器 | 同 owner，使用 `domain="police"` 调用 |
+| `stream_core.py` | **重构** | 路径改为环境变量 `MEDIAMTX_PATH` / `FFMPEG_PATH` + 自动 PATH 查找；新增 `StreamConfig` 和 `stop()` |
+| `docker-compose.yml` | 新增服务 | 添加 `mediamtx` 容器（bluenviron/mediamtx:latest），暴露 RTSP/RTMP/HLS/WebRTC 端口 |
+| `frontend/src/api/owner_gesture.ts` | API 改造 | `/current` GET → POST multipart/form-data |
+| `frontend/src/api/police_gesture.ts` | API 改造 | `/current` GET → POST multipart/form-data |
+| `frontend/src/views/OwnerGesture.vue` | **重构** | 视频流占位 → 真实文件上传 + 图片预览 + canvas 手部骨架叠加 + 置信度展示 |
+| `frontend/src/views/PoliceGesture.vue` | **重构** | 视频流占位 → 真实文件上传 + 图片预览 + canvas 姿态骨架叠加 + 结果列表 |
+| `docs/changes-mediapipe-inference.md` | 文档 | 追加本次三项改动的说明 |
+
+---
+
+## 详细说明
+
+### 一、手势分类器规则化实现
+
+`GestureClassifier.classify(keypoints, domain)` 现已实现真实分类逻辑：
+
+**手部（owner, 21 关键点/只手）**：
+
+| 手势 | 规则 |
+|------|------|
+| `open_palm`（手掌张开）| 食指/中指/无名指/小拇指尖 y < 指根 MCP y |
+| `fist`（握拳）| 四指尖 y > PIP 关节 y |
+| `thumbs_up`（拇指向上）| 拇指尖 < 手腕 y - 0.05，其余手指卷曲 |
+| `thumbs_down`（拇指向下）| 拇指尖 > 手腕 y + 0.05，其余手指卷曲 |
+| `unknown`（未识别）| 以上都不满足 |
+
+**交警姿态（police, 33 关键点/人）**：
+
+| 手势 | 规则 |
+|------|------|
+| `stop`（停止）| 双手腕 y < 肩膀 y - 0.08 |
+| `left_turn`（左转弯）| 左手腕 y < 左肩 y - 0.08（或左臂横向扩展） |
+| `right_turn`（右转弯）| 右手腕 y < 右肩 y - 0.08（或右臂横向扩展） |
+| `go_straight`（直行）| 双臂未举起 |
+| `unknown` | 未检测到人体 |
+
+**调用链路更新**：
+```
+POST /api/v1/owner-gesture/current
+  → MediaPipeHands.infer(frame)                    # 21×N 关键点
+  → GestureClassifier.classify(raw_kps, "owner")   # → {gesture, confidence}
+  → GestureFrameResult(gesture="open_palm", confidence=0.92, ...)
+```
+
+---
+
+### 二、流媒体配置（MediaMTX + FFmpeg）
+
+**`stream_core.py` 重构**：
+- 不再硬编码绝对路径，改用环境变量：
+  - `MEDIAMTX_PATH` — 指向 `mediamtx.exe` 的绝对路径
+  - `FFMPEG_PATH` — 可选，未设时自动从系统 PATH 查找 `ffmpeg`
+- 新增 `StreamConfig` 数据类统一配置
+- 新增 `StreamManager.stop()` 优雅关闭进程
+
+**`docker-compose.yml` 新增 mediamtx 服务**：
+```yaml
+mediamtx:
+  image: bluenviron/mediamtx:latest
+  ports:
+    - "8554:8554"     # RTSP
+    - "1935:1935"     # RTMP
+    - "8888:8888"     # HLS
+    - "8889:8889"     # WebRTC
+```
+
+---
+
+### 三、前端手势页真实联调
+
+**OwnerGesture.vue 改进**：
+- 文件选择 → 预览 → POST multipart → 显示 gesture/confidence
+- Canvas 叠加手部 21 关键点 + 连接线（拇指/食指/中指/无名指/小指）
+- 支持多只手同时渲染
+
+**PoliceGesture.vue 改进**：
+- 文件选择 → 预览 → POST multipart → 显示 gesture/confidence
+- Canvas 叠加姿态 33 关键点 + 肢体连接线（手臂/躯干/腿部/面部）
+- 右侧结果列表高亮当前识别手势
+
+**手势标签中文映射**：
+
+| 英文 key | 中文 |
+|----------|------|
+| `open_palm` | 手掌张开 |
+| `fist` | 握拳 |
+| `thumbs_up` | 拇指向上 |
+| `thumbs_down` | 拇指向下 |
+| `stop` | 停止信号 |
+| `left_turn` | 左转弯信号 |
+| `right_turn` | 右转弯信号 |
+| `go_straight` | 直行信号 |
+
+---
+
+## 后续待办
+
+1. **YOLO / OCR 推理层**：`YoloDetector`、`OCRRecognizer` 仍为占位桩。
+2. **WebSocket 实时视频流推测**：目前为单帧 HTTP POST；如需连续推流可在此基础上接入 WebSocket。
+3. **history 接口持久化**：`PoliceGestureService.history()` 仍为 mock，需接 DB。
+4. **交警手势更多姿势**：当前仅 4 类规则，左待转/变道/减速/靠边需更多姿态规则或时序推理。

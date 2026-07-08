@@ -7,7 +7,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from app.models_infer import MediaPipePose
+from app.models_infer import MediaPipePose, GestureClassifier
 from app.schemas.gesture import GestureFrameResult, GestureHistoryItem, Keypoint
 
 logger = logging.getLogger(__name__)
@@ -17,6 +17,7 @@ class PoliceGestureService:
     """Police (traffic) gesture service backed by MediaPipe Pose."""
 
     _pose: Optional[MediaPipePose] = None
+    _classifier: Optional[GestureClassifier] = None
 
     # ------------------------------------------------------------------
     # Lazy-load helpers
@@ -30,6 +31,12 @@ class PoliceGestureService:
             self._pose = MediaPipePose()
             logger.info("PoliceGestureService – MediaPipePose loaded")
         return self._pose
+
+    @property
+    def classifier(self) -> GestureClassifier:
+        if self._classifier is None:
+            self._classifier = GestureClassifier()
+        return self._classifier
 
     # ------------------------------------------------------------------
     # Public API
@@ -58,20 +65,29 @@ class PoliceGestureService:
 
         result = self.pose.infer(frame)
 
+        raw_kps = result["keypoints"]
+        num_poses = result.get("num_poses_detected", 0)
+
+        # ----- Rule-based gesture classification -----
+        cls_result = self.classifier.classify(raw_kps, domain="police")
+        gesture_label = cls_result["gesture"]
+        cls_conf = cls_result["confidence"]
+        if num_poses == 0:
+            gesture_label = "未检测到人体"
+            cls_conf = 0.0
+
         keypoints = [
             Keypoint(
                 x=kp["x"],
                 y=kp["y"],
                 score=kp.get("visibility", kp.get("z", 0.0)),
             )
-            for kp in result["keypoints"]
+            for kp in raw_kps
         ]
-        num_poses = result.get("num_poses_detected", 0)
-        gesture_label = f"检测到 {num_poses} 人" if num_poses > 0 else "未检测到人体"
 
         return GestureFrameResult(
             gesture=gesture_label,
-            confidence=0.99 if num_poses > 0 else 0.0,
+            confidence=round(cls_conf, 4),
             keypoints=keypoints,
             updated_at=datetime.utcnow(),
         )
