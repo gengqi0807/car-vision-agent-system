@@ -10,6 +10,7 @@ from threading import Lock
 from fastapi import HTTPException, status
 
 from app.core.config import settings
+from app.utils.crypto import normalize_email
 
 
 @dataclass
@@ -24,10 +25,13 @@ class EmailCodeService:
     _lock = Lock()
 
     def send_code(self, email: str, username: str) -> None:
+        normalized_email = normalize_email(email)
+        if normalized_email is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="邮箱格式不正确")
         now = datetime.now(timezone.utc)
 
         with self._lock:
-            entry = self._entries.get(email)
+            entry = self._entries.get(normalized_email)
             if entry and (now - entry.last_sent_at).total_seconds() < settings.email_code_cooldown_seconds:
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -35,27 +39,30 @@ class EmailCodeService:
                 )
 
             code = f"{randbelow(1_000_000):06d}"
-            self._entries[email] = EmailCodeEntry(
+            self._entries[normalized_email] = EmailCodeEntry(
                 code=code,
                 expires_at=now + timedelta(minutes=settings.email_code_expire_minutes),
                 last_sent_at=now,
             )
 
-        self._send_email(email, username, code)
+        self._send_email(normalized_email, username, code)
 
     def verify_code(self, email: str, code: str) -> bool:
+        normalized_email = normalize_email(email)
+        if normalized_email is None:
+            return False
         now = datetime.now(timezone.utc)
         with self._lock:
-            entry = self._entries.get(email)
+            entry = self._entries.get(normalized_email)
             if entry is None:
                 return False
             if entry.expires_at < now:
-                self._entries.pop(email, None)
+                self._entries.pop(normalized_email, None)
                 return False
             if entry.code != code:
                 return False
 
-            self._entries.pop(email, None)
+            self._entries.pop(normalized_email, None)
             return True
 
     def _send_email(self, email: str, username: str, code: str) -> None:

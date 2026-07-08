@@ -47,13 +47,13 @@ class AuthService:
         return TokenResponse(access_token=token, user=UserProfile.model_validate(user))
 
     def send_email_login_code(self, email: str) -> None:
-        user = self.db.scalar(select(User).where(User.email == email))
+        user = self.db.scalar(select(User).where(User.email_hash == User.build_email_hash(email)))
         if user is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="该邮箱尚未绑定账号")
         self.email_code_service.send_code(email=email, username=user.username)
 
     def email_login(self, payload: EmailLoginRequest) -> TokenResponse:
-        user = self.db.scalar(select(User).where(User.email == payload.email))
+        user = self.db.scalar(select(User).where(User.email_hash == User.build_email_hash(payload.email)))
         if user is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="该邮箱尚未绑定账号")
         if not self.email_code_service.verify_code(payload.email, payload.code):
@@ -96,10 +96,12 @@ class AuthService:
         exclude_user_id: int | None = None,
     ) -> None:
         conditions = [User.username == username]
-        if email:
-            conditions.append(User.email == email)
-        if phone:
-            conditions.append(User.phone == phone)
+        email_hash = User.build_email_hash(email)
+        phone_hash = User.build_phone_hash(phone)
+        if email_hash:
+            conditions.append(User.email_hash == email_hash)
+        if phone_hash:
+            conditions.append(User.phone_hash == phone_hash)
 
         statement = select(User).where(or_(*conditions))
         if exclude_user_id is not None:
@@ -111,7 +113,7 @@ class AuthService:
 
         if existing_user.username == username:
             detail = "用户名已存在"
-        elif email and existing_user.email == email:
+        elif email_hash and existing_user.email_hash == email_hash:
             detail = "邮箱已存在"
         else:
             detail = "手机号已存在"

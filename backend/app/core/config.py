@@ -28,6 +28,17 @@ class Settings(BaseSettings):
     api_v1_prefix: str = Field(default="/api/v1")
     secret_key: str = Field(default="change-me")
     access_token_expire_minutes: int = Field(default=120)
+    openapi_description: str = Field(
+        default=(
+            "智能车载视觉感知与交互系统后端 API，覆盖用户认证、车牌识别、"
+            "交警手势识别、车主手势控车与告警监控等能力。"
+        )
+    )
+    docs_url: str = Field(default="/docs")
+    redoc_url: str = Field(default="/redoc")
+    openapi_url: str = Field(default="/openapi.json")
+    api_contact_name: str = Field(default="Car Vision Team")
+    api_contact_email: str = Field(default="team@example.com")
 
     # ---------- 数据库配置（HEAD） ----------
     database_url: str | None = Field(default=None)
@@ -44,6 +55,16 @@ class Settings(BaseSettings):
     llm_provider: str = Field(default="openai-compatible")
     llm_api_base: str = Field(default="")
     llm_api_key: str = Field(default="")
+
+    # ---------- 数据加密配置 ----------
+    data_encryption_key: str = Field(
+        default="",
+        description="Base64-encoded AES key for encrypting sensitive fields.",
+    )
+    data_hash_key: str = Field(
+        default="",
+        description="Optional secret used for HMAC-based lookup hashes.",
+    )
 
     # ---------- 邮件验证码配置 ----------
     smtp_host: str = Field(default="smtp.163.com")
