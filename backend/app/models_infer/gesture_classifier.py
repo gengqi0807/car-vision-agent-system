@@ -120,6 +120,9 @@ class GestureClassifier:
         if all_four_ext:
             return {"domain": "owner", "gesture": "open_palm", "confidence": 0.92}
 
+        if index_ext and middle_curled and ring_curled and pinky_curled:
+            return {"domain": "owner", "gesture": "point", "confidence": 0.84}
+
         if all_four_curled:
             return {"domain": "owner", "gesture": "fist", "confidence": 0.90}
 

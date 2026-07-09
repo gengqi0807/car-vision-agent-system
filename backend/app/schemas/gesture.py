@@ -15,8 +15,14 @@ class ControlPanelState(BaseModel):
     climate_temperature: int
     phone_call_active: bool
     current_mode: str
+    media_playing: bool = True
+    comfort_scene: str = "标准"
+    vehicle_status: str = "就绪"
+    focus_tile: str = "home"
     last_gesture: str | None = None
     last_command: str | None = None
+    last_command_at: datetime | None = None
+    last_feedback: str | None = None
     updated_at: datetime | None = None
 
 

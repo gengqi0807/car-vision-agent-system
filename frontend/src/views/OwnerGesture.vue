@@ -38,7 +38,7 @@
           >
             刷新设备
           </button>
-          <span class="file-name">{{ cameraActive ? "实时模式：约每 0.45 秒分析一帧" : "摄像头未开启" }}</span>
+          <span class="file-name">{{ cameraActive ? "实时模式：约每 0.55 秒分析一帧" : "摄像头未开启" }}</span>
         </div>
 
         <div class="video-status" v-if="error">
@@ -55,12 +55,7 @@
             v-show="cameraActive"
             @loadedmetadata="onVideoReady"
           />
-          <canvas
-            ref="canvasRef"
-            class="overlay-canvas"
-            :width="canvasW"
-            :height="canvasH"
-          />
+          <canvas ref="canvasRef" class="overlay-canvas" :width="canvasW" :height="canvasH" />
           <canvas ref="captureCanvasRef" class="capture-canvas" />
           <div v-if="!cameraActive" class="image-placeholder gesture-frame">
             手势实时识别
@@ -71,17 +66,15 @@
         <div class="stream-meta">{{ cameraStatusText }}</div>
 
         <template v-if="result">
-          <div class="recognition-summary">
-            <span class="gesture-tag">{{ gestureLabel }}</span>
-            <span class="recognition-chip gesture-confidence">
-              置信度 {{ (result.confidence * 100).toFixed(1) }}%
-            </span>
-            <span class="gesture-action-chip">{{ gestureActionLabel }}</span>
-            <span class="recognition-chip">
-              {{ result.keypoints?.length || 0 }} 点 · {{ (result.keypoints?.length || 0) / 21 }} 手
-            </span>
-            <span class="recognition-chip" v-if="sessionId">会话 {{ sessionId }}</span>
-          </div>
+        <div class="recognition-summary">
+          <span class="gesture-tag">{{ gestureLabel }}</span>
+          <span class="recognition-chip gesture-confidence">
+            置信度 {{ recognitionConfidence }}
+          </span>
+          <span class="gesture-action-chip">{{ gestureActionLabel }}</span>
+          <span class="recognition-chip">{{ gestureCommandLabel }}</span>
+          <span class="recognition-chip" v-if="sessionId">会话 {{ sessionId }}</span>
+        </div>
         </template>
       </article>
 
@@ -100,19 +93,25 @@
             </div>
             <div class="cockpit-meta">
               <span>5G</span>
-              <span>23°C</span>
+              <span>{{ panelState.climate_temperature }}°C</span>
               <span>{{ cockpitClock }}</span>
             </div>
           </div>
 
           <div class="cockpit-display">
+            <div v-if="showConfirmSpotlight" class="confirm-spotlight">
+              <span class="section-label">确认执行</span>
+              <strong>{{ focusTileLabel }}</strong>
+              <span>{{ confirmSpotlightText }}</span>
+            </div>
+
             <div class="cockpit-off" v-if="activeCockpitPage === 'off'">
               <div class="off-screen">
                 <div class="off-glow"></div>
                 <div class="off-copy">
                   <span class="section-label">待机状态</span>
                   <strong>CMC 已关闭</strong>
-                  <span>检测到唤醒手势后将直接进入主页，不再停留在通话界面。</span>
+                  <span>识别到手掌张开后唤醒系统，进入主页待命。</span>
                 </div>
               </div>
             </div>
@@ -127,16 +126,44 @@
                   <div class="map-badge">导航主页</div>
                 </div>
                 <div class="home-side-widgets">
-                  <div class="widget-card media-widget">
+                  <div class="widget-card" :class="{ focused: isTileFocused('media') }">
                     <span class="section-label">媒体</span>
-                    <strong>行车伴音</strong>
-                    <span>音量 {{ Math.round(panelState.volume) }}% · 蓝牙已连接</span>
+                    <strong>{{ panelState.media_playing ? "蓝牙音乐播放中" : "媒体已暂停" }}</strong>
+                    <span>音量 {{ Math.round(panelState.volume) }}% · 单指画圈可直接调节</span>
                     <div class="mini-track"><div class="mini-fill" :style="{ width: `${panelState.volume}%` }"></div></div>
                   </div>
-                  <div class="widget-card vehicle-widget">
+                  <div class="widget-card" :class="{ focused: isTileFocused('vehicle') }">
                     <span class="section-label">车辆</span>
-                    <strong>{{ panelState.climate_temperature }}°C 舒适座舱</strong>
+                    <strong>{{ panelState.vehicle_status }}</strong>
                     <span>{{ modeSummary }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="cockpit-media" v-else-if="activeCockpitPage === 'media'">
+              <div class="media-layout">
+                <div class="media-main" :class="{ focused: isTileFocused('media') }">
+                  <span class="section-label">媒体中心</span>
+                  <strong>{{ panelState.media_playing ? "行车伴音" : "媒体暂停" }}</strong>
+                  <span>{{ mediaStatusText }}</span>
+                  <div class="volume-knob">
+                    <div class="volume-ring">
+                      <div class="volume-ring-fill" :style="{ width: `${panelState.volume}%` }"></div>
+                    </div>
+                    <div class="volume-value">{{ Math.round(panelState.volume) }}</div>
+                  </div>
+                </div>
+                <div class="media-side">
+                  <div class="metric-card">
+                    <span class="section-label">来源</span>
+                    <strong>蓝牙音频</strong>
+                    <span>握拳可确认播放/暂停</span>
+                  </div>
+                  <div class="metric-card">
+                    <span class="section-label">推荐</span>
+                    <strong>城市通勤</strong>
+                    <span>单指画圈时自动前置媒体页</span>
                   </div>
                 </div>
               </div>
@@ -144,8 +171,8 @@
 
             <div class="cockpit-comfort" v-else-if="activeCockpitPage === 'comfort'">
               <div class="comfort-layout">
-                <div class="comfort-main">
-                  <span class="section-label">空调控制</span>
+                <div class="comfort-main" :class="{ focused: isTileFocused('comfort') }">
+                  <span class="section-label">舒适控制</span>
                   <strong>{{ panelState.climate_temperature }}°C</strong>
                   <span>{{ comfortStatusText }}</span>
                   <div class="climate-ring">
@@ -154,19 +181,46 @@
                 </div>
                 <div class="comfort-side">
                   <div class="metric-card">
-                    <span class="section-label">风量</span>
-                    <strong>3 档</strong>
-                    <span>维持前排柔风</span>
+                    <span class="section-label">场景</span>
+                    <strong>{{ panelState.comfort_scene }}</strong>
+                    <span>握拳后执行舒适联动</span>
                   </div>
                   <div class="metric-card">
                     <span class="section-label">座椅</span>
                     <strong>主驾通风</strong>
-                    <span>已同步舒适模式</span>
+                    <span>已与温控策略联动</span>
                   </div>
                   <div class="metric-card">
                     <span class="section-label">空气</span>
                     <strong>PM2.5 优</strong>
-                    <span>座舱净化持续运行</span>
+                    <span>净化系统持续工作</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="cockpit-vehicle" v-else-if="activeCockpitPage === 'vehicle'">
+              <div class="vehicle-layout">
+                <div class="vehicle-main" :class="{ focused: isTileFocused('vehicle') }">
+                  <span class="section-label">车辆状态</span>
+                  <strong>{{ panelState.vehicle_status }}</strong>
+                  <span>{{ vehicleStatusText }}</span>
+                </div>
+                <div class="vehicle-side">
+                  <div class="metric-card">
+                    <span class="section-label">续航</span>
+                    <strong>438 km</strong>
+                    <span>电池温控正常</span>
+                  </div>
+                  <div class="metric-card">
+                    <span class="section-label">车门</span>
+                    <strong>全部关闭</strong>
+                    <span>锁止状态可握拳确认</span>
+                  </div>
+                  <div class="metric-card">
+                    <span class="section-label">360 环视</span>
+                    <strong>待命</strong>
+                    <span>切换到本页后可查看车况</span>
                   </div>
                 </div>
               </div>
@@ -183,7 +237,7 @@
                     <span>挂断</span>
                   </div>
                   <div class="call-action accept">
-                    <span>{{ panelState.phone_call_active ? "静音" : "接听" }}</span>
+                    <span>{{ panelState.phone_call_active ? "通话中" : "接听" }}</span>
                   </div>
                 </div>
               </div>
@@ -191,10 +245,14 @@
           </div>
 
           <div class="cockpit-dock">
-            <div class="dock-item" :class="{ active: activeCockpitPage === 'home' }">主页</div>
-            <div class="dock-item" :class="{ active: activeCockpitPage === 'comfort' }">舒适</div>
-            <div class="dock-item" :class="{ active: activeCockpitPage === 'call' }">电话</div>
-            <div class="dock-item">车辆</div>
+            <div
+              v-for="page in cockpitPages"
+              :key="page.key"
+              class="dock-item"
+              :class="{ active: activeCockpitPage === page.key }"
+            >
+              {{ page.label }}
+            </div>
           </div>
         </div>
       </article>
@@ -226,16 +284,7 @@ const sessionId = ref("");
 const cameraDeviceLabel = ref("");
 const videoDevices = ref<Array<{ deviceId: string; label: string }>>([]);
 const selectedDeviceId = ref("");
-const debugVideoWidth = ref(0);
-const debugVideoHeight = ref(0);
-const debugReadyState = ref(0);
-const debugTrackState = ref("none");
-const debugTrackMuted = ref("false");
-const debugPreviewFrames = ref(0);
-const debugCaptureMode = ref("video");
-const debugRawFrameState = ref("已停用");
-const debugFrameSignature = ref("");
-const debugFrameContrast = ref(0);
+const uiNow = ref(Date.now());
 
 const frameIntervalMs = 550;
 const captureMaxWidth = 640;
@@ -245,13 +294,18 @@ let mediaStream: MediaStream | null = null;
 let activeSourceVideo: HTMLVideoElement | null = null;
 let captureTimer: number | null = null;
 let requestInFlight = false;
-let previewFrameHandle: number | null = null;
+let uiClockTimer: number | null = null;
 
 const LABEL_MAP: Record<string, string> = {
   open_palm: "手掌张开",
   fist: "握拳",
+  point: "单指伸出",
+  index_circle: "单指画圈",
+  swipe_left: "向左滑动",
+  swipe_right: "向右滑动",
   thumbs_up: "拇指向上",
   thumbs_down: "拇指向下",
+  wave: "挥手",
   unknown: "未识别",
   "未检测到手部": "未检测到手部",
 };
@@ -259,11 +313,44 @@ const LABEL_MAP: Record<string, string> = {
 const GESTURE_ACTION_MAP: Record<string, string> = {
   open_palm: "唤醒",
   fist: "确认",
+  point: "待命",
+  index_circle: "音量",
+  swipe_left: "切换",
+  swipe_right: "切换",
   thumbs_up: "接听",
   thumbs_down: "挂断",
+  wave: "主页",
   unknown: "等待",
   "未检测到手部": "无动作",
 };
+
+const COMMAND_DISPLAY_MAP: Record<string, string> = {
+  WakeSystem: "系统唤醒",
+  ConfirmAction: "确认执行",
+  AdjustVolume: "音量调节",
+  SwitchPrevFeature: "切换功能",
+  SwitchNextFeature: "切换功能",
+  AnswerCall: "接听电话",
+  HangUpCall: "挂断电话",
+  ReturnHome: "返回主页",
+};
+
+const MODE_LABEL_MAP: Record<string, string> = {
+  home: "主页",
+  media: "媒体",
+  comfort: "舒适",
+  vehicle: "车辆",
+  call: "通话",
+  off: "关闭",
+};
+
+const cockpitPages = [
+  { key: "home", label: "主页" },
+  { key: "media", label: "媒体" },
+  { key: "comfort", label: "舒适" },
+  { key: "vehicle", label: "车辆" },
+  { key: "call", label: "电话" },
+] as const;
 
 function createDefaultPanelState(): OwnerControlPanelState {
   return {
@@ -272,8 +359,14 @@ function createDefaultPanelState(): OwnerControlPanelState {
     climate_temperature: 24,
     phone_call_active: false,
     current_mode: "home",
+    media_playing: true,
+    comfort_scene: "标准",
+    vehicle_status: "就绪",
+    focus_tile: "home",
     last_gesture: null,
     last_command: null,
+    last_command_at: null,
+    last_feedback: null,
     updated_at: null,
   };
 }
@@ -283,68 +376,99 @@ const gestureLabel = computed(() => {
   if (!gesture) return "—";
   return LABEL_MAP[gesture] || gesture;
 });
+
 const gestureActionLabel = computed(() => {
   const key = result.value?.gesture || panelState.value.last_gesture || "unknown";
   return GESTURE_ACTION_MAP[key] || GESTURE_ACTION_MAP.unknown;
 });
-const systemAwake = computed(() => panelState.value.system_awake);
-const modeSummary = computed(() => {
-  if (!systemAwake.value) {
-    return "系统默认关闭，识别到唤醒手势后会立即开启并回到主页。";
-  }
-  if (panelState.value.phone_call_active) {
-    return "当前通话已接管主界面，可直接观察通话状态。";
-  }
-  if (panelState.value.current_mode === "control") {
-    return "舒适功能已被置于前台，温控与座舱参数突出显示。";
-  }
-  return "主页已经恢复显示，导航、媒体与车辆卡片进入待命状态。";
+
+const recognitionConfidence = computed(() => `${((result.value?.confidence ?? 0) * 100).toFixed(1)}%`);
+
+const gestureCommandLabel = computed(() => {
+  const command = result.value?.control_command || panelState.value.last_command;
+  return command ? COMMAND_DISPLAY_MAP[command] || command : "等待动作";
 });
-const cockpitPages = [
-  { key: "home", label: "主页" },
-  { key: "comfort", label: "舒适" },
-  { key: "call", label: "通话" },
-] as const;
-type CockpitPageKey = "off" | (typeof cockpitPages)[number]["key"];
-const activeCockpitPage = computed<CockpitPageKey>(() => {
+
+const systemAwake = computed(() => panelState.value.system_awake);
+
+const activeCockpitPage = computed<"off" | "home" | "media" | "comfort" | "vehicle" | "call">(() => {
   if (!systemAwake.value) {
     return "off";
   }
-  if (panelState.value.phone_call_active) {
+
+  const currentMode = panelState.value.current_mode;
+  if (currentMode === "call" || panelState.value.phone_call_active) {
     return "call";
   }
-  if (panelState.value.current_mode === "control") {
-    return "comfort";
+
+  if (currentMode === "media" || currentMode === "comfort" || currentMode === "vehicle") {
+    return currentMode;
   }
   return "home";
 });
-const activePageLabel = computed(() => {
-  if (activeCockpitPage.value === "off") {
-    return "关闭";
+
+const activePageLabel = computed(() => MODE_LABEL_MAP[activeCockpitPage.value] || "主页");
+
+const focusTileLabel = computed(() => MODE_LABEL_MAP[panelState.value.focus_tile] || "主页");
+
+const cockpitClock = computed(() =>
+  new Date(uiNow.value).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })
+);
+
+const modeSummary = computed(() => {
+  if (!systemAwake.value) {
+    return "系统默认关闭，识别到唤醒手势后进入主页。";
   }
-  return cockpitPages.find((page) => page.key === activeCockpitPage.value)?.label || "主页";
+  if (activeCockpitPage.value === "comfort") {
+    return "舒适功能前置展示，便于确认空调与座舱联动。";
+  }
+  if (activeCockpitPage.value === "vehicle") {
+    return "车辆页用于查看车况与整车状态。";
+  }
+  return "主页汇总导航、媒体、舒适与车辆信息。";
 });
+
+const mediaStatusText = computed(() => {
+  return panelState.value.media_playing
+    ? "单指画圈可直接提高音量，握拳可确认当前播放状态。"
+    : "媒体已暂停，握拳后会恢复播放。";
+});
+
 const comfortStatusText = computed(() => {
-  if (panelState.value.current_mode === "control") {
-    return "握拳确认后已切入舒适控制，温度与空气质量卡片高亮。";
-  }
-  return "当前维持舒适巡航设定，空调、座椅与净化联动待命。";
+  return panelState.value.comfort_scene === "舒享"
+    ? "握拳后已执行舒享模式，温控与座椅同步强化。"
+    : "左右滑动切换到此页后，可通过握拳执行舒适场景。";
 });
+
+const vehicleStatusText = computed(() => {
+  return panelState.value.vehicle_status === "已完成整车检查"
+    ? "整车检查已执行完成，关键车况正常。"
+    : "可通过左右滑动切换到车辆页，再用握拳执行车况确认。";
+});
+
 const callStatusText = computed(() => {
   if (panelState.value.phone_call_active) {
-    return "通话已接通，方向盘与手势挂断逻辑均可接管结束操作。";
+    return "通话已接通，拇指向下可直接挂断。";
   }
   return "检测到来电场景时，拇指向上可进入通话界面。";
 });
-const cockpitClock = computed(() => {
-  const base = panelState.value.updated_at ? new Date(panelState.value.updated_at) : new Date();
-  return base.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+
+const showConfirmSpotlight = computed(() => {
+  return (
+    panelState.value.last_command === "ConfirmAction" &&
+    isFreshCommand(panelState.value.last_command_at, 3200)
+  );
+});
+
+const confirmSpotlightText = computed(() => {
+  return panelState.value.last_feedback || `${focusTileLabel.value}功能已执行。`;
 });
 
 const temperatureFillWidth = computed(() => {
   const raw = ((panelState.value.climate_temperature - 18) / 12) * 100;
   return `${Math.max(0, Math.min(100, raw))}%`;
 });
+
 const cameraStatusText = computed(() => {
   if (!cameraActive.value) {
     return "摄像头未开启";
@@ -356,6 +480,15 @@ const cameraStatusText = computed(() => {
   }
   return loading.value ? "实时识别中 ..." : "摄像头已连接，等待下一帧";
 });
+
+function isTileFocused(tile: string) {
+  return panelState.value.focus_tile === tile;
+}
+
+function isFreshCommand(timestamp: string | null, windowMs: number) {
+  if (!timestamp) return false;
+  return uiNow.value - new Date(timestamp).getTime() <= windowMs;
+}
 
 function createSessionId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -393,7 +526,6 @@ async function startCamera() {
   sessionId.value = createSessionId();
   result.value = null;
   panelState.value = createDefaultPanelState();
-  resetDebugState();
 
   try {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -421,7 +553,6 @@ async function startCamera() {
     await videoRef.value.play();
     await ensureVideoFrame(videoRef.value);
     syncCanvasToPreview();
-    startPreviewLoop();
     startCaptureLoop();
   } catch (err: any) {
     stopCamera();
@@ -431,7 +562,6 @@ async function startCamera() {
 
 function stopCamera() {
   stopCaptureLoop();
-  stopPreviewLoop();
   loading.value = false;
   requestInFlight = false;
   cameraActive.value = false;
@@ -450,27 +580,17 @@ function stopCamera() {
     mediaStream = null;
   }
   cameraDeviceLabel.value = "";
-
   clearCanvas();
-  clearPreviewCanvas();
 }
 
 function bindTrackEvents(track?: MediaStreamTrack) {
   if (!track) return;
 
-  debugTrackState.value = track.readyState;
-  debugTrackMuted.value = String(track.muted);
-
   track.onmute = () => {
-    debugTrackMuted.value = "true";
     if (!cameraActive.value) return;
     error.value = "摄像头已连接但没有输出画面，常见原因是微信、会议软件等正在占用摄像头。";
   };
-  track.onunmute = () => {
-    debugTrackMuted.value = "false";
-  };
   track.onended = () => {
-    debugTrackState.value = "ended";
     if (!cameraActive.value) return;
     stopCamera();
     error.value = "摄像头连接已中断，请关闭占用程序后重新开启。";
@@ -558,9 +678,6 @@ async function requestPreferredStream(): Promise<{
 
         const track = stream.getVideoTracks()[0];
         const deviceLabel = lookupDeviceLabel(deviceId) || track?.label || "默认摄像头";
-        debugTrackState.value = track?.readyState || "unknown";
-        debugTrackMuted.value = String(track?.muted ?? false);
-        cameraDeviceLabel.value = deviceLabel;
         if (isLikelyUnsupportedCamera(deviceLabel)) {
           stream.getTracks().forEach((item) => item.stop());
           continue;
@@ -582,8 +699,8 @@ async function requestPreferredStream(): Promise<{
           deviceLabel,
         };
         break;
-      } catch (error) {
-        lastError = error;
+      } catch (requestError) {
+        lastError = requestError;
       } finally {
         if (!selectedBinding) {
           probeVideo.pause();
@@ -602,14 +719,16 @@ async function requestPreferredStream(): Promise<{
     throw new Error("未找到可输出有效画面的摄像头，请切换为真实内置摄像头。");
   }
 
+  return await requestFallbackStream(probeVideo);
+}
+
+async function requestFallbackStream(probeVideo: HTMLVideoElement) {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: buildVideoConstraints({ facingMode: "user" }),
       audio: false,
     });
     const track = stream.getVideoTracks()[0];
-    debugTrackState.value = track?.readyState || "unknown";
-    debugTrackMuted.value = String(track?.muted ?? false);
     cameraDeviceLabel.value = track?.label || "默认摄像头";
     probeVideo.srcObject = stream;
     await probeVideo.play();
@@ -636,8 +755,6 @@ async function requestPreferredStream(): Promise<{
       audio: false,
     });
     const track = stream.getVideoTracks()[0];
-    debugTrackState.value = track?.readyState || "unknown";
-    debugTrackMuted.value = String(track?.muted ?? false);
     cameraDeviceLabel.value = track?.label || "默认摄像头";
     probeVideo.srcObject = stream;
     await probeVideo.play();
@@ -719,48 +836,15 @@ function stopCaptureLoop() {
   }
 }
 
-function startPreviewLoop() {
-  stopPreviewLoop();
-  debugPreviewFrames.value = 0;
-
-  const draw = () => {
-    if (!cameraActive.value) return;
-
-    const video = activeSourceVideo;
-    if (video) {
-      debugVideoWidth.value = video.videoWidth || 0;
-      debugVideoHeight.value = video.videoHeight || 0;
-      debugReadyState.value = video.readyState;
-      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-        debugPreviewFrames.value += 1;
-      }
-    }
-
-    previewFrameHandle = window.requestAnimationFrame(draw);
-  };
-
-  previewFrameHandle = window.requestAnimationFrame(draw);
-}
-
-function stopPreviewLoop() {
-  if (previewFrameHandle !== null) {
-    window.cancelAnimationFrame(previewFrameHandle);
-    previewFrameHandle = null;
-  }
-}
-
 async function captureFrame() {
   if (!cameraActive.value || requestInFlight) return;
 
   const video = activeSourceVideo;
   const captureCanvas = captureCanvasRef.value;
-  if (!captureCanvas) {
+  if (!captureCanvas || !video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
     return;
   }
 
-  if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-    return;
-  }
   const captureSize = computeCaptureSize(video);
   captureCanvas.width = captureSize.width;
   captureCanvas.height = captureSize.height;
@@ -769,9 +853,6 @@ async function captureFrame() {
   if (!ctx) return;
   ctx.imageSmoothingEnabled = true;
   ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
-  debugCaptureMode.value = "video";
-
-  updateDebugFrameStats(ctx, captureCanvas.width, captureCanvas.height);
 
   const blob = await new Promise<Blob | null>((resolve) => {
     captureCanvas.toBlob(resolve, "image/jpeg", captureJpegQuality);
@@ -814,7 +895,6 @@ async function captureFrame() {
 
 function onVideoReady() {
   syncCanvasToPreview();
-  startPreviewLoop();
   if (result.value?.keypoints?.length) {
     nextTick(() => drawKeypoints(result.value?.keypoints || []));
   }
@@ -829,7 +909,8 @@ function applyResultToPanelState(data: OwnerGestureResult) {
   const nextState: OwnerControlPanelState = {
     ...panelState.value,
     last_gesture: data.gesture,
-    last_command: data.control_command,
+    last_command: data.triggered ? data.control_command : panelState.value.last_command,
+    last_command_at: data.triggered ? data.updated_at : panelState.value.last_command_at,
     updated_at: data.updated_at,
   };
 
@@ -838,22 +919,87 @@ function applyResultToPanelState(data: OwnerGestureResult) {
       nextState.system_awake = true;
       nextState.phone_call_active = false;
       nextState.current_mode = "home";
+      nextState.focus_tile = "home";
+      nextState.last_feedback = "CMC 已唤醒，主页信息恢复显示。";
+    } else if (data.control_command === "SwitchPrevFeature" && nextState.system_awake && !nextState.phone_call_active) {
+      nextState.current_mode = shiftMode(nextState.current_mode, -1);
+      nextState.focus_tile = nextState.current_mode;
+      nextState.last_feedback = `已切换至${MODE_LABEL_MAP[nextState.current_mode] || "主页"}界面。`;
+    } else if (data.control_command === "SwitchNextFeature" && nextState.system_awake && !nextState.phone_call_active) {
+      nextState.current_mode = shiftMode(nextState.current_mode, 1);
+      nextState.focus_tile = nextState.current_mode;
+      nextState.last_feedback = `已切换至${MODE_LABEL_MAP[nextState.current_mode] || "主页"}界面。`;
+    } else if (data.control_command === "AdjustVolume" && nextState.system_awake) {
+      nextState.current_mode = "media";
+      nextState.focus_tile = "media";
+      nextState.media_playing = true;
+      nextState.volume = Math.min(100, nextState.volume + 6);
+      nextState.last_feedback = `媒体音量已调至 ${nextState.volume}%。`;
     } else if (data.control_command === "ConfirmAction" && nextState.system_awake) {
-      nextState.current_mode = "control";
+      applyConfirmActionLocally(nextState);
     } else if (data.control_command === "AnswerCall" && nextState.system_awake) {
       nextState.phone_call_active = true;
+      nextState.current_mode = "call";
+      nextState.focus_tile = "call";
+      nextState.last_feedback = "蓝牙电话已接通，通话界面接管前台。";
     } else if (data.control_command === "HangUpCall" && nextState.system_awake) {
       nextState.phone_call_active = false;
       nextState.current_mode = "home";
+      nextState.focus_tile = "home";
+      nextState.last_feedback = "通话已挂断，系统已回到主页。";
+    } else if (data.control_command === "ReturnHome" && nextState.system_awake && !nextState.phone_call_active) {
+      nextState.current_mode = "home";
+      nextState.focus_tile = "home";
+      nextState.last_feedback = "已挥手返回主页。";
     }
   }
 
   panelState.value = nextState;
 }
 
+function shiftMode(currentMode: string, direction: number) {
+  const modes = ["home", "media", "comfort", "vehicle"];
+  const currentIndex = Math.max(0, modes.indexOf(currentMode));
+  return modes[(currentIndex + direction + modes.length) % modes.length];
+}
+
+function applyConfirmActionLocally(state: OwnerControlPanelState) {
+  if (state.current_mode === "media") {
+    state.media_playing = !state.media_playing;
+    state.focus_tile = "media";
+    state.last_feedback = state.media_playing ? "媒体播放已确认继续。" : "媒体播放已确认暂停。";
+    return;
+  }
+
+  if (state.current_mode === "comfort") {
+    state.comfort_scene = "舒享";
+    state.climate_temperature = 22;
+    state.focus_tile = "comfort";
+    state.last_feedback = "舒适模式已执行，空调与座椅联动完成。";
+    return;
+  }
+
+  if (state.current_mode === "vehicle") {
+    state.vehicle_status = "已完成整车检查";
+    state.focus_tile = "vehicle";
+    state.last_feedback = "车辆检查已执行，车况状态正常。";
+    return;
+  }
+
+  if (state.current_mode === "call" && state.phone_call_active) {
+    state.focus_tile = "call";
+    state.last_feedback = "当前正在通话，确认动作已转为通话内操作。";
+    return;
+  }
+
+  state.current_mode = "home";
+  state.focus_tile = "home";
+  state.last_feedback = "主页快捷操作已确认执行。";
+}
+
 function computeCaptureSize(video: HTMLVideoElement) {
-  const sourceWidth = Math.max(1, debugVideoWidth.value || video.videoWidth || captureMaxWidth);
-  const sourceHeight = Math.max(1, debugVideoHeight.value || video.videoHeight || captureMaxHeight);
+  const sourceWidth = Math.max(1, video.videoWidth || captureMaxWidth);
+  const sourceHeight = Math.max(1, video.videoHeight || captureMaxHeight);
   const scale = Math.min(1, captureMaxWidth / sourceWidth, captureMaxHeight / sourceHeight);
 
   return {
@@ -932,13 +1078,6 @@ function clearCanvas() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
-function clearPreviewCanvas() {
-  const canvas = canvasRef.value;
-  const ctx = canvas?.getContext("2d");
-  if (!canvas || !ctx) return;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-}
-
 async function probeLiveVideoFrame(video: HTMLVideoElement) {
   const canvas = document.createElement("canvas");
   const width = Math.max(64, video.videoWidth || 320);
@@ -955,8 +1094,6 @@ async function probeLiveVideoFrame(video: HTMLVideoElement) {
     ctx.drawImage(video, 0, 0, width, height);
     const signature = sampleFrameSignature(ctx, width, height);
     signatures.push(signature.signature);
-    debugFrameSignature.value = signature.signature;
-    debugFrameContrast.value = signature.contrast;
     await new Promise((resolve) => window.setTimeout(resolve, 120));
   }
 
@@ -1002,37 +1139,25 @@ function sampleFrameSignature(ctx: CanvasRenderingContext2D, width: number, heig
   };
 }
 
-function updateDebugFrameStats(ctx: CanvasRenderingContext2D, width: number, height: number) {
-  const frame = sampleFrameSignature(ctx, width, height);
-  debugFrameSignature.value = frame.signature;
-  debugFrameContrast.value = frame.contrast;
-}
-
-function resetDebugState() {
-  debugVideoWidth.value = 0;
-  debugVideoHeight.value = 0;
-  debugReadyState.value = 0;
-  debugTrackState.value = "none";
-  debugTrackMuted.value = "false";
-  debugPreviewFrames.value = 0;
-  debugCaptureMode.value = "video";
-  debugRawFrameState.value = "已停用";
-  debugFrameSignature.value = "";
-  debugFrameContrast.value = 0;
-}
-
 onMounted(() => {
   void refreshVideoDevices();
+  uiClockTimer = window.setInterval(() => {
+    uiNow.value = Date.now();
+  }, 1000);
 });
 
 onBeforeUnmount(() => {
   stopCamera();
+  if (uiClockTimer !== null) {
+    window.clearInterval(uiClockTimer);
+    uiClockTimer = null;
+  }
 });
 </script>
 
 <style scoped lang="scss">
 .two-col {
-  grid-template-columns: minmax(0, 1.04fr) minmax(0, 0.96fr);
+  grid-template-columns: minmax(0, 1.02fr) minmax(0, 0.98fr);
   align-items: stretch;
 }
 
@@ -1041,15 +1166,67 @@ onBeforeUnmount(() => {
   flex-direction: column;
 }
 
+.upload-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.control-button {
+  border: none;
+  cursor: pointer;
+}
+
+.control-button:disabled,
+.device-refresh:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.secondary-button {
+  background: #d8c8b5;
+  color: #49372d;
+}
+
+.file-name,
+.stream-meta {
+  font-size: 13px;
+  color: var(--muted-soft);
+}
+
+.preview-canvas-wrap {
+  position: relative;
+  min-height: 292px;
+}
+
 .gesture-frame {
   height: 272px;
   margin-top: 0;
 }
 
-.stream-meta {
-  margin-top: 6px;
-  font-size: 13px;
-  color: var(--muted-soft);
+.preview-video {
+  display: block;
+  width: 100%;
+  min-height: 272px;
+  aspect-ratio: 4 / 3;
+  max-height: 408px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: #f0ece5;
+}
+
+.overlay-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.capture-canvas {
+  display: none;
 }
 
 .recognition-summary {
@@ -1060,25 +1237,28 @@ onBeforeUnmount(() => {
   margin-top: 10px;
 }
 
-.recognition-chip {
+.recognition-chip,
+.gesture-action-chip,
+.cockpit-page-tag,
+.map-badge {
   display: inline-flex;
   align-items: center;
-  padding: 6px 10px;
   border-radius: 999px;
+}
+
+.recognition-chip {
+  padding: 6px 10px;
   background: rgba(201, 176, 153, 0.1);
   color: #8a7b6d;
   font-size: 12px;
 }
 
 .gesture-action-chip {
-  display: inline-flex;
-  align-items: center;
   padding: 6px 12px;
-  border-radius: 999px;
-  background: rgba(201, 176, 153, 0.14);
-  color: #7b6453;
+  background: rgba(201, 176, 153, 0.16);
+  color: #6f5746;
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 700;
 }
 
 .cockpit-header {
@@ -1087,13 +1267,6 @@ onBeforeUnmount(() => {
   justify-content: flex-start;
   gap: 16px;
   margin-bottom: 10px;
-}
-
-.section-label {
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: rgba(111, 95, 82, 0.68);
 }
 
 .cockpit-shell {
@@ -1108,17 +1281,21 @@ onBeforeUnmount(() => {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
 }
 
-.cockpit-topbar {
+.cockpit-topbar,
+.cockpit-brand-group,
+.cockpit-meta,
+.call-action-row {
   display: flex;
   align-items: center;
+}
+
+.cockpit-topbar {
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 14px;
+  margin-bottom: 12px;
 }
 
 .cockpit-brand-group {
-  display: flex;
-  align-items: center;
   gap: 10px;
 }
 
@@ -1130,37 +1307,81 @@ onBeforeUnmount(() => {
 }
 
 .cockpit-page-tag {
-  display: inline-flex;
-  align-items: center;
   height: 28px;
   padding: 0 10px;
-  border-radius: 999px;
   background: rgba(201, 176, 153, 0.18);
   color: #7f6a5a;
   font-size: 12px;
 }
 
 .cockpit-meta {
-  display: flex;
-  align-items: center;
   gap: 12px;
   font-size: 12px;
   color: #a59a8c;
 }
 
+.section-label {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(111, 95, 82, 0.68);
+}
+
 .cockpit-display {
+  position: relative;
   min-height: 300px;
   padding: 12px;
   border-radius: 20px;
   background: linear-gradient(180deg, rgba(255, 251, 246, 0.96), rgba(245, 238, 229, 0.96));
   border: 1px solid rgba(184, 162, 141, 0.18);
+  overflow: hidden;
+}
+
+.confirm-spotlight {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 180px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(201, 176, 153, 0.94), rgba(184, 154, 126, 0.92));
+  color: #fff9f3;
+  box-shadow: 0 14px 30px rgba(184, 154, 126, 0.26);
+}
+
+.confirm-spotlight strong {
+  font-size: 26px;
+  color: inherit;
+}
+
+.confirm-spotlight span:last-child {
+  font-size: 12px;
+  line-height: 1.5;
+  color: rgba(255, 249, 243, 0.9);
 }
 
 .cockpit-off,
 .cockpit-home,
+.cockpit-media,
 .cockpit-comfort,
+.cockpit-vehicle,
 .cockpit-call {
   min-height: 276px;
+}
+
+.off-screen,
+.call-screen,
+.media-main,
+.comfort-main,
+.vehicle-main,
+.widget-card,
+.metric-card {
+  border-radius: 20px;
+  border: 1px solid rgba(184, 162, 141, 0.18);
 }
 
 .off-screen {
@@ -1170,9 +1391,7 @@ onBeforeUnmount(() => {
   justify-content: center;
   min-height: 276px;
   overflow: hidden;
-  border-radius: 18px;
   background: linear-gradient(180deg, #f1e9df 0%, #e7ddd1 100%);
-  border: 1px solid rgba(184, 162, 141, 0.18);
 }
 
 .off-glow {
@@ -1197,9 +1416,10 @@ onBeforeUnmount(() => {
 
 .off-copy strong,
 .widget-card strong,
-.shortcut-title,
+.media-main strong,
 .comfort-main strong,
 .metric-card strong,
+.vehicle-main strong,
 .call-screen strong {
   font-size: 28px;
   color: #43352d;
@@ -1207,9 +1427,10 @@ onBeforeUnmount(() => {
 
 .off-copy span:last-child,
 .widget-card span:last-child,
-.shortcut-subtitle,
+.media-main span:last-child,
 .comfort-main span:last-child,
 .metric-card span:last-child,
+.vehicle-main span:last-child,
 .call-screen span:last-child {
   font-size: 12px;
   line-height: 1.5;
@@ -1282,28 +1503,33 @@ onBeforeUnmount(() => {
   left: 16px;
   bottom: 16px;
   padding: 7px 12px;
-  border-radius: 999px;
   background: rgba(255, 250, 244, 0.86);
   color: #6a5a4d;
   font-size: 12px;
-  border: 1px solid rgba(184, 162, 141, 0.18);
 }
 
-.home-side-widgets {
+.home-side-widgets,
+.media-side,
+.comfort-side,
+.vehicle-side {
   display: grid;
-  grid-template-rows: repeat(2, minmax(0, 1fr));
   gap: 14px;
 }
 
+.home-side-widgets {
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+
 .widget-card,
-.metric-card {
+.metric-card,
+.media-main,
+.comfort-main,
+.vehicle-main {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 16px;
-  border-radius: 18px;
   background: linear-gradient(180deg, rgba(255, 252, 247, 0.98), rgba(244, 236, 227, 0.96));
-  border: 1px solid rgba(184, 162, 141, 0.18);
 }
 
 .widget-card strong,
@@ -1311,8 +1537,14 @@ onBeforeUnmount(() => {
   font-size: 20px;
 }
 
+.focused {
+  box-shadow: inset 0 0 0 1px rgba(184, 154, 126, 0.28), 0 12px 26px rgba(184, 154, 126, 0.16);
+  background: linear-gradient(180deg, rgba(255, 250, 244, 1), rgba(242, 232, 219, 0.98));
+}
+
 .mini-track,
-.climate-ring {
+.climate-ring,
+.volume-ring {
   position: relative;
   width: 100%;
   height: 10px;
@@ -1323,36 +1555,40 @@ onBeforeUnmount(() => {
 }
 
 .mini-fill,
-.climate-ring-fill {
+.climate-ring-fill,
+.volume-ring-fill {
   position: absolute;
   inset: 0 auto 0 0;
   border-radius: 999px;
   background: linear-gradient(90deg, #b89a7e, #d9c5b2);
 }
 
-.comfort-layout {
+.media-layout,
+.comfort-layout,
+.vehicle-layout {
   display: grid;
   grid-template-columns: 1.2fr 1fr;
   gap: 14px;
   min-height: 276px;
 }
 
-.comfort-main {
-  display: flex;
-  flex-direction: column;
+.media-main,
+.comfort-main,
+.vehicle-main {
   justify-content: center;
-  gap: 12px;
-  padding: 24px;
-  border-radius: 20px;
-  background:
-    radial-gradient(circle at top left, rgba(201, 176, 153, 0.22), transparent 34%),
-    linear-gradient(180deg, rgba(254, 251, 245, 0.98), rgba(243, 235, 225, 0.98));
-  border: 1px solid rgba(184, 162, 141, 0.2);
 }
 
-.comfort-side {
-  display: grid;
-  gap: 14px;
+.volume-knob {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.volume-value {
+  font-size: 42px;
+  font-weight: 700;
+  color: #4b3a2e;
 }
 
 .call-screen {
@@ -1362,11 +1598,9 @@ onBeforeUnmount(() => {
   justify-content: center;
   gap: 12px;
   min-height: 276px;
-  border-radius: 20px;
   background:
     radial-gradient(circle at top, rgba(201, 176, 153, 0.26), transparent 34%),
     linear-gradient(180deg, rgba(254, 250, 244, 0.98), rgba(241, 232, 221, 0.98));
-  border: 1px solid rgba(184, 162, 141, 0.2);
 }
 
 .caller-avatar {
@@ -1383,7 +1617,6 @@ onBeforeUnmount(() => {
 }
 
 .call-action-row {
-  display: flex;
   gap: 18px;
   margin-top: 10px;
 }
@@ -1409,7 +1642,7 @@ onBeforeUnmount(() => {
 
 .cockpit-dock {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 10px;
   margin-top: 14px;
 }
@@ -1429,46 +1662,6 @@ onBeforeUnmount(() => {
 .dock-item.active {
   background: linear-gradient(180deg, rgba(201, 176, 153, 0.3), rgba(184, 154, 126, 0.22));
   color: #5d4c40;
-}
-
-@media (max-width: 960px) {
-  .cockpit-header {
-    flex-direction: column;
-  }
-
-  .home-hero,
-  .comfort-layout,
-  .cockpit-dock {
-    grid-template-columns: 1fr;
-  }
-}
-
-.upload-row {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 12px;
-  margin-bottom: 14px;
-}
-
-.control-button {
-  border: none;
-  cursor: pointer;
-}
-
-.control-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.secondary-button {
-  background: #d8c8b5;
-  color: #49372d;
-}
-
-.file-name {
-  font-size: 13px;
-  color: var(--muted);
 }
 
 .device-select {
@@ -1493,38 +1686,19 @@ onBeforeUnmount(() => {
   cursor: pointer;
 }
 
-.device-refresh:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
+@media (max-width: 960px) {
+  .cockpit-header,
+  .cockpit-topbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
 
-.preview-canvas-wrap {
-  position: relative;
-  margin-top: 6px;
-  min-height: 292px;
-}
-
-.preview-video {
-  display: block;
-  width: 100%;
-  min-height: 272px;
-  aspect-ratio: 4 / 3;
-  max-height: 408px;
-  object-fit: cover;
-  border-radius: 8px;
-  background: #f0ece5;
-}
-
-.overlay-canvas {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-}
-
-.capture-canvas {
-  display: none;
+  .home-hero,
+  .media-layout,
+  .comfort-layout,
+  .vehicle-layout,
+  .cockpit-dock {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

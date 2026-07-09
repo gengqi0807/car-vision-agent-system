@@ -26,6 +26,8 @@ class PlateService:
     def __init__(self) -> None:
         self.recognizer = HyperLPRRecognizer()
         self._backend_dir = Path(__file__).resolve().parents[2]
+        self._anonymous_history: list[PlateRecordSummary] = []
+        self._anonymous_history_id = 0
 
     async def recognize_image(self, filename: str, image_bytes: bytes | None = None) -> PlateRecognitionResponse:
         return await self.recognize_image_bytes_async(image_bytes or b"", filename)
@@ -119,13 +121,15 @@ class PlateService:
         user_id: int | None = None,
     ) -> PlateRecognitionResponse:
         if not image_bytes:
-            raise ValueError("上传文件为空。")
+            return PlateRecognitionResponse(frame_id=filename, detections=[])
 
         image_path = self._persist_upload(image_bytes, filename) if settings.plate_save_uploads else None
         detections = self._detect_plates(image_bytes)
 
         if detections and save_history and user_id is not None:
             self._save_history(detections, image_path=image_path, user_id=user_id)
+        elif detections and user_id is None:
+            self._save_anonymous_history(detections)
 
         return PlateRecognitionResponse(frame_id=filename, detections=detections)
 
@@ -138,6 +142,8 @@ class PlateService:
             records = session.scalars(statement).all()
 
         if not records:
+            if user_id is None and self._anonymous_history:
+                return self._anonymous_history[: settings.plate_history_limit]
             return [
                 PlateRecordSummary(
                     id=1,
@@ -156,6 +162,27 @@ class PlateService:
             )
             for record in records
         ]
+
+    def _save_anonymous_history(self, detections: list[PlateDetection]) -> None:
+        created_at = datetime.utcnow()
+        summaries: list[PlateRecordSummary] = []
+        for detection in detections:
+            if not detection.plate_number:
+                continue
+            self._anonymous_history_id += 1
+            summaries.append(
+                PlateRecordSummary(
+                    id=self._anonymous_history_id,
+                    plate_number=detection.plate_number,
+                    plate_color=detection.plate_color,
+                    created_at=created_at,
+                )
+            )
+
+        if not summaries:
+            return
+
+        self._anonymous_history = (summaries + self._anonymous_history)[: settings.plate_history_limit]
 
     def _save_history(self, detections: list[PlateDetection], image_path: str | None, user_id: int) -> None:
         records = [

@@ -421,7 +421,20 @@ class AlertService:
 
     async def _dispatch_notifications(self, event: AlertEvent) -> None:
         try:
-            results = await self.notifier.notify_alert(event.model_dump(mode="json"))
+            payload = event.model_dump(mode="json")
+            if hasattr(self.notifier, "notify_alert"):
+                results = await self.notifier.notify_alert(payload)
+            elif hasattr(self.notifier, "broadcast"):
+                delivered = await self.notifier.broadcast(payload)
+                results = [
+                    {
+                        "channel": "websocket",
+                        "target": f"alerts:{delivered}",
+                        "success": delivered > 0,
+                    }
+                ]
+            else:
+                raise AttributeError("Notifier must provide notify_alert() or broadcast().")
         except Exception as exc:
             logger.warning("Failed to dispatch alert event %s: %s", event.id, exc)
             results = [

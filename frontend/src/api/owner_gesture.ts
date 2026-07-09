@@ -12,8 +12,14 @@ export interface OwnerControlPanelState {
   climate_temperature: number;
   phone_call_active: boolean;
   current_mode: string;
+  media_playing: boolean;
+  comfort_scene: string;
+  vehicle_status: string;
+  focus_tile: string;
   last_gesture: string | null;
   last_command: string | null;
+  last_command_at: string | null;
+  last_feedback: string | null;
   updated_at: string | null;
 }
 
