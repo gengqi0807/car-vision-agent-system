@@ -11,24 +11,20 @@ import numpy as np
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-<<<<<<< HEAD
+from app.core.config import settings
 from app.models.owner_gesture_record import OwnerGestureRecord
 from app.models.user_operation_log import UserOperationLog
-from app.models_infer import MediaPipeHands, GestureClassifier
+from app.models_infer import GestureClassifier, MediaPipeHands
 from app.schemas.gesture import ControlPanelState, GestureFrameResult, Keypoint
 from app.services.alert_service import AlertService
-=======
-from app.core.config import settings
-from app.core.database import SessionLocal
-from app.models_infer import MediaPipeHands
-from app.schemas.gesture import ControlPanelState, GestureFrameResult, Keypoint
 from app.services.monitor_service import MonitorService
->>>>>>> 5adc10cb8cee9f348da5d6346b2e038944b280fc
 
 logger = logging.getLogger(__name__)
 
 
 class OwnerGestureService:
+    """Owner (in-cabin) gesture service backed by MediaPipe Hands."""
+
     _hands: Optional[MediaPipeHands] = None
     _classifier: Optional[GestureClassifier] = None
     _hold_frame_count = 2
@@ -43,21 +39,17 @@ class OwnerGestureService:
 
     @property
     def hands(self) -> MediaPipeHands:
+        """Lazy-initialise MediaPipeHands to avoid import-time model issues."""
         if self._hands is None:
             self._hands = MediaPipeHands()
-            logger.info("OwnerGestureService MediaPipeHands 已加载")
+            logger.info("OwnerGestureService – MediaPipeHands loaded")
         return self._hands
 
-<<<<<<< HEAD
     @property
     def classifier(self) -> GestureClassifier:
         if self._classifier is None:
             self._classifier = GestureClassifier()
         return self._classifier
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     async def process_frame(
         self,
@@ -68,38 +60,26 @@ class OwnerGestureService:
         user_id: int,
         session_id: str | None = None,
     ) -> GestureFrameResult:
-        """Run MediaPipe Hands inference on an uploaded image frame.
-
-        Parameters
-        ----------
-        image_bytes:
-            Raw image file bytes (JPEG / PNG / etc.).
-        filename:
-            Descriptive file name for logging / tracing.
-
-        Returns
-        -------
-        GestureFrameResult
-            Detected keypoints and a placeholder gesture label.
-        """
+        """Run MediaPipe Hands inference on an uploaded image frame."""
         started_at = perf_counter()
-=======
-    async def process_frame(self, image_bytes: bytes, filename: str) -> GestureFrameResult:
->>>>>>> 5adc10cb8cee9f348da5d6346b2e038944b280fc
         nparr = np.frombuffer(image_bytes, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if frame is None:
-            await self._capture_error(filename, "owner_gesture_decode_error", "无法解析图像字节数据。")
-            raise ValueError(f"无法解析图像文件：{filename}")
+            await self._capture_error(
+                db,
+                user_id=user_id,
+                filename=filename,
+                event_type="owner_gesture_decode_error",
+                summary="无法解析图像字节数据。",
+            )
+            raise ValueError(f"Cannot decode image '{filename}'")
 
-        logger.info("正在处理车主手势帧 '%s'（%dx%d）", filename, frame.shape[1], frame.shape[0])
-        result = self.hands.infer(frame)
-<<<<<<< HEAD
+        logger.info("Processing hand-gesture frame '%s' (%dx%d)", filename, frame.shape[1], frame.shape[0])
+        infer_result = self.hands.infer(frame)
 
-        raw_kps = result["keypoints"]
-        num_hands = result.get("num_hands_detected", 0)
+        raw_kps = infer_result["keypoints"]
+        num_hands = infer_result.get("num_hands_detected", 0)
 
-        # ----- Rule-based gesture classification -----
         cls_result = self.classifier.classify(raw_kps, domain="owner")
         gesture_label = cls_result["gesture"]
         cls_conf = cls_result["confidence"]
@@ -115,7 +95,7 @@ class OwnerGestureService:
         )
         previous_record = recent_records[0] if recent_records else None
 
-        control_command, _ = self._map_gesture_to_command(gesture_label)
+        control_command = self._map_gesture_to_command(gesture_label)
         triggered = self._should_trigger(
             gesture=gesture_label,
             control_command=control_command,
@@ -123,13 +103,10 @@ class OwnerGestureService:
         )
         processing_time_ms = int((perf_counter() - started_at) * 1000)
 
-=======
->>>>>>> 5adc10cb8cee9f348da5d6346b2e038944b280fc
         keypoints = [
             Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0))
             for kp in raw_kps
         ]
-<<<<<<< HEAD
 
         record = OwnerGestureRecord(
             user_id=user_id,
@@ -155,6 +132,35 @@ class OwnerGestureService:
         db.commit()
         db.refresh(record)
 
+        await self._capture_monitor_log(
+            db,
+            user_id=user_id,
+            event_type=(
+                "owner_gesture_success"
+                if cls_conf >= settings.alert_low_confidence_threshold
+                else "owner_gesture_low_confidence"
+            ),
+            title="车主手势帧处理完成",
+            summary=(
+                f"{filename} 已处理完成，识别手势 {gesture_label}，"
+                f"置信度 {cls_conf:.2f}，检测到 {num_hands} 只手。"
+            ),
+            confidence=cls_conf,
+            details={
+                "filename": filename,
+                "session_id": active_session_id,
+                "num_hands_detected": num_hands,
+                "frame_width": int(frame.shape[1]),
+                "frame_height": int(frame.shape[0]),
+                "gesture": gesture_label,
+                "control_command": control_command,
+                "triggered": triggered,
+                "processing_time_ms": processing_time_ms,
+            },
+            trigger_alert=cls_conf < settings.alert_low_confidence_threshold,
+            level="info" if cls_conf >= settings.alert_low_confidence_threshold else "warning",
+        )
+
         panel_state = self._build_panel_state(db, user_id=user_id)
         if self._should_record_behavior(
             previous_record=previous_record,
@@ -171,38 +177,10 @@ class OwnerGestureService:
                     processing_time_ms=processing_time_ms,
                 ),
             )
-=======
-        num_hands = result.get("num_hands_detected", 0)
-        confidence = 0.99 if num_hands > 0 else 0.0
-        gesture_label = f"检测到 {num_hands} 只手" if num_hands > 0 else "未检测到手部"
->>>>>>> 5adc10cb8cee9f348da5d6346b2e038944b280fc
-
-        await self._capture_monitor_log(
-            event_type=(
-                "owner_gesture_success"
-                if confidence >= settings.alert_low_confidence_threshold
-                else "owner_gesture_low_confidence"
-            ),
-            title="车主手势帧处理完成",
-            summary=f"{filename} 已处理完成，置信度为 {confidence:.2f}，检测到 {num_hands} 只手。",
-            confidence=confidence,
-            details={
-                "filename": filename,
-                "num_hands_detected": num_hands,
-                "frame_width": int(frame.shape[1]),
-                "frame_height": int(frame.shape[0]),
-            },
-            trigger_alert=confidence < settings.alert_low_confidence_threshold,
-            level="info" if confidence >= settings.alert_low_confidence_threshold else "warning",
-        )
 
         return GestureFrameResult(
             gesture=gesture_label,
-<<<<<<< HEAD
             confidence=round(cls_conf, 4),
-=======
-            confidence=confidence,
->>>>>>> 5adc10cb8cee9f348da5d6346b2e038944b280fc
             keypoints=keypoints,
             control_command=control_command,
             triggered=triggered,
@@ -211,6 +189,7 @@ class OwnerGestureService:
         )
 
     def current_result(self) -> GestureFrameResult:
+        """Legacy mock fallback (deprecated — use ``process_frame`` instead)."""
         return GestureFrameResult(
             gesture="手掌张开",
             confidence=0.92,
@@ -233,15 +212,14 @@ class OwnerGestureService:
             )
         )
 
-<<<<<<< HEAD
-    def _map_gesture_to_command(self, gesture: str) -> tuple[str | None, bool]:
+    def _map_gesture_to_command(self, gesture: str) -> str | None:
         command_map = {
-            "open_palm": ("WakeSystem", True),
-            "fist": ("ConfirmAction", True),
-            "thumbs_up": ("AnswerCall", True),
-            "thumbs_down": ("HangUpCall", True),
+            "open_palm": "WakeSystem",
+            "fist": "ConfirmAction",
+            "thumbs_up": "AnswerCall",
+            "thumbs_down": "HangUpCall",
         }
-        return command_map.get(gesture, (None, False))
+        return command_map.get(gesture)
 
     def _recent_session_records(
         self,
@@ -299,9 +277,7 @@ class OwnerGestureService:
         gesture: str,
         triggered: bool,
     ) -> bool:
-        if triggered:
-            return True
-        if previous_record is None:
+        if triggered or previous_record is None:
             return True
         return previous_record.gesture != gesture
 
@@ -312,9 +288,7 @@ class OwnerGestureService:
         gesture: str,
         triggered: bool,
     ) -> bool:
-        if triggered:
-            return True
-        if previous_record is None:
+        if triggered or previous_record is None:
             return True
         return previous_record.gesture != gesture
 
@@ -382,10 +356,12 @@ class OwnerGestureService:
                 f"处理耗时 {processing_time_ms} ms。"
             )
         return f"识别到手势 {gesture}，未触发控车指令，处理耗时 {processing_time_ms} ms。"
-=======
+
     async def _capture_monitor_log(
         self,
+        db: Session,
         *,
+        user_id: int,
         event_type: str,
         title: str,
         summary: str,
@@ -394,30 +370,38 @@ class OwnerGestureService:
         trigger_alert: bool = False,
         level: str = "info",
     ) -> None:
-        with SessionLocal() as session:
-            await MonitorService(session).capture_event(
-                category="owner_gesture",
-                source="owner-gesture",
-                event_type=event_type,
-                title=title,
-                summary=summary,
-                level=level,
-                status="processed" if confidence and confidence > 0 else "empty",
-                confidence=confidence,
-                details=details,
-                trigger_alert=trigger_alert,
-            )
+        await MonitorService(db).capture_event(
+            category="owner_gesture",
+            source="owner-gesture",
+            event_type=event_type,
+            title=title,
+            summary=summary,
+            level=level,
+            status="processed" if confidence and confidence > 0 else "empty",
+            user_id=user_id,
+            confidence=confidence,
+            details=details,
+            trigger_alert=trigger_alert,
+        )
 
-    async def _capture_error(self, filename: str, event_type: str, summary: str) -> None:
-        with SessionLocal() as session:
-            await MonitorService(session).capture_event(
-                category="owner_gesture",
-                source="owner-gesture",
-                event_type=event_type,
-                title="车主手势帧处理失败",
-                summary=f"{filename}: {summary}",
-                level="warning",
-                status="failed",
-                details={"filename": filename},
-            )
->>>>>>> 5adc10cb8cee9f348da5d6346b2e038944b280fc
+    async def _capture_error(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        filename: str,
+        event_type: str,
+        summary: str,
+    ) -> None:
+        await MonitorService(db).capture_event(
+            category="owner_gesture",
+            source="owner-gesture",
+            event_type=event_type,
+            title="车主手势帧处理失败",
+            summary=f"{filename}: {summary}",
+            level="warning",
+            status="failed",
+            user_id=user_id,
+            details={"filename": filename},
+            trigger_alert=False,
+        )

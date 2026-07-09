@@ -7,27 +7,27 @@ from typing import Optional
 import cv2
 import numpy as np
 
-# HEAD 原有导入
-from app.models_infer import MediaPipePose, GestureClassifier
-from app.schemas.gesture import GestureFrameResult, GestureHistoryItem, Keypoint
-
-# 另一端新增导入（监控相关）
 from app.core.config import settings
 from app.core.database import SessionLocal
+from app.models_infer import GestureClassifier, MediaPipePose
+from app.schemas.gesture import GestureFrameResult, GestureHistoryItem, Keypoint
 from app.services.monitor_service import MonitorService
 
 logger = logging.getLogger(__name__)
 
 
 class PoliceGestureService:
+    """Police (traffic) gesture service backed by MediaPipe Pose."""
+
     _pose: Optional[MediaPipePose] = None
     _classifier: Optional[GestureClassifier] = None
 
     @property
     def pose(self) -> MediaPipePose:
+        """Lazy-initialise MediaPipePose so import does not require the model up front."""
         if self._pose is None:
             self._pose = MediaPipePose()
-            logger.info("PoliceGestureService MediaPipePose 已加载")
+            logger.info("PoliceGestureService – MediaPipePose loaded")
         return self._pose
 
     @property
@@ -36,24 +36,24 @@ class PoliceGestureService:
             self._classifier = GestureClassifier()
         return self._classifier
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     async def process_frame(self, image_bytes: bytes, filename: str) -> GestureFrameResult:
+        """Run MediaPipe Pose inference on an uploaded image frame."""
         nparr = np.frombuffer(image_bytes, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if frame is None:
-            await self._capture_error(filename, "police_gesture_decode_error", "无法解析图像字节数据。")
-            raise ValueError(f"无法解析图像文件：{filename}")
+            await self._capture_error(
+                filename=filename,
+                event_type="police_gesture_decode_error",
+                summary="无法解析图像字节数据。",
+            )
+            raise ValueError(f"Cannot decode image '{filename}'")
 
-        logger.info("正在处理交警手势帧 '%s'（%dx%d）", filename, frame.shape[1], frame.shape[0])
+        logger.info("Processing police-pose frame '%s' (%dx%d)", filename, frame.shape[1], frame.shape[0])
         result = self.pose.infer(frame)
 
         raw_kps = result["keypoints"]
         num_poses = result.get("num_poses_detected", 0)
 
-        # ----- Rule-based gesture classification -----
         cls_result = self.classifier.classify(raw_kps, domain="police")
         gesture_label = cls_result["gesture"]
         cls_conf = cls_result["confidence"]
@@ -70,7 +70,6 @@ class PoliceGestureService:
             for kp in raw_kps
         ]
 
-        # ---------- 集成 MonitorService 监控日志（来自另一端） ----------
         await self._capture_monitor_log(
             event_type=(
                 "police_gesture_success"
@@ -85,6 +84,7 @@ class PoliceGestureService:
                 "num_poses_detected": num_poses,
                 "frame_width": int(frame.shape[1]),
                 "frame_height": int(frame.shape[0]),
+                "gesture": gesture_label,
             },
             trigger_alert=cls_conf < settings.alert_low_confidence_threshold,
             level="info" if cls_conf >= settings.alert_low_confidence_threshold else "warning",
@@ -98,8 +98,9 @@ class PoliceGestureService:
         )
 
     def current_result(self) -> GestureFrameResult:
+        """Legacy mock fallback (deprecated — use ``process_frame`` instead)."""
         return GestureFrameResult(
-            gesture="停止手势",
+            gesture="停止信号",
             confidence=0.88,
             keypoints=[
                 Keypoint(x=0.46, y=0.22, score=0.98),
@@ -111,13 +112,12 @@ class PoliceGestureService:
     def history(self) -> list[GestureHistoryItem]:
         return [
             GestureHistoryItem(
-                gesture="停止手势",
+                gesture="停止信号",
                 confidence=0.88,
                 updated_at=datetime.utcnow(),
             )
         ]
 
-    # ---------- 以下方法从另一端合并而来（监控日志） ----------
     async def _capture_monitor_log(
         self,
         *,
@@ -143,7 +143,13 @@ class PoliceGestureService:
                 trigger_alert=trigger_alert,
             )
 
-    async def _capture_error(self, filename: str, event_type: str, summary: str) -> None:
+    async def _capture_error(
+        self,
+        *,
+        filename: str,
+        event_type: str,
+        summary: str,
+    ) -> None:
         with SessionLocal() as session:
             await MonitorService(session).capture_event(
                 category="police_gesture",
@@ -154,4 +160,5 @@ class PoliceGestureService:
                 level="warning",
                 status="failed",
                 details={"filename": filename},
+                trigger_alert=False,
             )
