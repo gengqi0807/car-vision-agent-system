@@ -11,9 +11,12 @@ from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models_infer import GestureClassifier, MediaPipePose
 from app.schemas.gesture import GestureFrameResult, GestureHistoryItem, Keypoint
+from app.services.alert_service import AlertService
 from app.services.monitor_service import MonitorService
 
 logger = logging.getLogger(__name__)
+
+NO_POSE_GESTURE = "\u672a\u68c0\u6d4b\u5230\u4eba\u4f53"
 
 
 class PoliceGestureService:
@@ -21,13 +24,13 @@ class PoliceGestureService:
 
     _pose: Optional[MediaPipePose] = None
     _classifier: Optional[GestureClassifier] = None
+    _unrecognized_behavior_window_seconds = 30
 
     @property
     def pose(self) -> MediaPipePose:
-        """Lazy-initialise MediaPipePose so import does not require the model up front."""
         if self._pose is None:
             self._pose = MediaPipePose()
-            logger.info("PoliceGestureService – MediaPipePose loaded")
+            logger.info("PoliceGestureService loaded MediaPipePose")
         return self._pose
 
     @property
@@ -37,14 +40,13 @@ class PoliceGestureService:
         return self._classifier
 
     async def process_frame(self, image_bytes: bytes, filename: str) -> GestureFrameResult:
-        """Run MediaPipe Pose inference on an uploaded image frame."""
         nparr = np.frombuffer(image_bytes, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if frame is None:
             await self._capture_error(
                 filename=filename,
                 event_type="police_gesture_decode_error",
-                summary="无法解析图像字节数据。",
+                summary="Cannot decode image bytes.",
             )
             raise ValueError(f"Cannot decode image '{filename}'")
 
@@ -58,7 +60,7 @@ class PoliceGestureService:
         gesture_label = cls_result["gesture"]
         cls_conf = cls_result["confidence"]
         if num_poses == 0:
-            gesture_label = "未检测到人体"
+            gesture_label = NO_POSE_GESTURE
             cls_conf = 0.0
 
         keypoints = [
@@ -70,25 +72,42 @@ class PoliceGestureService:
             for kp in raw_kps
         ]
 
-        await self._capture_monitor_log(
-            event_type=(
-                "police_gesture_success"
-                if cls_conf >= settings.alert_low_confidence_threshold
-                else "police_gesture_low_confidence"
-            ),
-            title="交警手势帧处理完成",
-            summary=f"{filename} 已处理完成，置信度为 {cls_conf:.2f}，检测到 {num_poses} 个人体姿态。",
-            confidence=cls_conf,
-            details={
-                "filename": filename,
-                "num_poses_detected": num_poses,
-                "frame_width": int(frame.shape[1]),
-                "frame_height": int(frame.shape[0]),
-                "gesture": gesture_label,
-            },
-            trigger_alert=cls_conf < settings.alert_low_confidence_threshold,
-            level="info" if cls_conf >= settings.alert_low_confidence_threshold else "warning",
-        )
+        is_unrecognized = self._is_unrecognized_result(gesture=gesture_label, num_poses=num_poses)
+        if is_unrecognized:
+            with SessionLocal() as session:
+                AlertService(session).record_behavior_once(
+                    source="police-gesture",
+                    title="Police gesture not recognized",
+                    summary=self._build_unrecognized_behavior_summary(
+                        filename=filename,
+                        gesture=gesture_label,
+                        num_detections=num_poses,
+                    ),
+                    window_seconds=self._unrecognized_behavior_window_seconds,
+                )
+        else:
+            await self._capture_monitor_log(
+                event_type=(
+                    "police_gesture_success"
+                    if cls_conf >= settings.alert_low_confidence_threshold
+                    else "police_gesture_low_confidence"
+                ),
+                title="Police gesture frame processed",
+                summary=(
+                    f"{filename} processed: gesture={gesture_label}, "
+                    f"confidence={cls_conf:.2f}, poses={num_poses}."
+                ),
+                confidence=cls_conf,
+                details={
+                    "filename": filename,
+                    "num_poses_detected": num_poses,
+                    "frame_width": int(frame.shape[1]),
+                    "frame_height": int(frame.shape[0]),
+                    "gesture": gesture_label,
+                },
+                trigger_alert=cls_conf < settings.alert_low_confidence_threshold,
+                level="info" if cls_conf >= settings.alert_low_confidence_threshold else "warning",
+            )
 
         return GestureFrameResult(
             gesture=gesture_label,
@@ -98,9 +117,8 @@ class PoliceGestureService:
         )
 
     def current_result(self) -> GestureFrameResult:
-        """Legacy mock fallback (deprecated — use ``process_frame`` instead)."""
         return GestureFrameResult(
-            gesture="停止信号",
+            gesture="stop",
             confidence=0.88,
             keypoints=[
                 Keypoint(x=0.46, y=0.22, score=0.98),
@@ -112,11 +130,26 @@ class PoliceGestureService:
     def history(self) -> list[GestureHistoryItem]:
         return [
             GestureHistoryItem(
-                gesture="停止信号",
+                gesture="stop",
                 confidence=0.88,
                 updated_at=datetime.utcnow(),
             )
         ]
+
+    def _is_unrecognized_result(self, *, gesture: str, num_poses: int) -> bool:
+        return num_poses == 0 or gesture in {"unknown", NO_POSE_GESTURE}
+
+    def _build_unrecognized_behavior_summary(
+        self,
+        *,
+        filename: str,
+        gesture: str,
+        num_detections: int,
+    ) -> str:
+        return (
+            f"{filename} did not produce a recognized police gesture. "
+            f"gesture={gesture}, poses={num_detections}."
+        )
 
     async def _capture_monitor_log(
         self,
@@ -155,7 +188,7 @@ class PoliceGestureService:
                 category="police_gesture",
                 source="police-gesture",
                 event_type=event_type,
-                title="交警手势帧处理失败",
+                title="Police gesture frame processing failed",
                 summary=f"{filename}: {summary}",
                 level="warning",
                 status="failed",

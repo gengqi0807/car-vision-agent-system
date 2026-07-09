@@ -237,7 +237,10 @@ const debugRawFrameState = ref("已停用");
 const debugFrameSignature = ref("");
 const debugFrameContrast = ref(0);
 
-const frameIntervalMs = 450;
+const frameIntervalMs = 550;
+const captureMaxWidth = 640;
+const captureMaxHeight = 480;
+const captureJpegQuality = 0.72;
 let mediaStream: MediaStream | null = null;
 let activeSourceVideo: HTMLVideoElement | null = null;
 let captureTimer: number | null = null;
@@ -549,7 +552,7 @@ async function requestPreferredStream(): Promise<{
     for (const deviceId of candidateIds) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: { exact: deviceId } },
+          video: buildVideoConstraints({ deviceId: { exact: deviceId } }),
           audio: false,
         });
 
@@ -601,7 +604,7 @@ async function requestPreferredStream(): Promise<{
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "user" },
+      video: buildVideoConstraints({ facingMode: "user" }),
       audio: false,
     });
     const track = stream.getVideoTracks()[0];
@@ -629,7 +632,7 @@ async function requestPreferredStream(): Promise<{
     }
 
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: true,
+      video: buildVideoConstraints(),
       audio: false,
     });
     const track = stream.getVideoTracks()[0];
@@ -683,6 +686,15 @@ function isLikelyUnsupportedCamera(label: string) {
     "epoccam",
     "ndi",
   ].some((keyword) => normalized.includes(keyword));
+}
+
+function buildVideoConstraints(extra: MediaTrackConstraints = {}): MediaTrackConstraints {
+  return {
+    width: { ideal: captureMaxWidth, max: 1280 },
+    height: { ideal: captureMaxHeight, max: 720 },
+    frameRate: { ideal: 15, max: 24 },
+    ...extra,
+  };
 }
 
 function startCaptureLoop() {
@@ -746,21 +758,23 @@ async function captureFrame() {
     return;
   }
 
-  captureCanvas.width = debugVideoWidth.value || video?.videoWidth || 640;
-  captureCanvas.height = debugVideoHeight.value || video?.videoHeight || 480;
-
-  const ctx = captureCanvas.getContext("2d");
-  if (!ctx) return;
   if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
     return;
   }
+  const captureSize = computeCaptureSize(video);
+  captureCanvas.width = captureSize.width;
+  captureCanvas.height = captureSize.height;
+
+  const ctx = captureCanvas.getContext("2d");
+  if (!ctx) return;
+  ctx.imageSmoothingEnabled = true;
   ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
   debugCaptureMode.value = "video";
 
   updateDebugFrameStats(ctx, captureCanvas.width, captureCanvas.height);
 
   const blob = await new Promise<Blob | null>((resolve) => {
-    captureCanvas.toBlob(resolve, "image/jpeg", 0.9);
+    captureCanvas.toBlob(resolve, "image/jpeg", captureJpegQuality);
   });
   if (!blob) {
     error.value = "摄像头帧抓取失败";
@@ -780,7 +794,6 @@ async function captureFrame() {
     result.value = data;
     applyResultToPanelState(data);
     await nextTick();
-    syncCanvasToPreview();
     drawKeypoints(data.keypoints);
   } catch (err: any) {
     if (axios.isAxiosError(err)) {
@@ -808,6 +821,11 @@ function onVideoReady() {
 }
 
 function applyResultToPanelState(data: OwnerGestureResult) {
+  if (data.panel_state) {
+    panelState.value = data.panel_state;
+    return;
+  }
+
   const nextState: OwnerControlPanelState = {
     ...panelState.value,
     last_gesture: data.gesture,
@@ -831,6 +849,17 @@ function applyResultToPanelState(data: OwnerGestureResult) {
   }
 
   panelState.value = nextState;
+}
+
+function computeCaptureSize(video: HTMLVideoElement) {
+  const sourceWidth = Math.max(1, debugVideoWidth.value || video.videoWidth || captureMaxWidth);
+  const sourceHeight = Math.max(1, debugVideoHeight.value || video.videoHeight || captureMaxHeight);
+  const scale = Math.min(1, captureMaxWidth / sourceWidth, captureMaxHeight / sourceHeight);
+
+  return {
+    width: Math.max(1, Math.round(sourceWidth * scale)),
+    height: Math.max(1, Math.round(sourceHeight * scale)),
+  };
 }
 
 function syncCanvasToPreview() {

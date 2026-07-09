@@ -5,12 +5,16 @@ from app.core.database import get_db
 from app.schemas.alert import (
     AlertDashboard,
     AlertEvent,
+    AlertEventPage,
     AlertEventCreate,
     AlertOverview,
     AlertPushRecord,
     AlertReplay,
+    BehaviorLogPage,
     BehaviorLogRecord,
+    MonitorLogPage,
     MonitorLogRecord,
+    OperationLogPage,
     OperationLogRecord,
 )
 from app.services.alert_service import AlertService
@@ -45,6 +49,18 @@ async def get_alert_timeline(
     return service.timeline(limit=limit, level=level, source=source)
 
 
+@router.get("/timeline-page", response_model=AlertEventPage)
+async def get_alert_timeline_page(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=5, ge=1, le=10),
+    level: str | None = Query(default=None),
+    source: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> AlertEventPage:
+    service = AlertService(db)
+    return service.timeline_page(page=page, page_size=page_size, level=level, source=source)
+
+
 @router.get("/push-logs", response_model=list[AlertPushRecord])
 async def get_alert_push_logs(
     limit: int = Query(default=20, ge=1, le=100),
@@ -66,6 +82,25 @@ async def get_monitor_logs(
     return service.list_monitor_logs(limit=limit, category=category, source=source, level=level)
 
 
+@router.get("/monitor-logs-page", response_model=MonitorLogPage)
+async def get_monitor_logs_page(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=5, ge=1, le=10),
+    category: str | None = Query(default=None),
+    source: str | None = Query(default=None),
+    level: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> MonitorLogPage:
+    service = AlertService(db)
+    return service.list_monitor_logs_page(
+        page=page,
+        page_size=page_size,
+        category=category,
+        source=source,
+        level=level,
+    )
+
+
 @router.get("/behavior-logs", response_model=list[BehaviorLogRecord])
 async def get_behavior_logs(
     limit: int = Query(default=12, ge=1, le=50),
@@ -73,6 +108,16 @@ async def get_behavior_logs(
 ) -> list[BehaviorLogRecord]:
     service = AlertService(db)
     return service.list_behavior_logs(limit=limit)
+
+
+@router.get("/behavior-logs-page", response_model=BehaviorLogPage)
+async def get_behavior_logs_page(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=5, ge=1, le=10),
+    db: Session = Depends(get_db),
+) -> BehaviorLogPage:
+    service = AlertService(db)
+    return service.list_behavior_logs_page(page=page, page_size=page_size)
 
 
 @router.get("/operation-logs", response_model=list[OperationLogRecord])
@@ -84,6 +129,23 @@ async def get_operation_logs(
 ) -> list[OperationLogRecord]:
     service = AlertService(db)
     return service.list_operation_logs(limit=limit, user_id=user_id, operation_type=operation_type)
+
+
+@router.get("/operation-logs-page", response_model=OperationLogPage)
+async def get_operation_logs_page(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=5, ge=1, le=10),
+    user_id: int | None = Query(default=None, ge=1),
+    operation_type: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> OperationLogPage:
+    service = AlertService(db)
+    return service.list_operation_logs_page(
+        page=page,
+        page_size=page_size,
+        user_id=user_id,
+        operation_type=operation_type,
+    )
 
 
 @router.get("/replay/{alert_id}", response_model=AlertReplay)

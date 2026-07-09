@@ -114,4 +114,27 @@ class AlertDashboard(BaseModel):
     top_event_types: list[MetricPoint]
 
 
+class AlertPageBase(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+
+
+class AlertEventPage(AlertPageBase):
+    items: list[AlertEvent]
+
+
+class BehaviorLogPage(AlertPageBase):
+    items: list[BehaviorLogRecord]
+
+
+class MonitorLogPage(AlertPageBase):
+    items: list[MonitorLogRecord]
+
+
+class OperationLogPage(AlertPageBase):
+    items: list[OperationLogRecord]
+
+
 AlertOverview.model_rebuild()

@@ -88,12 +88,30 @@ export interface AlertDashboard {
   top_event_types: MetricPoint[];
 }
 
+export interface PagedResult<T> {
+  items: T[];
+  page: number;
+  page_size: number;
+  total: number;
+  total_pages: number;
+}
+
 export const fetchAlertOverviewApi = () => request.get<AlertOverview>("/alerts/overview");
 export const fetchAlertTimelineApi = () => request.get<AlertEvent[]>("/alerts/timeline");
+export const fetchAlertTimelinePageApi = (params?: {
+  page?: number;
+  page_size?: number;
+  level?: string;
+  source?: string;
+}) => request.get<PagedResult<AlertEvent>>("/alerts/timeline-page", { params });
 export const fetchBehaviorLogsApi = (limit = 24) =>
   request.get<BehaviorLogRecord[]>("/alerts/behavior-logs", {
     params: { limit }
   });
+export const fetchBehaviorLogsPageApi = (params?: {
+  page?: number;
+  page_size?: number;
+}) => request.get<PagedResult<BehaviorLogRecord>>("/alerts/behavior-logs-page", { params });
 
 export const fetchMonitorLogsApi = (params?: {
   limit?: number;
@@ -101,12 +119,25 @@ export const fetchMonitorLogsApi = (params?: {
   source?: string;
   level?: string;
 }) => request.get<MonitorLogRecord[]>("/alerts/monitor-logs", { params });
+export const fetchMonitorLogsPageApi = (params?: {
+  page?: number;
+  page_size?: number;
+  category?: string;
+  source?: string;
+  level?: string;
+}) => request.get<PagedResult<MonitorLogRecord>>("/alerts/monitor-logs-page", { params });
 
 export const fetchOperationLogsApi = (params?: {
   limit?: number;
   user_id?: number;
   operation_type?: string;
 }) => request.get<OperationLogRecord[]>("/alerts/operation-logs", { params });
+export const fetchOperationLogsPageApi = (params?: {
+  page?: number;
+  page_size?: number;
+  user_id?: number;
+  operation_type?: string;
+}) => request.get<PagedResult<OperationLogRecord>>("/alerts/operation-logs-page", { params });
 
 export const fetchAlertReplayApi = (alertId: number) =>
   request.get<AlertReplay>(`/alerts/replay/${alertId}`);

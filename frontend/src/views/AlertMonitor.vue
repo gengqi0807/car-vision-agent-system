@@ -2,7 +2,7 @@
   <section class="page-shell">
     <header class="page-header">
       <h1>告警监控</h1>
-      <p>集中查看智能体告警、监控日志、原因分析与事件回放。</p>
+      <p>集中查看智能体告警、监控日志、原因分析与行为记录。</p>
     </header>
 
     <section v-if="showHealthyBanner" class="status-banner healthy">
@@ -35,25 +35,58 @@
           <h4>告警时间线</h4>
           <span class="panel-hint">点击任一条可查看原因分析与事件回放</span>
         </div>
-        <div v-if="timeline.length === 0" class="empty-state">暂无告警事件。</div>
-        <div
-          v-for="item in timeline"
-          :key="item.id"
-          class="timeline-item"
-          :style="{ cursor: 'pointer', opacity: selectedAlertId === item.id ? '1' : '0.92' }"
-          @click="selectReplay(item.id)"
-        >
-          <span class="dot" :class="item.level"></span>
-          <div class="body">
-            <span class="tag" :class="item.level">{{ getAlertLevelLabel(item.level) }}</span>
-            <div class="title">{{ item.title }}</div>
-            <div class="desc">{{ item.summary }}</div>
-            <div class="desc">
-              {{ getSourceLabel(item.source) }}
-              <template v-if="item.event_type"> · {{ item.event_type }}</template>
+        <div class="panel-fixed-body panel-fixed-body--timeline">
+          <div v-if="timelineState.items.length === 0" class="empty-state">暂无告警事件。</div>
+          <div
+            v-for="item in timelineState.items"
+            :key="item.id"
+            class="timeline-item"
+            :style="{ cursor: 'pointer', opacity: selectedAlertId === item.id ? '1' : '0.92' }"
+            @click="selectReplay(item.id)"
+          >
+            <span class="dot" :class="item.level"></span>
+            <div class="body">
+              <span class="tag" :class="item.level">{{ getAlertLevelLabel(item.level) }}</span>
+              <div class="title">{{ item.title }}</div>
+              <div class="desc clamp-2">{{ item.summary }}</div>
+              <div class="desc">
+                {{ getSourceLabel(item.source) }}
+                <template v-if="item.event_type"> · {{ item.event_type }}</template>
+              </div>
             </div>
+            <span class="time">{{ formatClock(item.created_at) }}</span>
           </div>
-          <span class="time">{{ formatClock(item.created_at) }}</span>
+        </div>
+        <div class="pagination-row">
+          <button
+            type="button"
+            class="page-arrow"
+            :disabled="timelineState.page <= 1"
+            @click="goToPreviousPage(timelineState, loadTimelinePage)"
+          >
+            &lt;
+          </button>
+          <div class="page-status">第 {{ timelineState.page }} / {{ timelineState.totalPages }} 页</div>
+          <button
+            type="button"
+            class="page-arrow"
+            :disabled="timelineState.page >= timelineState.totalPages"
+            @click="goToNextPage(timelineState, loadTimelinePage)"
+          >
+            &gt;
+          </button>
+          <div class="page-jump">
+            <input
+              v-model="timelineState.pageInput"
+              class="page-input"
+              type="number"
+              min="1"
+              :max="timelineState.totalPages"
+              @keydown.enter.prevent="jumpToPage(timelineState, loadTimelinePage)"
+              @blur="normalizePageInput(timelineState)"
+            />
+            <span class="page-range">范围 1 - {{ timelineState.totalPages }}</span>
+          </div>
         </div>
       </article>
 
@@ -147,18 +180,51 @@
           <h4>监控日志</h4>
           <span class="panel-hint">覆盖车牌识别、手势识别、交警手势与认证访问</span>
         </div>
-        <div v-if="monitorLogs.length === 0" class="empty-state">暂无监控日志。</div>
-        <div v-for="log in monitorLogs" :key="log.id" class="behavior-log-item">
-          <div class="behavior-log-main">
-            <span class="behavior-source">{{ getSourceLabel(log.source) }}</span>
-            <div class="title">{{ log.title }}</div>
-            <div class="desc">{{ log.summary }}</div>
-            <div class="desc">
-              {{ log.event_type }} · {{ log.status || "无状态" }}
-              <template v-if="typeof log.confidence === 'number'"> · 置信度 {{ log.confidence.toFixed(2) }}</template>
+        <div class="panel-fixed-body">
+          <div v-if="monitorState.items.length === 0" class="empty-state">暂无监控日志。</div>
+          <div v-for="log in monitorState.items" :key="log.id" class="behavior-log-item">
+            <div class="behavior-log-main">
+              <span class="behavior-source">{{ getSourceLabel(log.source) }}</span>
+              <div class="title">{{ log.title }}</div>
+              <div class="desc clamp-2">{{ log.summary }}</div>
+              <div class="desc">
+                {{ log.event_type }} · {{ log.status || "无状态" }}
+                <template v-if="typeof log.confidence === 'number'"> · 置信度 {{ log.confidence.toFixed(2) }}</template>
+              </div>
             </div>
+            <span class="time">{{ formatDateTime(log.created_at) }}</span>
           </div>
-          <span class="time">{{ formatDateTime(log.created_at) }}</span>
+        </div>
+        <div class="pagination-row">
+          <button
+            type="button"
+            class="page-arrow"
+            :disabled="monitorState.page <= 1"
+            @click="goToPreviousPage(monitorState, loadMonitorLogsPage)"
+          >
+            &lt;
+          </button>
+          <div class="page-status">第 {{ monitorState.page }} / {{ monitorState.totalPages }} 页</div>
+          <button
+            type="button"
+            class="page-arrow"
+            :disabled="monitorState.page >= monitorState.totalPages"
+            @click="goToNextPage(monitorState, loadMonitorLogsPage)"
+          >
+            &gt;
+          </button>
+          <div class="page-jump">
+            <input
+              v-model="monitorState.pageInput"
+              class="page-input"
+              type="number"
+              min="1"
+              :max="monitorState.totalPages"
+              @keydown.enter.prevent="jumpToPage(monitorState, loadMonitorLogsPage)"
+              @blur="normalizePageInput(monitorState)"
+            />
+            <span class="page-range">范围 1 - {{ monitorState.totalPages }}</span>
+          </div>
         </div>
       </article>
 
@@ -167,14 +233,47 @@
           <h4>用户操作日志</h4>
           <span class="panel-hint">用于审计登录、注册、资料更新等行为</span>
         </div>
-        <div v-if="operationLogs.length === 0" class="empty-state">暂无用户操作日志。</div>
-        <div v-for="record in operationLogs" :key="record.id" class="behavior-log-item">
-          <div class="behavior-log-main">
-            <span class="behavior-source">用户 {{ record.user_id }}</span>
-            <div class="title">{{ record.operation_type }}</div>
-            <div class="desc">状态：{{ record.response_status || "未知" }}</div>
+        <div class="panel-fixed-body">
+          <div v-if="operationState.items.length === 0" class="empty-state">暂无用户操作日志。</div>
+          <div v-for="record in operationState.items" :key="record.id" class="behavior-log-item">
+            <div class="behavior-log-main">
+              <span class="behavior-source">用户 {{ record.user_id }}</span>
+              <div class="title">{{ record.operation_type }}</div>
+              <div class="desc">状态：{{ record.response_status || "未知" }}</div>
+            </div>
+            <span class="time">{{ formatDateTime(record.created_at) }}</span>
           </div>
-          <span class="time">{{ formatDateTime(record.created_at) }}</span>
+        </div>
+        <div class="pagination-row">
+          <button
+            type="button"
+            class="page-arrow"
+            :disabled="operationState.page <= 1"
+            @click="goToPreviousPage(operationState, loadOperationLogsPage)"
+          >
+            &lt;
+          </button>
+          <div class="page-status">第 {{ operationState.page }} / {{ operationState.totalPages }} 页</div>
+          <button
+            type="button"
+            class="page-arrow"
+            :disabled="operationState.page >= operationState.totalPages"
+            @click="goToNextPage(operationState, loadOperationLogsPage)"
+          >
+            &gt;
+          </button>
+          <div class="page-jump">
+            <input
+              v-model="operationState.pageInput"
+              class="page-input"
+              type="number"
+              min="1"
+              :max="operationState.totalPages"
+              @keydown.enter.prevent="jumpToPage(operationState, loadOperationLogsPage)"
+              @blur="normalizePageInput(operationState)"
+            />
+            <span class="page-range">范围 1 - {{ operationState.totalPages }}</span>
+          </div>
         </div>
       </article>
     </section>
@@ -184,37 +283,46 @@
         <h4>行为日志</h4>
         <span class="panel-hint">识别任务的普通运行记录，可用于辅助排查。</span>
       </div>
-      <div class="behavior-log-board">
-        <div v-if="behaviorLogs.length === 0" class="empty-state">暂无行为日志。</div>
-        <div v-for="log in paginatedBehaviorLogs" :key="log.id" class="behavior-log-item">
+      <div class="panel-fixed-body panel-fixed-body--wide">
+        <div v-if="behaviorState.items.length === 0" class="empty-state">暂无行为日志。</div>
+        <div v-for="log in behaviorState.items" :key="log.id" class="behavior-log-item">
           <div class="behavior-log-main">
             <span class="behavior-source">{{ getSourceLabel(log.source) }}</span>
             <div class="title">{{ log.title }}</div>
-            <div class="desc">{{ log.summary }}</div>
+            <div class="desc clamp-2">{{ log.summary }}</div>
           </div>
           <span class="time">{{ formatDateTime(log.created_at) }}</span>
         </div>
       </div>
-      <div v-if="totalBehaviorPages > 1" class="pagination-row">
-        <button type="button" class="page-arrow" :disabled="behaviorPage === 1" @click="goToPreviousPage">
-          上一页
+      <div class="pagination-row">
+        <button
+          type="button"
+          class="page-arrow"
+          :disabled="behaviorState.page <= 1"
+          @click="goToPreviousPage(behaviorState, loadBehaviorLogsPage)"
+        >
+          &lt;
         </button>
-        <div class="page-current">{{ behaviorPage }}</div>
-        <button type="button" class="page-arrow" :disabled="behaviorPage === totalBehaviorPages" @click="goToNextPage">
-          下一页
+        <div class="page-status">第 {{ behaviorState.page }} / {{ behaviorState.totalPages }} 页</div>
+        <button
+          type="button"
+          class="page-arrow"
+          :disabled="behaviorState.page >= behaviorState.totalPages"
+          @click="goToNextPage(behaviorState, loadBehaviorLogsPage)"
+        >
+          &gt;
         </button>
         <div class="page-jump">
           <input
-            v-model="pageInput"
+            v-model="behaviorState.pageInput"
             class="page-input"
             type="number"
             min="1"
-            :max="totalBehaviorPages"
-            @keydown.enter.prevent="jumpToBehaviorPage"
-            @blur="normalizeBehaviorPageInput"
+            :max="behaviorState.totalPages"
+            @keydown.enter.prevent="jumpToPage(behaviorState, loadBehaviorLogsPage)"
+            @blur="normalizePageInput(behaviorState)"
           />
-          <span class="page-total">/ {{ totalBehaviorPages }}</span>
-          <button type="button" class="page-jump-btn" @click="jumpToBehaviorPage">跳转</button>
+          <span class="page-range">范围 1 - {{ behaviorState.totalPages }}</span>
         </div>
       </div>
     </article>
@@ -223,15 +331,15 @@
 
 <script setup lang="ts">
 import axios from "axios";
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 
 import {
   fetchAlertDashboardApi,
   fetchAlertReplayApi,
-  fetchAlertTimelineApi,
-  fetchBehaviorLogsApi,
-  fetchMonitorLogsApi,
-  fetchOperationLogsApi,
+  fetchAlertTimelinePageApi,
+  fetchBehaviorLogsPageApi,
+  fetchMonitorLogsPageApi,
+  fetchOperationLogsPageApi,
   type AlertDashboard,
   type AlertEvent,
   type AlertOverview,
@@ -239,9 +347,21 @@ import {
   type BehaviorLogRecord,
   type MetricPoint,
   type MonitorLogRecord,
-  type OperationLogRecord
+  type OperationLogRecord,
+  type PagedResult
 } from "../api/alert";
 import { formatDateTime } from "../utils/format";
+
+interface PagedState<T> {
+  items: T[];
+  page: number;
+  pageInput: string;
+  total: number;
+  totalPages: number;
+  pageSize: number;
+}
+
+type PageLoader<T> = (page?: number) => Promise<void>;
 
 const overview = reactive<AlertOverview>({
   total: 0,
@@ -273,36 +393,66 @@ const dashboard = reactive<AlertDashboard>({
   top_event_types: []
 });
 
-const timeline = ref<AlertEvent[]>([]);
-const behaviorLogs = ref<BehaviorLogRecord[]>([]);
-const monitorLogs = ref<MonitorLogRecord[]>([]);
-const operationLogs = ref<OperationLogRecord[]>([]);
 const selectedReplay = ref<AlertReplay | null>(null);
 const selectedAlertId = ref<number | null>(null);
-const behaviorPage = ref(1);
-const pageInput = ref("1");
 
-const behaviorPageSize = 5;
+const timelineState = createPagedState<AlertEvent>(5);
+const monitorState = createPagedState<MonitorLogRecord>(5);
+const operationState = createPagedState<OperationLogRecord>(5);
+const behaviorState = createPagedState<BehaviorLogRecord>(5);
 
 let refreshTimer: number | undefined;
 let socket: WebSocket | null = null;
 let hasShownLoadError = false;
 
 const showHealthyBanner = computed(() => overview.critical === 0 && overview.warning === 0);
-const totalBehaviorPages = computed(() => Math.max(1, Math.ceil(behaviorLogs.value.length / behaviorPageSize)));
-const paginatedBehaviorLogs = computed(() => {
-  const start = (behaviorPage.value - 1) * behaviorPageSize;
-  return behaviorLogs.value.slice(start, start + behaviorPageSize);
-});
 const replayPushText = computed(() =>
   (selectedReplay.value?.push_logs ?? [])
-    .map((item) => `${item.channel} -> ${item.target}（${item.success ? "成功" : "失败"}）`)
+    .map((item) => `${item.channel} -> ${item.target} (${item.success ? "成功" : "失败"})`)
     .join("；")
 );
 
-watch(behaviorPage, (page) => {
-  pageInput.value = String(page);
-});
+function createPagedState<T>(pageSize: number): PagedState<T> {
+  return reactive({
+    items: [] as T[],
+    page: 1,
+    pageInput: "1",
+    total: 0,
+    totalPages: 1,
+    pageSize
+  }) as PagedState<T>;
+}
+
+function applyPageData<T>(state: PagedState<T>, data: PagedResult<T>) {
+  state.items = data.items;
+  state.page = data.page;
+  state.pageInput = String(data.page);
+  state.total = data.total;
+  state.totalPages = data.total_pages;
+}
+
+function normalizeRequestedPage<T>(state: PagedState<T>, rawPage: number) {
+  if (!Number.isFinite(rawPage)) {
+    return state.page;
+  }
+  return Math.min(Math.max(1, Math.trunc(rawPage)), Math.max(1, state.totalPages));
+}
+
+function normalizePageInput<T>(state: PagedState<T>) {
+  state.pageInput = String(normalizeRequestedPage(state, Number(state.pageInput)));
+}
+
+async function jumpToPage<T>(state: PagedState<T>, loader: PageLoader<T>) {
+  await loader(normalizeRequestedPage(state, Number(state.pageInput)));
+}
+
+async function goToPreviousPage<T>(state: PagedState<T>, loader: PageLoader<T>) {
+  await loader(state.page - 1);
+}
+
+async function goToNextPage<T>(state: PagedState<T>, loader: PageLoader<T>) {
+  await loader(state.page + 1);
+}
 
 function getAlertLevelLabel(level: AlertEvent["level"]) {
   if (level === "critical") {
@@ -348,36 +498,6 @@ function joinMetricPairs(items: MetricPoint[] | undefined) {
   return items.map((item) => `${item.label}: ${item.value}`).join("；");
 }
 
-function setBehaviorPage(page: number) {
-  behaviorPage.value = Math.min(Math.max(1, page), totalBehaviorPages.value);
-}
-
-function goToPreviousPage() {
-  setBehaviorPage(behaviorPage.value - 1);
-}
-
-function goToNextPage() {
-  setBehaviorPage(behaviorPage.value + 1);
-}
-
-function jumpToBehaviorPage() {
-  const page = Number(pageInput.value);
-  if (Number.isNaN(page)) {
-    pageInput.value = String(behaviorPage.value);
-    return;
-  }
-  setBehaviorPage(page);
-}
-
-function normalizeBehaviorPageInput() {
-  const page = Number(pageInput.value);
-  if (Number.isNaN(page)) {
-    pageInput.value = String(behaviorPage.value);
-    return;
-  }
-  setBehaviorPage(page);
-}
-
 function formatClock(value: string) {
   return new Date(value).toLocaleTimeString("zh-CN", {
     hour: "2-digit",
@@ -400,40 +520,67 @@ async function selectReplay(alertId: number) {
   }
 }
 
+async function loadTimelinePage(page = timelineState.page) {
+  const response = await fetchAlertTimelinePageApi({
+    page: normalizeRequestedPage(timelineState, page),
+    page_size: timelineState.pageSize
+  });
+  applyPageData(timelineState, response.data);
+
+  if (timelineState.items.length === 0) {
+    selectedAlertId.value = null;
+    selectedReplay.value = null;
+    return;
+  }
+
+  if (selectedAlertId.value === null) {
+    await selectReplay(timelineState.items[0].id);
+    return;
+  }
+
+  try {
+    await selectReplay(selectedAlertId.value);
+  } catch {
+    return;
+  }
+}
+
+async function loadMonitorLogsPage(page = monitorState.page) {
+  const response = await fetchMonitorLogsPageApi({
+    page: normalizeRequestedPage(monitorState, page),
+    page_size: monitorState.pageSize
+  });
+  applyPageData(monitorState, response.data);
+}
+
+async function loadOperationLogsPage(page = operationState.page) {
+  const response = await fetchOperationLogsPageApi({
+    page: normalizeRequestedPage(operationState, page),
+    page_size: operationState.pageSize
+  });
+  applyPageData(operationState, response.data);
+}
+
+async function loadBehaviorLogsPage(page = behaviorState.page) {
+  const response = await fetchBehaviorLogsPageApi({
+    page: normalizeRequestedPage(behaviorState, page),
+    page_size: behaviorState.pageSize
+  });
+  applyPageData(behaviorState, response.data);
+}
+
 async function loadAlertMonitor() {
   try {
-    const [dashboardResponse, timelineResponse, behaviorResponse, monitorResponse, operationResponse] =
-      await Promise.all([
-        fetchAlertDashboardApi({ latest_limit: 6, log_limit: 12 }),
-        fetchAlertTimelineApi(),
-        fetchBehaviorLogsApi(24),
-        fetchMonitorLogsApi({ limit: 12 }),
-        fetchOperationLogsApi({ limit: 12 })
-      ]);
+    const [dashboardResponse] = await Promise.all([
+      fetchAlertDashboardApi({ latest_limit: 6, log_limit: 12 }),
+      loadTimelinePage(),
+      loadBehaviorLogsPage(),
+      loadMonitorLogsPage(),
+      loadOperationLogsPage()
+    ]);
 
     Object.assign(dashboard, dashboardResponse.data);
     Object.assign(overview, dashboardResponse.data.alert_overview);
-    timeline.value = timelineResponse.data;
-    behaviorLogs.value = behaviorResponse.data;
-    monitorLogs.value = monitorResponse.data;
-    operationLogs.value = operationResponse.data;
-
-    if (timeline.value.length > 0) {
-      const candidateId = selectedAlertId.value ?? timeline.value[0].id;
-      if (candidateId !== selectedAlertId.value || selectedReplay.value === null) {
-        await selectReplay(candidateId);
-      }
-    } else {
-      selectedAlertId.value = null;
-      selectedReplay.value = null;
-    }
-
-    if (behaviorPage.value > totalBehaviorPages.value) {
-      behaviorPage.value = totalBehaviorPages.value;
-    } else {
-      pageInput.value = String(behaviorPage.value);
-    }
-
     hasShownLoadError = false;
   } catch (error) {
     if (hasShownLoadError) {
@@ -488,3 +635,99 @@ onBeforeUnmount(() => {
   socket?.close();
 });
 </script>
+
+<style scoped lang="scss">
+.panel-fixed-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 420px;
+  overflow: hidden;
+}
+
+.panel-fixed-body--timeline {
+  height: 440px;
+}
+
+.panel-fixed-body--wide {
+  height: 360px;
+}
+
+.pagination-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+
+.page-arrow {
+  width: 38px;
+  height: 38px;
+  border: 1px solid rgba(184, 162, 141, 0.35);
+  border-radius: 10px;
+  background: #f8f3ec;
+  color: #5e4d41;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.page-arrow:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.page-status {
+  min-width: 92px;
+  color: #6e5e52;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.page-jump {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.page-input {
+  width: 84px;
+  height: 38px;
+  padding: 0 10px;
+  border: 1px solid rgba(184, 162, 141, 0.35);
+  border-radius: 10px;
+  background: #fffdf9;
+  color: #5e4d41;
+}
+
+.page-range {
+  color: #938477;
+  font-size: 12px;
+}
+
+.clamp-2 {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.timeline-item,
+.behavior-log-item {
+  min-height: 0;
+}
+
+@media (max-width: 960px) {
+  .panel-fixed-body,
+  .panel-fixed-body--timeline,
+  .panel-fixed-body--wide {
+    height: auto;
+    min-height: 320px;
+  }
+
+  .page-jump {
+    margin-left: 0;
+  }
+}
+</style>

@@ -23,6 +23,7 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
 from app.core.config import settings
+from app.models_infer.mediapipe_compat import patch_windows_mediapipe_free_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ class MediaPipeHands:
 
     def _ensure_landmarker(self) -> HandLandmarker:
         if self._landmarker is None:
+            patch_windows_mediapipe_free_symbol()
             self._landmarker = HandLandmarker.create_from_options(self._options)
         return self._landmarker
 

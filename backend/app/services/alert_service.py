@@ -18,13 +18,17 @@ from app.models.user_operation_log import UserOperationLog
 from app.schemas.alert import (
     AlertDashboard,
     AlertEvent,
+    AlertEventPage,
     AlertEventCreate,
     AlertOverview,
+    BehaviorLogPage,
     AlertPushRecord,
     AlertReplay,
     BehaviorLogRecord,
     MetricPoint,
+    MonitorLogPage,
     MonitorLogRecord,
+    OperationLogPage,
     OperationLogRecord,
 )
 
@@ -75,6 +79,36 @@ class AlertService:
         alerts = self.db.scalars(query.limit(limit)).all()
         return [self._to_alert_event(alert) for alert in alerts]
 
+    def timeline_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 5,
+        level: str | None = None,
+        source: str | None = None,
+    ) -> AlertEventPage:
+        query = select(AlertLog).order_by(AlertLog.created_at.desc())
+        if level:
+            query = query.where(AlertLog.level == level)
+        if source:
+            query = query.where(AlertLog.source == source)
+
+        total = int(
+            self.db.scalar(
+                select(func.count()).select_from(query.order_by(None).subquery())
+            )
+            or 0
+        )
+        page, total_pages, offset = self._resolve_page(total=total, page=page, page_size=page_size)
+        alerts = self.db.scalars(query.offset(offset).limit(page_size)).all()
+        return AlertEventPage(
+            items=[self._to_alert_event(alert) for alert in alerts],
+            page=page,
+            page_size=page_size,
+            total=total,
+            total_pages=total_pages,
+        )
+
     def overview(self, *, latest_limit: int = 5) -> AlertOverview:
         counts = dict(
             self.db.execute(
@@ -121,6 +155,51 @@ class AlertService:
 
         return list(_behavior_log_store)[:limit]
 
+    def list_behavior_logs_page(self, *, page: int = 1, page_size: int = 5) -> BehaviorLogPage:
+        query = (
+            select(MonitorLog)
+            .where(MonitorLog.category.in_(["plate", "owner_gesture", "police_gesture"]))
+            .order_by(MonitorLog.created_at.desc())
+        )
+        total = int(
+            self.db.scalar(
+                select(func.count()).select_from(query.order_by(None).subquery())
+            )
+            or 0
+        )
+
+        if total > 0:
+            page, total_pages, offset = self._resolve_page(total=total, page=page, page_size=page_size)
+            records = self.db.scalars(query.offset(offset).limit(page_size)).all()
+            items = [
+                BehaviorLogRecord(
+                    id=record.id,
+                    source=record.source,
+                    title=record.title,
+                    summary=record.summary,
+                    created_at=record.created_at,
+                )
+                for record in records
+            ]
+            return BehaviorLogPage(
+                items=items,
+                page=page,
+                page_size=page_size,
+                total=total,
+                total_pages=total_pages,
+            )
+
+        fallback_total = len(_behavior_log_store)
+        page, total_pages, offset = self._resolve_page(total=fallback_total, page=page, page_size=page_size)
+        items = list(_behavior_log_store)[offset : offset + page_size]
+        return BehaviorLogPage(
+            items=items,
+            page=page,
+            page_size=page_size,
+            total=fallback_total,
+            total_pages=total_pages,
+        )
+
     def record_behavior(
         self,
         *,
@@ -154,6 +233,44 @@ class AlertService:
         self.db.commit()
         return record
 
+    def record_behavior_once(
+        self,
+        *,
+        source: str,
+        title: str,
+        summary: str,
+        created_at: datetime | None = None,
+        window_seconds: int = 30,
+    ) -> BehaviorLogRecord:
+        timestamp = created_at or datetime.utcnow()
+        since = timestamp - timedelta(seconds=window_seconds)
+        existing = self.db.scalar(
+            select(MonitorLog)
+            .where(
+                MonitorLog.source == source,
+                MonitorLog.event_type == "behavior_event",
+                MonitorLog.title == title,
+                MonitorLog.created_at >= since,
+            )
+            .order_by(MonitorLog.created_at.desc())
+            .limit(1)
+        )
+        if existing is not None:
+            return BehaviorLogRecord(
+                id=existing.id,
+                source=existing.source,
+                title=existing.title,
+                summary=existing.summary,
+                created_at=existing.created_at,
+            )
+
+        return self.record_behavior(
+            source=source,
+            title=title,
+            summary=summary,
+            created_at=timestamp,
+        )
+
     def list_operation_logs(
         self,
         *,
@@ -169,6 +286,36 @@ class AlertService:
 
         records = self.db.scalars(query.limit(limit)).all()
         return [OperationLogRecord.model_validate(record) for record in records]
+
+    def list_operation_logs_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 5,
+        user_id: int | None = None,
+        operation_type: str | None = None,
+    ) -> OperationLogPage:
+        query = select(UserOperationLog).order_by(UserOperationLog.created_at.desc())
+        if user_id is not None:
+            query = query.where(UserOperationLog.user_id == user_id)
+        if operation_type:
+            query = query.where(UserOperationLog.operation_type == operation_type)
+
+        total = int(
+            self.db.scalar(
+                select(func.count()).select_from(query.order_by(None).subquery())
+            )
+            or 0
+        )
+        page, total_pages, offset = self._resolve_page(total=total, page=page, page_size=page_size)
+        records = self.db.scalars(query.offset(offset).limit(page_size)).all()
+        return OperationLogPage(
+            items=[OperationLogRecord.model_validate(record) for record in records],
+            page=page,
+            page_size=page_size,
+            total=total,
+            total_pages=total_pages,
+        )
 
     def list_monitor_logs(
         self,
@@ -187,6 +334,39 @@ class AlertService:
             query = query.where(MonitorLog.level == level)
         records = self.db.scalars(query.limit(limit)).all()
         return [self._to_monitor_log(record) for record in records]
+
+    def list_monitor_logs_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 5,
+        category: str | None = None,
+        source: str | None = None,
+        level: str | None = None,
+    ) -> MonitorLogPage:
+        query = select(MonitorLog).order_by(MonitorLog.created_at.desc())
+        if category:
+            query = query.where(MonitorLog.category == category)
+        if source:
+            query = query.where(MonitorLog.source == source)
+        if level:
+            query = query.where(MonitorLog.level == level)
+
+        total = int(
+            self.db.scalar(
+                select(func.count()).select_from(query.order_by(None).subquery())
+            )
+            or 0
+        )
+        page, total_pages, offset = self._resolve_page(total=total, page=page, page_size=page_size)
+        records = self.db.scalars(query.offset(offset).limit(page_size)).all()
+        return MonitorLogPage(
+            items=[self._to_monitor_log(record) for record in records],
+            page=page,
+            page_size=page_size,
+            total=total,
+            total_pages=total_pages,
+        )
 
     def replay(self, alert_id: int) -> AlertReplay:
         alert = self.db.get(AlertLog, alert_id)
@@ -348,3 +528,8 @@ class AlertService:
         if source == "auth":
             return "user_operation"
         return "system"
+
+    def _resolve_page(self, *, total: int, page: int, page_size: int) -> tuple[int, int, int]:
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        normalized_page = min(max(1, page), total_pages)
+        return normalized_page, total_pages, (normalized_page - 1) * page_size
