@@ -176,6 +176,9 @@ def _ensure_alert_table_compatibility() -> None:
         _ensure_updated_at_column("user_operation_logs")
         _backfill_updated_at_from_created_at("user_operation_logs")
 
+    if "owner_gesture_records" in table_names:
+        _ensure_owner_gesture_record_columns(inspector)
+
 
 def _ensure_alert_logs_columns(inspector) -> None:
     columns = {column["name"]: column for column in inspector.get_columns("alert_logs")}
@@ -338,6 +341,35 @@ def _backfill_updated_at_from_created_at(table_name: str) -> None:
                 "WHERE updated_at IS NULL"
             )
         )
+
+
+def _ensure_owner_gesture_record_columns(inspector) -> None:
+    columns = {column["name"] for column in inspector.get_columns("owner_gesture_records")}
+    statements: list[str] = []
+
+    if "user_id" not in columns:
+        statements.append("ALTER TABLE owner_gesture_records ADD COLUMN user_id INT NULL")
+    if "session_id" not in columns:
+        statements.append("ALTER TABLE owner_gesture_records ADD COLUMN session_id VARCHAR(64) NULL")
+    if "hand_landmarks" not in columns:
+        statements.append("ALTER TABLE owner_gesture_records ADD COLUMN hand_landmarks JSON NULL")
+    if "is_triggered" not in columns:
+        statements.append("ALTER TABLE owner_gesture_records ADD COLUMN is_triggered BOOLEAN NULL DEFAULT 0")
+    if "processing_time_ms" not in columns:
+        statements.append("ALTER TABLE owner_gesture_records ADD COLUMN processing_time_ms INT NULL")
+
+    indexes = {index["name"] for index in inspector.get_indexes("owner_gesture_records")}
+    if "ix_owner_gesture_records_user_id" not in indexes:
+        statements.append("CREATE INDEX ix_owner_gesture_records_user_id ON owner_gesture_records (user_id)")
+    if "ix_owner_gesture_records_session_id" not in indexes:
+        statements.append("CREATE INDEX ix_owner_gesture_records_session_id ON owner_gesture_records (session_id)")
+
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 def init_database() -> None:
