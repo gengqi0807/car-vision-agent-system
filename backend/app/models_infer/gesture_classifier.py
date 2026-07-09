@@ -20,26 +20,182 @@
 """
 
 import math
+import os
+import logging
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class GestureClassifier:
-    """手势分类器，支持 domain="owner" / "police" 两种模式。"""
+    """手势分类器，支持 domain="owner" / "police" 两种模式。
+
+    owner 模式下优先使用训练的 SVM 模型，模型不存在时回退到启发式规则。
+    """
+
+    # ----------------------------------------------------------------
+    # 时序保护常量（classify_frame 使用）
+    # ----------------------------------------------------------------
+    DYNAMIC_COOLDOWN_FRAMES: int = 18  # 动态触发后抑制静态的帧数 (~0.6s @30fps)
+    NO_HAND_REARM_FRAMES: int = 3      # 手消失多少帧算「手势边界」，重新武装
+    STATIC_STABLE_FRAMES: int = 3      # 静态手势需连续稳定几帧才输出
 
     def __init__(self, domain: str = "owner"):
         self.domain = domain
         self.tracker: HandGestureTracker | None = (
             HandGestureTracker() if domain == "owner" else None
         )
+        self._ml_model = None
+        self._ml_scaler = None
+        self._ml_labels = None
+
+        # 时序保护状态
+        self._cooldown: int = 0
+        self._no_hand: int = 0
+        self._stable_gesture: str | None = None
+        self._stable_count: int = 0
+
+        # 尝试加载训练好的 SVM 模型
+        if domain == "owner":
+            self._load_ml_model()
+
+    # ----------------------------------------------------------------
+    # ML 模型加载与推理
+    # ----------------------------------------------------------------
+
+    def _load_ml_model(self) -> None:
+        """尝试从 models/ 目录加载训练好的 SVM 模型。"""
+        try:
+            from app.core.config import settings
+            model_path = os.path.join(settings.models_dir, "gesture_classifier_svm.joblib")
+            if not os.path.exists(model_path):
+                logger.info("SVM 模型文件不存在，将使用启发式规则: %s", model_path)
+                return
+
+            import joblib
+            bundle = joblib.load(model_path)
+            self._ml_model = bundle["model"]
+            self._ml_scaler = bundle["scaler"]
+            self._ml_labels = bundle["label_names"]
+            logger.info("已加载 SVM 手势模型，类别: %s", self._ml_labels.tolist())
+        except Exception as e:
+            logger.warning("加载 SVM 模型失败，回退到启发式规则: %s", e)
+            self._ml_model = None
+
+    def _classify_ml(self, keypoints: list[dict]) -> tuple[str, float] | None:
+        """使用 SVM 模型预测手势。失败返回 None，由调用方回退到启发式规则。"""
+        if self._ml_model is None or self._ml_scaler is None:
+            return None
+        if len(keypoints) != 21:
+            return None
+
+        try:
+            from app.models_infer.hand_utils import normalize_hand_landmarks_array, SingleClassWrapper  # noqa: F401
+            feat = normalize_hand_landmarks_array(keypoints).reshape(1, -1)  # (1, 63)
+            feat_scaled = self._ml_scaler.transform(feat)
+
+            # 尝试获取概率
+            if hasattr(self._ml_model, "predict_proba"):
+                proba = self._ml_model.predict_proba(feat_scaled)[0]
+                idx = int(np.argmax(proba))
+                gesture = str(self._ml_labels[idx])
+                confidence = float(proba[idx])
+                return gesture, confidence
+            else:
+                idx = int(self._ml_model.predict(feat_scaled)[0])
+                gesture = str(self._ml_labels[idx])
+                return gesture, 0.75
+        except Exception as e:
+            logger.debug("ML 推理失败: %s", e)
+            return None
+
+    # ----------------------------------------------------------------
+    # 静态手势分类
+    # ----------------------------------------------------------------
 
     def classify_static(self, keypoints: list[dict]) -> tuple[str, float]:
         """
         根据 21 个手部关键点判定静态手势。
+        优先使用 ML 模型，不存在时回退到启发式规则。
 
         Returns:
             (gesture_name, confidence)
         """
         if len(keypoints) != 21:
             return "unknown", 0.0
+
+        # 优先: 训练好的 SVM/ML 模型
+        ml_result = self._classify_ml(keypoints)
+        if ml_result is not None:
+            return ml_result
+
+        # 回退: 启发式规则
+        return self._classify_heuristic(keypoints)
+
+    # ----------------------------------------------------------------
+    # 统一入口：静态 + 动态 + 时序去抖
+    # ----------------------------------------------------------------
+
+    def classify_frame(self, keypoints: list[dict] | None) -> tuple[str, float]:
+        """
+        统一手势分类入口，融合静态识别、动态追踪、时序去抖。
+
+        传入 None 表示当前帧无手。
+        - 动态手势触发后进入冷却期，抑制静态输出返回 idle
+        - 手消失 ≥ NO_HAND_REARM_FRAMES 帧 → 解除冷却（手势边界）
+        - 静态手势需连续稳定 STATIC_STABLE_FRAMES 帧才输出
+
+        Returns:
+            (gesture_name, confidence)
+        """
+        # ---- 无手：重置 tracker + 计数 ----
+        if keypoints is None:
+            if self.tracker:
+                self.tracker.reset()
+            self._no_hand += 1
+            self._stable_gesture = None
+            self._stable_count = 0
+            if self._no_hand >= self.NO_HAND_REARM_FRAMES:
+                self._cooldown = 0  # 手势边界 → 解除冷却
+            return "unknown", 0.0
+
+        if len(keypoints) != 21:
+            return "unknown", 0.0
+
+        self._no_hand = 0
+
+        # ---- 静态 + 动态推理 ----
+        static_gesture, static_conf = self.classify_static(keypoints)
+        dynamic = self.tracker.update(keypoints) if self.tracker else None
+
+        # 1) 动态触发：立即输出 + 进入冷却
+        if dynamic:
+            self._cooldown = self.DYNAMIC_COOLDOWN_FRAMES
+            self._stable_gesture = None
+            self._stable_count = 0
+            return dynamic, 0.85
+
+        # 2) 冷却期：抑制所有静态输出
+        if self._cooldown > 0:
+            self._cooldown -= 1
+            self._stable_gesture = None
+            self._stable_count = 0
+            return "idle", 0.0
+
+        # 3) 冷却结束：静态需连续稳定 K 帧才输出
+        if static_gesture == self._stable_gesture:
+            self._stable_count += 1
+        else:
+            self._stable_gesture = static_gesture
+            self._stable_count = 1
+
+        if self._stable_count >= self.STATIC_STABLE_FRAMES:
+            return static_gesture, static_conf
+
+        return "idle", 0.0
+
+    def _classify_heuristic(self, keypoints: list[dict]) -> tuple[str, float]:
 
         fingers = self._finger_states(keypoints)
         extended_count = sum(fingers)
@@ -96,10 +252,19 @@ class GestureClassifier:
 
         results: list[bool] = []
         for tip_i, pip_i, mcp_i in fingers_def:
-            if tip_i == 4:  # 拇指特殊判定
-                tip_pip = GestureClassifier._dist(kp[tip_i], kp[pip_i])
-                pip_mcp = GestureClassifier._dist(kp[pip_i], kp[mcp_i])
-                results.append(tip_pip > pip_mcp * 1.2 if pip_mcp > 1e-8 else False)
+            if tip_i == 4:  # 拇指: 用 MCP→IP 与 IP→TIP 夹角判断（比距离比更鲁棒）
+                v1 = (kp[pip_i]["x"] - kp[mcp_i]["x"],
+                      kp[pip_i]["y"] - kp[mcp_i]["y"])
+                v2 = (kp[tip_i]["x"] - kp[pip_i]["x"],
+                      kp[tip_i]["y"] - kp[pip_i]["y"])
+                mag1 = math.hypot(v1[0], v1[1])
+                mag2 = math.hypot(v2[0], v2[1])
+                if mag1 < 1e-8 or mag2 < 1e-8:
+                    results.append(False)
+                else:
+                    cos_angle = (v1[0] * v2[0] + v1[1] * v2[1]) / (mag1 * mag2)
+                    # cos > 0.35 → 夹角 < ~70° → 拇指伸直
+                    results.append(cos_angle > 0.35)
             else:
                 tip_wrist = GestureClassifier._dist(kp[tip_i], wrist)
                 pip_wrist = GestureClassifier._dist(kp[pip_i], wrist)

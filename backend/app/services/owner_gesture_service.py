@@ -35,7 +35,7 @@ import cv2
 import numpy as np
 
 from app.core.config import settings
-from app.models_infer.gesture_classifier import GestureClassifier, HandGestureTracker
+from app.models_infer.gesture_classifier import GestureClassifier
 from app.models_infer.mediapipe_hands import MediaPipeHands
 from app.schemas.gesture import Keypoint, OwnerGestureResult, StreamState
 
@@ -246,7 +246,6 @@ class OwnerGestureService:
             return
 
         classifier = self._classifier
-        tracker = classifier.tracker  # HandGestureTracker
         frame_interval = 1.0 / max(fps, 1)
 
         while self._running:
@@ -260,44 +259,27 @@ class OwnerGestureService:
             try:
                 # MediaPipe Hands 推理
                 hands = MediaPipeHands.infer(frame_bgr)
+                hand_kp = hands[0] if hands else None
 
+                # 统一手势分类（静态 + 动态 + 时序去抖）
+                gesture, confidence = classifier.classify_frame(hand_kp)
+
+                # 转换为 keypoints
                 if hands:
-                    hand_kp = hands[0]  # 取第一只手
-
-                    # 静态手势分类
-                    gesture, static_conf = classifier.classify_static(hand_kp)
-
-                    # 动态手势追踪
-                    dynamic = None
-                    if tracker:
-                        dynamic = tracker.update(hand_kp)
-
-                    # 最终手势：动态优先
-                    final_gesture = dynamic if dynamic else gesture
-                    confidence = 0.85 if dynamic else static_conf
-
-                    # 转换为 keypoints
                     keypoints = [
                         Keypoint(x=k["x"], y=k["y"], score=1.0) for k in hand_kp
                     ]
-
-                    result = OwnerGestureResult(
-                        gesture=final_gesture,
-                        action=gesture_to_action(final_gesture),
-                        confidence=round(confidence, 4),
-                        keypoints=keypoints,
-                        hand_count=len(hands),
-                        updated_at=datetime.now(timezone.utc),
-                    )
                 else:
-                    result = OwnerGestureResult(
-                        gesture="unknown",
-                        action="idle",
-                        confidence=0.0,
-                        keypoints=[],
-                        hand_count=0,
-                        updated_at=datetime.now(timezone.utc),
-                    )
+                    keypoints = []
+
+                result = OwnerGestureResult(
+                    gesture=gesture,
+                    action=gesture_to_action(gesture),
+                    confidence=round(confidence, 4),
+                    keypoints=keypoints,
+                    hand_count=len(hands),
+                    updated_at=datetime.now(timezone.utc),
+                )
 
                 # 更新最新结果
                 with self._lock:

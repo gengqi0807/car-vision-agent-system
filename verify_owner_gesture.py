@@ -110,22 +110,11 @@ def draw_result(frame: np.ndarray, gesture: str, action: str, conf: float,
 
 def process_frame(frame_bgr: np.ndarray, classifier: GestureClassifier):
     hands = MediaPipeHands.infer(frame_bgr)
+    hand_kp = hands[0] if hands else None
 
-    if hands:
-        hand_kp = hands[0]
-        gesture, conf = classifier.classify_static(hand_kp)
-
-        dynamic = None
-        if classifier.tracker:
-            dynamic = classifier.tracker.update(hand_kp)
-
-        final = dynamic if dynamic else gesture
-        final_conf = 0.85 if dynamic else conf
-        return final, gesture_label(final), final_conf, len(hands), hand_kp
-    else:
-        if classifier.tracker:
-            classifier.tracker.reset()
-        return "unknown", "idle", 0.0, 0, None
+    gesture, conf = classifier.classify_frame(hand_kp)
+    action = gesture_label(gesture)
+    return gesture, action, conf, len(hands), hand_kp
 
 
 def main():

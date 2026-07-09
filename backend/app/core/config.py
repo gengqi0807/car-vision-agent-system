@@ -27,6 +27,7 @@ class Settings(BaseSettings):
         )
     )
     hand_landmarker_model: str = Field(default="hand_landmarker.task")
+    gesture_classifier_model: str = Field(default="gesture_classifier_svm.joblib")
     num_hands: int = Field(default=2)
     min_hand_detection_confidence: float = Field(default=0.5)
     min_hand_presence_confidence: float = Field(default=0.5)
