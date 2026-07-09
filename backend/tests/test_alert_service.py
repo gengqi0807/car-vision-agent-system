@@ -29,6 +29,16 @@ class StubNotifier:
         _ = message
         return self.delivered
 
+    async def notify_alert(self, alert) -> int:
+        _ = alert
+        return [
+            {
+                "channel": "websocket",
+                "target": f"alerts:{self.delivered}",
+                "success": self.delivered > 0,
+            }
+        ]
+
 
 class AlertServiceTestCase(unittest.TestCase):
     @classmethod
@@ -119,6 +129,11 @@ class AlertServiceTestCase(unittest.TestCase):
         self.assertEqual(records[0].user_id, 1)
         self.assertEqual(records[0].operation_type, "login")
 
+        keyword_records = service.list_operation_logs(limit=10, keyword="register")
+
+        self.assertEqual(len(keyword_records), 1)
+        self.assertEqual(keyword_records[0].operation_type, "register")
+
     def test_behavior_logs_only_return_real_records(self) -> None:
         service = AlertService(self.db, notifier=StubNotifier())
 
@@ -134,6 +149,65 @@ class AlertServiceTestCase(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].source, "plate-recognition")
         self.assertEqual(records[0].title, "车牌识别完成")
+
+
+    def test_timeline_and_behavior_filters_work(self) -> None:
+        service = AlertService(self.db, notifier=StubNotifier())
+
+        asyncio.run(
+            service.create_event(
+                AlertEventCreate(
+                    level="warning",
+                    source="owner-gesture",
+                    title="Owner gesture low confidence",
+                    summary="Confidence dropped below threshold",
+                )
+            )
+        )
+        asyncio.run(
+            service.create_event(
+                AlertEventCreate(
+                    level="info",
+                    source="auth",
+                    title="Login from new device",
+                    summary="User signed in from a new browser",
+                )
+            )
+        )
+        service.record_behavior(
+            source="plate-recognition",
+            title="Plate recognized",
+            summary="Detected plate YueB12345 with confidence 0.94",
+        )
+        service.record_behavior(
+            source="owner-gesture",
+            title="Owner gesture accepted",
+            summary="Unlock gesture verified successfully",
+        )
+
+        filtered_timeline = service.timeline(
+            limit=10,
+            level="warning",
+            source="owner-gesture",
+            keyword="confidence",
+        )
+        filtered_monitor_logs = service.list_monitor_logs(
+            limit=10,
+            source="plate-recognition",
+            keyword="YueB12345",
+        )
+        filtered_behavior_logs = service.list_behavior_logs(
+            limit=10,
+            source="owner-gesture",
+            keyword="Unlock",
+        )
+
+        self.assertEqual(len(filtered_timeline), 1)
+        self.assertEqual(filtered_timeline[0].source, "owner-gesture")
+        self.assertEqual(len(filtered_monitor_logs), 1)
+        self.assertEqual(filtered_monitor_logs[0].source, "plate-recognition")
+        self.assertEqual(len(filtered_behavior_logs), 1)
+        self.assertEqual(filtered_behavior_logs[0].source, "owner-gesture")
 
 
 if __name__ == "__main__":
