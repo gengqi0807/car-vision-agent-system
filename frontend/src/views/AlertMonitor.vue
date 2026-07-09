@@ -95,6 +95,43 @@
           <h4>统计仪表盘</h4>
           <span class="panel-hint">按来源、根因与通知渠道汇总</span>
         </div>
+        <div class="pie-chart-card">
+          <div class="pie-chart-wrap">
+            <svg viewBox="0 0 220 220" class="pie-chart" aria-label="Alert level pie chart">
+              <circle cx="110" cy="110" r="78" fill="#f3ede4" />
+              <template v-if="pieChartSegments.length > 0">
+                <path
+                  v-for="segment in pieChartSegments"
+                  :key="segment.key"
+                  :d="segment.path"
+                  :fill="segment.color"
+                />
+                <text
+                  v-for="segment in pieChartSegments"
+                  :key="`${segment.key}-label`"
+                  :x="segment.labelX"
+                  :y="segment.labelY"
+                  class="pie-slice-label"
+                >
+                  {{ segment.value }}
+                </text>
+              </template>
+              <template v-else>
+                <circle cx="110" cy="110" r="78" fill="#eadfce" />
+              </template>
+              <circle cx="110" cy="110" r="46" fill="#fffaf3" />
+              <text x="110" y="102" text-anchor="middle" class="pie-center-title">总数</text>
+              <text x="110" y="126" text-anchor="middle" class="pie-center-value">{{ pieChartTotal }}</text>
+            </svg>
+          </div>
+          <div class="pie-legend">
+            <div v-for="segment in pieLegendItems" :key="segment.key" class="pie-legend-item">
+              <span class="pie-legend-dot" :style="{ backgroundColor: segment.color }"></span>
+              <span class="pie-legend-label">{{ segment.label }}</span>
+              <span class="pie-legend-value">{{ segment.value }}</span>
+            </div>
+          </div>
+        </div>
         <div class="vertical-bars">
           <div class="vbar-group">
             <div class="bar critical" :style="{ height: buildBarHeight(overview.critical) }"></div>
@@ -411,6 +448,45 @@ const replayPushText = computed(() =>
     .map((item) => `${item.channel} -> ${item.target} (${item.success ? "成功" : "失败"})`)
     .join("；")
 );
+const pieLegendItems = computed(() => [
+  { key: "critical", label: "严重", value: overview.critical, color: "#c95d4c" },
+  { key: "warning", label: "警告", value: overview.warning, color: "#d8a25c" },
+  { key: "info", label: "提示", value: overview.info, color: "#7ea0c6" }
+]);
+const pieChartTotal = computed(() => pieLegendItems.value.reduce((sum, item) => sum + item.value, 0));
+const pieChartSegments = computed(() => {
+  const total = pieChartTotal.value;
+  if (total <= 0) {
+    return [] as Array<{
+      key: string;
+      value: number;
+      color: string;
+      path: string;
+      labelX: number;
+      labelY: number;
+    }>;
+  }
+
+  let startAngle = -90;
+  return pieLegendItems.value
+    .filter((item) => item.value > 0)
+    .map((item) => {
+      const angle = (item.value / total) * 360;
+      const endAngle = startAngle + angle;
+      const midAngle = startAngle + angle / 2;
+      const labelPoint = polarToCartesian(110, 110, 62, midAngle);
+      const segment = {
+        key: item.key,
+        value: item.value,
+        color: item.color,
+        path: describePieSlice(110, 110, 78, startAngle, endAngle),
+        labelX: labelPoint.x,
+        labelY: labelPoint.y
+      };
+      startAngle = endAngle;
+      return segment;
+    });
+});
 
 function createPagedState<T>(pageSize: number): PagedState<T> {
   return reactive({
@@ -504,6 +580,36 @@ function formatClock(value: string) {
     minute: "2-digit",
     hour12: false
   });
+}
+
+function polarToCartesian(centerX: number, centerY: number, radius: number, angleInDegrees: number) {
+  const angleInRadians = (angleInDegrees * Math.PI) / 180;
+  return {
+    x: centerX + radius * Math.cos(angleInRadians),
+    y: centerY + radius * Math.sin(angleInRadians)
+  };
+}
+
+function describePieSlice(centerX: number, centerY: number, radius: number, startAngle: number, endAngle: number) {
+  if (endAngle - startAngle >= 360) {
+    return [
+      `M ${centerX} ${centerY}`,
+      `m -${radius}, 0`,
+      `a ${radius},${radius} 0 1,0 ${radius * 2},0`,
+      `a ${radius},${radius} 0 1,0 -${radius * 2},0`
+    ].join(" ");
+  }
+
+  const start = polarToCartesian(centerX, centerY, radius, startAngle);
+  const end = polarToCartesian(centerX, centerY, radius, endAngle);
+  const largeArcFlag = endAngle - startAngle > 180 ? 1 : 0;
+
+  return [
+    `M ${centerX} ${centerY}`,
+    `L ${start.x} ${start.y}`,
+    `A ${radius} ${radius} 0 ${largeArcFlag} 1 ${end.x} ${end.y}`,
+    "Z"
+  ].join(" ");
 }
 
 async function selectReplay(alertId: number) {
@@ -713,6 +819,84 @@ onBeforeUnmount(() => {
   -webkit-box-orient: vertical;
 }
 
+.vertical-bars {
+  display: none;
+}
+
+.pie-chart-card {
+  display: grid;
+  grid-template-columns: minmax(180px, 240px) minmax(0, 1fr);
+  gap: 18px;
+  align-items: center;
+  min-height: 260px;
+}
+
+.pie-chart-wrap {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.pie-chart {
+  width: 220px;
+  height: 220px;
+  overflow: visible;
+}
+
+.pie-center-title {
+  fill: #9a8978;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pie-center-value {
+  fill: #5d4c40;
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.pie-slice-label {
+  fill: #fffaf3;
+  font-size: 14px;
+  font-weight: 700;
+  text-anchor: middle;
+  dominant-baseline: middle;
+}
+
+.pie-legend {
+  display: grid;
+  gap: 12px;
+}
+
+.pie-legend-item {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(248, 243, 236, 0.9);
+  border: 1px solid rgba(184, 162, 141, 0.18);
+}
+
+.pie-legend-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+.pie-legend-label {
+  color: #6e5e52;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pie-legend-value {
+  color: #5d4c40;
+  font-size: 15px;
+  font-weight: 700;
+}
+
 .timeline-item,
 .behavior-log-item {
   min-height: 0;
@@ -728,6 +912,15 @@ onBeforeUnmount(() => {
 
   .page-jump {
     margin-left: 0;
+  }
+
+  .pie-chart-card {
+    grid-template-columns: 1fr;
+    justify-items: center;
+  }
+
+  .pie-legend {
+    width: 100%;
   }
 }
 </style>
