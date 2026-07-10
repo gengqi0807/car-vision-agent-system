@@ -23,18 +23,30 @@ export interface OwnerControlPanelState {
   updated_at: string | null;
 }
 
-export interface OwnerGestureResult {
+export interface OwnerGestureFrameResult {
   gesture: string;
   confidence: number;
   keypoints: OwnerGestureKeypoint[];
+  annotated_image: string | null;
   control_command: string | null;
   triggered: boolean;
   panel_state: OwnerControlPanelState | null;
   updated_at: string;
 }
 
+export interface OwnerGestureStreamResult {
+  gesture: string;
+  action: string;
+  confidence: number;
+  keypoints: OwnerGestureKeypoint[];
+  annotated_image: string | null;
+  hand_count: number;
+  panel_state: OwnerControlPanelState | null;
+  updated_at: string;
+}
+
 export const fetchOwnerGestureApi = (formData: FormData) =>
-  request.post<OwnerGestureResult>("/owner-gesture/current", formData, {
+  request.post<OwnerGestureFrameResult>("/owner-gesture/current", formData, {
     headers: { "Content-Type": "multipart/form-data" },
   });
 

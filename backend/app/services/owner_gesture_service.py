@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import math
 import threading
@@ -35,6 +36,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+HAND_CONNECTIONS: tuple[tuple[int, int], ...] = (
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (0, 9), (9, 10), (10, 11), (11, 12),
+    (0, 13), (13, 14), (14, 15), (15, 16),
+    (0, 17), (17, 18), (18, 19), (19, 20),
+    (5, 9), (9, 13), (13, 17),
+)
+
 GESTURE_ACTION_MAP: dict[str, str] = {
     "open_palm": "wake",
     "fist": "confirm",
@@ -50,6 +60,32 @@ GESTURE_ACTION_MAP: dict[str, str] = {
     "未检测到手部": "idle",
 }
 
+GESTURE_DISPLAY_MAP: dict[str, str] = {
+    "open_palm": "OPEN PALM",
+    "fist": "FIST",
+    "point": "POINT",
+    "index_circle": "INDEX CIRCLE",
+    "swipe_left": "SWIPE LEFT",
+    "swipe_right": "SWIPE RIGHT",
+    "thumbs_up": "THUMBS UP",
+    "thumbs_down": "THUMBS DOWN",
+    "wave": "WAVE",
+    "idle": "IDLE",
+    "unknown": "UNKNOWN",
+    "未检测到手部": "NO HAND",
+}
+
+COMMAND_DISPLAY_MAP: dict[str, str] = {
+    "WakeSystem": "WAKE SYSTEM",
+    "ConfirmAction": "CONFIRM",
+    "AdjustVolume": "ADJUST VOLUME",
+    "SwitchPrevFeature": "PREV FEATURE",
+    "SwitchNextFeature": "NEXT FEATURE",
+    "AnswerCall": "ANSWER CALL",
+    "HangUpCall": "HANG UP",
+    "ReturnHome": "RETURN HOME",
+}
+
 
 class OwnerGestureService:
     _instance: ClassVar["OwnerGestureService | None"] = None
@@ -58,6 +94,7 @@ class OwnerGestureService:
     _classifier: Optional["GestureClassifier"] = None
     _stream_classifier: Optional["GestureClassifier"] = None
     _max_inference_edge = 640
+    _max_annotated_edge = 420
     _hold_frame_count = 2
     _trigger_cooldown = timedelta(seconds=2)
     _default_panel_state = {
@@ -202,6 +239,14 @@ class OwnerGestureService:
             recent_records=recent_records,
         )
         processing_time_ms = int((perf_counter() - started_at) * 1000)
+        hands = self._group_hands(raw_kps)
+        annotated_image = self._build_annotated_image(
+            frame,
+            hands=hands,
+            gesture=gesture_label,
+            confidence=cls_conf,
+            control_command=control_command if triggered else None,
+        )
 
         keypoints = [Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0)) for kp in raw_kps]
         record = OwnerGestureRecord(
@@ -270,6 +315,7 @@ class OwnerGestureService:
             gesture=gesture_label,
             confidence=round(cls_conf, 4),
             keypoints=keypoints,
+            annotated_image=annotated_image,
             control_command=control_command,
             triggered=triggered,
             panel_state=panel_state,
@@ -328,6 +374,7 @@ class OwnerGestureService:
                 action="idle",
                 confidence=0.0,
                 keypoints=[],
+                annotated_image=None,
                 hand_count=0,
                 panel_state=self._live_panel_state,
                 updated_at=datetime.now(timezone.utc),
@@ -398,11 +445,19 @@ class OwnerGestureService:
                         control_command=control_command,
                         updated_at=datetime.now(timezone.utc),
                     )
+                    annotated_image = self._build_annotated_image(
+                        prepared,
+                        hands=hands,
+                        gesture=gesture,
+                        confidence=confidence,
+                        control_command=control_command if action != "idle" else None,
+                    )
                     result = OwnerGestureResult(
                         gesture=gesture,
                         action=action,
                         confidence=round(confidence, 4),
                         keypoints=keypoints,
+                        annotated_image=annotated_image,
                         hand_count=len(hands),
                         panel_state=panel_state,
                         updated_at=datetime.now(timezone.utc),
@@ -588,6 +643,102 @@ class OwnerGestureService:
         resized_width = max(1, int(width * scale))
         resized_height = max(1, int(height * scale))
         return cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+
+    def _group_hands(self, keypoints: list[dict]) -> list[list[dict]]:
+        if not keypoints:
+            return []
+        grouped: list[list[dict]] = []
+        for start in range(0, len(keypoints), 21):
+            hand = keypoints[start:start + 21]
+            if len(hand) == 21:
+                grouped.append(hand)
+        return grouped
+
+    def _build_annotated_image(
+        self,
+        frame: np.ndarray,
+        *,
+        hands: list[list[dict]],
+        gesture: str,
+        confidence: float,
+        control_command: str | None,
+    ) -> str | None:
+        annotated = frame.copy()
+        height, width = annotated.shape[:2]
+
+        for hand in hands:
+            points: list[tuple[int, int]] = []
+            for point in hand:
+                x = int(min(max(float(point["x"]) * width, 0), width - 1))
+                y = int(min(max(float(point["y"]) * height, 0), height - 1))
+                points.append((x, y))
+
+            for start_index, end_index in HAND_CONNECTIONS:
+                start_point = points[start_index]
+                end_point = points[end_index]
+                cv2.line(annotated, start_point, end_point, (67, 163, 224), 2, cv2.LINE_AA)
+
+            for point in points:
+                cv2.circle(annotated, point, 4, (220, 196, 174), -1, cv2.LINE_AA)
+                cv2.circle(annotated, point, 6, (58, 88, 120), 1, cv2.LINE_AA)
+
+        label = GESTURE_DISPLAY_MAP.get(gesture, gesture)
+        summary = f"{label}  {confidence * 100:.1f}%"
+        if control_command:
+            summary = f"{summary}  |  {COMMAND_DISPLAY_MAP.get(control_command, control_command)}"
+
+        self._draw_summary_bar(
+            annotated,
+            summary=summary,
+            hands_detected=len(hands),
+        )
+        return self._encode_frame_to_data_url(annotated)
+
+    def _draw_summary_bar(self, frame: np.ndarray, *, summary: str, hands_detected: int) -> None:
+        height, width = frame.shape[:2]
+        bar_height = min(58, max(40, height // 8))
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (width, bar_height), (36, 44, 56), -1)
+        cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+
+        cv2.putText(
+            frame,
+            summary,
+            (16, min(bar_height - 16, 30)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (243, 240, 234),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            f"HANDS: {hands_detected}",
+            (16, bar_height - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (207, 215, 225),
+            1,
+            cv2.LINE_AA,
+        )
+
+    def _encode_frame_to_data_url(self, frame: np.ndarray) -> str | None:
+        preview = frame
+        height, width = frame.shape[:2]
+        longest_edge = max(width, height)
+        if longest_edge > self._max_annotated_edge:
+            scale = self._max_annotated_edge / float(longest_edge)
+            preview = cv2.resize(
+                frame,
+                (max(1, int(width * scale)), max(1, int(height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        ok, buffer = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 68])
+        if not ok:
+            return None
+        encoded = base64.b64encode(buffer.tobytes()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
 
     def _build_panel_state(
         self,

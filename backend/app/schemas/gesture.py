@@ -30,6 +30,7 @@ class GestureFrameResult(BaseModel):
     gesture: str
     confidence: float
     keypoints: list[Keypoint]
+    annotated_image: str | None = None
     control_command: str | None = None
     triggered: bool = False
     panel_state: ControlPanelState | None = None
@@ -47,6 +48,7 @@ class OwnerGestureResult(BaseModel):
     action: str
     confidence: float
     keypoints: list[Keypoint]
+    annotated_image: str | None = None
     hand_count: int = Field(default=0, description="检测到的手数量")
     panel_state: ControlPanelState | None = None
     updated_at: datetime

@@ -264,3 +264,20 @@ def test_prepare_frame_for_inference_downsizes_large_frames():
 
     assert prepared.shape[1] == 640
     assert prepared.shape[0] == 360
+
+
+def test_build_annotated_image_returns_data_url():
+    service = OwnerGestureService()
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    hand = [{"x": 0.5, "y": 0.5, "z": 0.0} for _ in range(21)]
+
+    annotated = service._build_annotated_image(
+        frame,
+        hands=[hand],
+        gesture="open_palm",
+        confidence=0.92,
+        control_command="WakeSystem",
+    )
+
+    assert annotated is not None
+    assert annotated.startswith("data:image/jpeg;base64,")

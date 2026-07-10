@@ -2,43 +2,86 @@
   <section class="page-shell">
     <header class="page-header">
       <h1>手势控车</h1>
-      <p>调用本机前置摄像头进行实时识别，完成非接触式控车交互</p>
+      <p>支持单张图片与实时视频输入，实时模式保留摄像头原画面并叠加手部节点识别结果</p>
     </header>
 
     <section class="two-col">
       <article class="panel">
         <div class="upload-row">
-          <button class="btn-video control-button" type="button" :disabled="cameraActive" @click="startCamera">
-            开启摄像头
-          </button>
-          <button
-            class="btn-video control-button secondary-button"
-            type="button"
-            :disabled="!cameraActive"
-            @click="stopCamera"
-          >
-            停止识别
-          </button>
-          <select
-            v-if="videoDevices.length > 1"
-            v-model="selectedDeviceId"
-            class="device-select"
-            :disabled="cameraActive"
-          >
-            <option v-for="device in videoDevices" :key="device.deviceId" :value="device.deviceId">
-              {{ device.label }}
-            </option>
-          </select>
-          <button
-            v-if="videoDevices.length > 1"
-            class="device-refresh"
-            type="button"
-            :disabled="cameraActive"
-            @click="refreshVideoDevices"
-          >
-            刷新设备
-          </button>
-          <span class="file-name">{{ cameraActive ? "实时模式：约每 0.55 秒分析一帧" : "摄像头未开启" }}</span>
+          <div class="mode-switch">
+            <button
+              class="mode-chip"
+              type="button"
+              :class="{ active: inputMode === 'camera' }"
+              @click="switchInputMode('camera')"
+            >
+              实时视频
+            </button>
+            <button
+              class="mode-chip"
+              type="button"
+              :class="{ active: inputMode === 'image' }"
+              @click="switchInputMode('image')"
+            >
+              图片识别
+            </button>
+          </div>
+
+          <template v-if="inputMode === 'camera'">
+            <button class="btn-video control-button" type="button" :disabled="cameraActive" @click="startCamera">
+              开启摄像头
+            </button>
+            <button
+              class="btn-video control-button secondary-button"
+              type="button"
+              :disabled="!cameraActive"
+              @click="stopCamera"
+            >
+              停止识别
+            </button>
+            <select
+              v-if="videoDevices.length > 1"
+              v-model="selectedDeviceId"
+              class="device-select"
+              :disabled="cameraActive"
+            >
+              <option v-for="device in videoDevices" :key="device.deviceId" :value="device.deviceId">
+                {{ device.label }}
+              </option>
+            </select>
+            <button
+              v-if="videoDevices.length > 1"
+              class="device-refresh"
+              type="button"
+              :disabled="cameraActive"
+              @click="refreshVideoDevices"
+            >
+              刷新设备
+            </button>
+          </template>
+
+          <template v-else>
+            <button class="btn-video control-button" type="button" @click="openImagePicker">
+              选择图片
+            </button>
+            <button
+              class="btn-video control-button secondary-button"
+              type="button"
+              :disabled="!sourcePreviewUrl && !result"
+              @click="clearImageSelection"
+            >
+              清空结果
+            </button>
+            <input
+              ref="fileInputRef"
+              class="hidden-file-input"
+              type="file"
+              accept="image/*"
+              @change="onImageSelected"
+            />
+          </template>
+
+          <span class="file-name">{{ inputStatusText }}</span>
         </div>
 
         <div class="video-status" v-if="error">
@@ -46,24 +89,47 @@
         </div>
 
         <div class="preview-canvas-wrap">
-          <video
-            ref="videoRef"
-            class="preview-video"
-            autoplay
-            muted
-            playsinline
-            v-show="cameraActive"
-            @loadedmetadata="onVideoReady"
-          />
-          <canvas ref="canvasRef" class="overlay-canvas" :width="canvasW" :height="canvasH" />
+          <div v-if="inputMode === 'camera'" class="preview-stage">
+            <video
+              ref="videoRef"
+              class="preview-video"
+              autoplay
+              muted
+              playsinline
+              v-show="cameraActive"
+            />
+            <canvas
+              ref="overlayCanvasRef"
+              v-show="cameraActive"
+              class="overlay-canvas"
+            />
+          </div>
+          <div v-else-if="sourcePreviewUrl" class="preview-stage image-preview-stage">
+            <img
+              ref="imagePreviewRef"
+              class="preview-image image-preview-fit"
+              :src="sourcePreviewUrl"
+              alt="手势图片识别原图"
+              @load="handleImagePreviewLoad"
+            />
+            <canvas
+              ref="imageOverlayCanvasRef"
+              class="overlay-canvas image-overlay-canvas"
+            />
+          </div>
           <canvas ref="captureCanvasRef" class="capture-canvas" />
-          <div v-if="!cameraActive" class="image-placeholder gesture-frame">
-            手势实时识别
-            <div class="small">点击“开启摄像头”开始检测驾驶员手势</div>
+          <div
+            v-if="(inputMode === 'camera' && !cameraActive) || (inputMode === 'image' && !sourcePreviewUrl)"
+            class="image-placeholder gesture-frame"
+          >
+            {{ inputMode === "camera" ? "手势实时识别" : "手势图片识别" }}
+            <div class="small">
+              {{ inputMode === "camera" ? "点击“开启摄像头”开始检测驾驶员手势" : "上传单张手势图片，直接查看原图与节点标注结果" }}
+            </div>
           </div>
         </div>
 
-        <div class="stream-meta">{{ cameraStatusText }}</div>
+        <div class="stream-meta">{{ previewStatusText }}</div>
 
         <template v-if="result">
         <div class="recognition-summary">
@@ -267,34 +333,56 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import {
   fetchOwnerGestureApi,
   type OwnerControlPanelState,
-  type OwnerGestureResult,
+  type OwnerGestureFrameResult,
 } from "@/api/owner_gesture";
 
 const loading = ref(false);
 const error = ref("");
-const result = ref<OwnerGestureResult | null>(null);
+const result = ref<OwnerGestureFrameResult | null>(null);
+const inputMode = ref<"camera" | "image">("camera");
+const fileInputRef = ref<HTMLInputElement | null>(null);
 const videoRef = ref<HTMLVideoElement | null>(null);
-const canvasRef = ref<HTMLCanvasElement | null>(null);
+const imagePreviewRef = ref<HTMLImageElement | null>(null);
+const overlayCanvasRef = ref<HTMLCanvasElement | null>(null);
+const imageOverlayCanvasRef = ref<HTMLCanvasElement | null>(null);
 const captureCanvasRef = ref<HTMLCanvasElement | null>(null);
-const canvasW = ref(300);
-const canvasH = ref(220);
 const panelState = ref<OwnerControlPanelState>(createDefaultPanelState());
 const cameraActive = ref(false);
 const sessionId = ref("");
 const cameraDeviceLabel = ref("");
 const videoDevices = ref<Array<{ deviceId: string; label: string }>>([]);
 const selectedDeviceId = ref("");
+const sourcePreviewUrl = ref("");
+const annotatedPreviewUrl = ref("");
 const uiNow = ref(Date.now());
 
-const frameIntervalMs = 550;
-const captureMaxWidth = 640;
-const captureMaxHeight = 480;
-const captureJpegQuality = 0.72;
+const baseFrameIntervalMs = 90;
+const previewIdealWidth = 960;
+const previewIdealHeight = 720;
+const captureMaxWidth = 416;
+const captureMaxHeight = 312;
+const captureJpegQuality = 0.58;
 let mediaStream: MediaStream | null = null;
 let activeSourceVideo: HTMLVideoElement | null = null;
 let captureTimer: number | null = null;
 let requestInFlight = false;
 let uiClockTimer: number | null = null;
+let overlayAnimationFrame: number | null = null;
+let overlayFromKeypoints: Array<{ x: number; y: number }> = [];
+let overlayTargetKeypoints: Array<{ x: number; y: number }> = [];
+let overlayDisplayKeypoints: Array<{ x: number; y: number }> = [];
+let overlayTransitionStartedAt = 0;
+let overlayTransitionDurationMs = 120;
+let lastInferenceDurationMs = 120;
+
+const HAND_CONNECTIONS: Array<[number, number]> = [
+  [0, 1], [1, 2], [2, 3], [3, 4],
+  [0, 5], [5, 6], [6, 7], [7, 8],
+  [0, 9], [9, 10], [10, 11], [11, 12],
+  [0, 13], [13, 14], [14, 15], [15, 16],
+  [0, 17], [17, 18], [18, 19], [19, 20],
+  [5, 9], [9, 13], [13, 17],
+];
 
 const LABEL_MAP: Record<string, string> = {
   open_palm: "手掌张开",
@@ -481,6 +569,29 @@ const cameraStatusText = computed(() => {
   return loading.value ? "实时识别中 ..." : "摄像头已连接，等待下一帧";
 });
 
+const inputStatusText = computed(() => {
+  if (inputMode.value === "camera") {
+    return cameraActive.value ? "实时模式：保留摄像头原画面，自适应节奏更新识别节点" : "摄像头未开启";
+  }
+  return sourcePreviewUrl.value ? "图片模式：显示上传原图，并在前端叠加节点标注" : "图片模式：等待上传";
+});
+
+const previewStatusText = computed(() => {
+  if (inputMode.value === "camera") {
+    if (!cameraActive.value) {
+      return cameraStatusText.value;
+    }
+    return `${cameraStatusText.value} · 节点覆盖层已启用`;
+  }
+  if (loading.value) {
+    return "图片识别中 ...";
+  }
+  if (sourcePreviewUrl.value) {
+    return result.value?.keypoints?.length ? "已显示上传原图与节点标注" : "已加载上传原图";
+  }
+  return "上传图片后可直接查看原图与节点标注";
+});
+
 function isTileFocused(tile: string) {
   return panelState.value.focus_tile === tile;
 }
@@ -519,13 +630,309 @@ function normalizeCameraError(error: unknown) {
   return err?.message || "无法启动摄像头";
 }
 
+function resetRecognitionState() {
+  result.value = null;
+  sessionId.value = "";
+  panelState.value = createDefaultPanelState();
+  annotatedPreviewUrl.value = "";
+  resetOverlayState();
+  clearImageOverlayCanvas();
+}
+
+function revokeSourcePreview() {
+  if (!sourcePreviewUrl.value) return;
+  URL.revokeObjectURL(sourcePreviewUrl.value);
+  sourcePreviewUrl.value = "";
+}
+
+function switchInputMode(mode: "camera" | "image") {
+  if (inputMode.value === mode) return;
+
+  if (inputMode.value === "camera") {
+    stopCamera();
+  }
+  if (inputMode.value === "image") {
+    revokeSourcePreview();
+  }
+
+  error.value = "";
+  resetRecognitionState();
+  inputMode.value = mode;
+}
+
+function openImagePicker() {
+  fileInputRef.value?.click();
+}
+
+async function onImageSelected(event: Event) {
+  const target = event.target as HTMLInputElement;
+  const file = target.files?.[0];
+  if (!file) return;
+
+  if (cameraActive.value) {
+    stopCamera();
+  }
+
+  error.value = "";
+  resetRecognitionState();
+  revokeSourcePreview();
+  inputMode.value = "image";
+  sourcePreviewUrl.value = URL.createObjectURL(file);
+  sessionId.value = createSessionId();
+
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("session_id", sessionId.value);
+
+  loading.value = true;
+  try {
+    const { data } = await fetchOwnerGestureApi(formData);
+    result.value = data;
+    applyResultToPanelState(data);
+    annotatedPreviewUrl.value = "";
+    await nextTick();
+    drawImageOverlay();
+  } catch (err: unknown) {
+    if (axios.isAxiosError(err)) {
+      error.value = String(err.response?.data?.detail || err.message || "识别失败");
+    } else {
+      error.value = (err as Error | undefined)?.message || "识别失败";
+    }
+  } finally {
+    loading.value = false;
+    target.value = "";
+  }
+}
+
+function clearImageSelection() {
+  revokeSourcePreview();
+  error.value = "";
+  resetRecognitionState();
+}
+
+function resetOverlayState() {
+  overlayFromKeypoints = [];
+  overlayTargetKeypoints = [];
+  overlayDisplayKeypoints = [];
+  overlayTransitionStartedAt = 0;
+  clearOverlayCanvas();
+}
+
+function clearOverlayCanvas() {
+  const canvas = overlayCanvasRef.value;
+  const context = canvas?.getContext("2d");
+  if (!canvas || !context) return;
+  context.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function clearImageOverlayCanvas() {
+  const canvas = imageOverlayCanvasRef.value;
+  const context = canvas?.getContext("2d");
+  if (!canvas || !context) return;
+  context.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function syncImageOverlayCanvasSize() {
+  const canvas = imageOverlayCanvasRef.value;
+  const image = imagePreviewRef.value;
+  if (!canvas || !image) return;
+
+  const width = Math.max(1, Math.round(image.clientWidth));
+  const height = Math.max(1, Math.round(image.clientHeight));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+}
+
+function drawImageOverlay() {
+  const canvas = imageOverlayCanvasRef.value;
+  const image = imagePreviewRef.value;
+  const keypoints = result.value?.keypoints || [];
+  const context = canvas?.getContext("2d");
+  if (!canvas || !image || !context) return;
+
+  syncImageOverlayCanvasSize();
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  if (!keypoints.length || !image.naturalWidth || !image.naturalHeight) {
+    return;
+  }
+
+  const scale = Math.min(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight);
+  const drawWidth = image.naturalWidth * scale;
+  const drawHeight = image.naturalHeight * scale;
+  const offsetX = (canvas.width - drawWidth) / 2;
+  const offsetY = (canvas.height - drawHeight) / 2;
+
+  const perHand = 21;
+  const handCount = Math.floor(keypoints.length / perHand);
+  for (let handIndex = 0; handIndex < handCount; handIndex += 1) {
+    const hand = keypoints.slice(handIndex * perHand, (handIndex + 1) * perHand);
+
+    context.strokeStyle = "rgba(74, 192, 183, 0.92)";
+    context.lineWidth = 2.2;
+    context.lineCap = "round";
+    context.lineJoin = "round";
+    for (const [start, end] of HAND_CONNECTIONS) {
+      const startPoint = hand[start];
+      const endPoint = hand[end];
+      if (!startPoint || !endPoint) continue;
+      context.beginPath();
+      context.moveTo(offsetX + startPoint.x * drawWidth, offsetY + startPoint.y * drawHeight);
+      context.lineTo(offsetX + endPoint.x * drawWidth, offsetY + endPoint.y * drawHeight);
+      context.stroke();
+    }
+
+    for (const point of hand) {
+      const x = offsetX + point.x * drawWidth;
+      const y = offsetY + point.y * drawHeight;
+      context.beginPath();
+      context.fillStyle = "rgba(247, 235, 222, 0.96)";
+      context.arc(x, y, 3.2, 0, Math.PI * 2);
+      context.fill();
+      context.beginPath();
+      context.strokeStyle = "rgba(74, 192, 183, 0.42)";
+      context.lineWidth = 5.2;
+      context.arc(x, y, 5.2, 0, Math.PI * 2);
+      context.stroke();
+    }
+  }
+}
+
+function handleImagePreviewLoad() {
+  drawImageOverlay();
+}
+
+function syncOverlayCanvasSize() {
+  const canvas = overlayCanvasRef.value;
+  const video = videoRef.value;
+  if (!canvas || !video) return;
+
+  const width = Math.max(1, Math.round(video.clientWidth || video.videoWidth || 0));
+  const height = Math.max(1, Math.round(video.clientHeight || video.videoHeight || 0));
+  if (width === 0 || height === 0) return;
+
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+}
+
+function updateOverlayKeypoints(keypoints: Array<{ x: number; y: number }>) {
+  const now = performance.now();
+  overlayFromKeypoints = overlayDisplayKeypoints.length ? overlayDisplayKeypoints.map((point) => ({ ...point })) : [];
+  overlayTargetKeypoints = keypoints.map((point) => ({ x: point.x, y: point.y }));
+  overlayTransitionStartedAt = now;
+  overlayTransitionDurationMs = Math.max(70, Math.min(160, lastInferenceDurationMs * 0.5));
+
+  if (overlayFromKeypoints.length !== overlayTargetKeypoints.length) {
+    overlayFromKeypoints = overlayTargetKeypoints.map((point) => ({ ...point }));
+    overlayDisplayKeypoints = overlayTargetKeypoints.map((point) => ({ ...point }));
+  }
+}
+
+function interpolateOverlayKeypoints(now: number) {
+  if (!overlayTargetKeypoints.length) {
+    overlayDisplayKeypoints = [];
+    return;
+  }
+
+  if (!overlayFromKeypoints.length || overlayFromKeypoints.length !== overlayTargetKeypoints.length) {
+    overlayDisplayKeypoints = overlayTargetKeypoints.map((point) => ({ ...point }));
+    return;
+  }
+
+  const progress = Math.min(1, (now - overlayTransitionStartedAt) / Math.max(overlayTransitionDurationMs, 1));
+  const eased = 1 - (1 - progress) * (1 - progress);
+  overlayDisplayKeypoints = overlayTargetKeypoints.map((point, index) => ({
+    x: overlayFromKeypoints[index].x + (point.x - overlayFromKeypoints[index].x) * eased,
+    y: overlayFromKeypoints[index].y + (point.y - overlayFromKeypoints[index].y) * eased,
+  }));
+}
+
+function drawOverlayFrame(now: number) {
+  if (!cameraActive.value || inputMode.value !== "camera") {
+    clearOverlayCanvas();
+    return;
+  }
+
+  syncOverlayCanvasSize();
+  interpolateOverlayKeypoints(now);
+
+  const canvas = overlayCanvasRef.value;
+  const context = canvas?.getContext("2d");
+  if (!canvas || !context) return;
+
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  if (!overlayDisplayKeypoints.length) {
+    return;
+  }
+
+  const perHand = 21;
+  const handCount = Math.floor(overlayDisplayKeypoints.length / perHand);
+  const width = canvas.width;
+  const height = canvas.height;
+
+  for (let handIndex = 0; handIndex < handCount; handIndex += 1) {
+    const hand = overlayDisplayKeypoints.slice(handIndex * perHand, (handIndex + 1) * perHand);
+
+    context.strokeStyle = "rgba(74, 192, 183, 0.92)";
+    context.lineWidth = 2.4;
+    context.lineCap = "round";
+    context.lineJoin = "round";
+    for (const [start, end] of HAND_CONNECTIONS) {
+      const startPoint = hand[start];
+      const endPoint = hand[end];
+      if (!startPoint || !endPoint) continue;
+      context.beginPath();
+      context.moveTo(startPoint.x * width, startPoint.y * height);
+      context.lineTo(endPoint.x * width, endPoint.y * height);
+      context.stroke();
+    }
+
+    for (const point of hand) {
+      const x = point.x * width;
+      const y = point.y * height;
+      context.beginPath();
+      context.fillStyle = "rgba(247, 235, 222, 0.95)";
+      context.arc(x, y, 3.2, 0, Math.PI * 2);
+      context.fill();
+      context.beginPath();
+      context.strokeStyle = "rgba(74, 192, 183, 0.42)";
+      context.lineWidth = 5.5;
+      context.arc(x, y, 5.4, 0, Math.PI * 2);
+      context.stroke();
+    }
+  }
+}
+
+function startOverlayLoop() {
+  stopOverlayLoop();
+
+  const animate = (now: number) => {
+    drawOverlayFrame(now);
+    overlayAnimationFrame = window.requestAnimationFrame(animate);
+  };
+
+  overlayAnimationFrame = window.requestAnimationFrame(animate);
+}
+
+function stopOverlayLoop() {
+  if (overlayAnimationFrame !== null) {
+    window.cancelAnimationFrame(overlayAnimationFrame);
+    overlayAnimationFrame = null;
+  }
+}
+
 async function startCamera() {
   if (cameraActive.value) return;
 
+  inputMode.value = "camera";
   error.value = "";
   sessionId.value = createSessionId();
   result.value = null;
   panelState.value = createDefaultPanelState();
+  annotatedPreviewUrl.value = "";
 
   try {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -552,7 +959,8 @@ async function startCamera() {
     await nextTick();
     await videoRef.value.play();
     await ensureVideoFrame(videoRef.value);
-    syncCanvasToPreview();
+    syncOverlayCanvasSize();
+    startOverlayLoop();
     startCaptureLoop();
   } catch (err: any) {
     stopCamera();
@@ -562,9 +970,12 @@ async function startCamera() {
 
 function stopCamera() {
   stopCaptureLoop();
+  stopOverlayLoop();
   loading.value = false;
   requestInFlight = false;
   cameraActive.value = false;
+  annotatedPreviewUrl.value = "";
+  resetOverlayState();
 
   if (videoRef.value) {
     videoRef.value.pause();
@@ -580,7 +991,6 @@ function stopCamera() {
     mediaStream = null;
   }
   cameraDeviceLabel.value = "";
-  clearCanvas();
 }
 
 function bindTrackEvents(track?: MediaStreamTrack) {
@@ -807,9 +1217,9 @@ function isLikelyUnsupportedCamera(label: string) {
 
 function buildVideoConstraints(extra: MediaTrackConstraints = {}): MediaTrackConstraints {
   return {
-    width: { ideal: captureMaxWidth, max: 1280 },
-    height: { ideal: captureMaxHeight, max: 720 },
-    frameRate: { ideal: 15, max: 24 },
+    width: { ideal: previewIdealWidth, max: 1280 },
+    height: { ideal: previewIdealHeight, max: 720 },
+    frameRate: { ideal: 24, max: 30 },
     ...extra,
   };
 }
@@ -821,9 +1231,10 @@ function startCaptureLoop() {
     if (!cameraActive.value) return;
     await captureFrame();
     if (!cameraActive.value) return;
+    const nextDelay = Math.max(45, Math.min(110, lastInferenceDurationMs * 0.28 + baseFrameIntervalMs));
     captureTimer = window.setTimeout(() => {
       void tick();
-    }, frameIntervalMs);
+    }, nextDelay);
   };
 
   void tick();
@@ -869,13 +1280,14 @@ async function captureFrame() {
   const formData = new FormData();
   formData.append("file", blob, "owner-gesture-frame.jpg");
   formData.append("session_id", sessionId.value);
+  const inferStartedAt = performance.now();
 
   try {
     const { data } = await fetchOwnerGestureApi(formData);
+    lastInferenceDurationMs = performance.now() - inferStartedAt;
     result.value = data;
     applyResultToPanelState(data);
-    await nextTick();
-    drawKeypoints(data.keypoints);
+    updateOverlayKeypoints(data.keypoints);
   } catch (err: any) {
     if (axios.isAxiosError(err)) {
       if (err.response?.status === 401 || err.response?.status === 403) {
@@ -893,14 +1305,7 @@ async function captureFrame() {
   }
 }
 
-function onVideoReady() {
-  syncCanvasToPreview();
-  if (result.value?.keypoints?.length) {
-    nextTick(() => drawKeypoints(result.value?.keypoints || []));
-  }
-}
-
-function applyResultToPanelState(data: OwnerGestureResult) {
+function applyResultToPanelState(data: OwnerGestureFrameResult) {
   if (data.panel_state) {
     panelState.value = data.panel_state;
     return;
@@ -1008,76 +1413,6 @@ function computeCaptureSize(video: HTMLVideoElement) {
   };
 }
 
-function syncCanvasToPreview() {
-  const wrapper = videoRef.value?.parentElement;
-  if (!wrapper) return;
-
-  const width = wrapper.clientWidth || 300;
-  const videoWidth = activeSourceVideo?.videoWidth || 4;
-  const videoHeight = activeSourceVideo?.videoHeight || 3;
-  const ratio = videoWidth / videoHeight;
-  const computedHeight = width / ratio;
-
-  canvasW.value = width;
-  canvasH.value = Math.min(360, Math.max(220, computedHeight));
-}
-
-const HAND_CONNECTIONS: [number, number][] = [
-  [0, 1], [1, 2], [2, 3], [3, 4],
-  [0, 5], [5, 6], [6, 7], [7, 8],
-  [0, 9], [9, 10], [10, 11], [11, 12],
-  [0, 13], [13, 14], [14, 15], [15, 16],
-  [0, 17], [17, 18], [18, 19], [19, 20],
-  [5, 9], [9, 13], [13, 17],
-];
-
-function drawKeypoints(keypoints: Array<{ x: number; y: number }>) {
-  const canvas = canvasRef.value;
-  if (!canvas) return;
-
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (!keypoints?.length) return;
-
-  const perHand = 21;
-  const numHands = Math.floor(keypoints.length / perHand);
-
-  for (let handIndex = 0; handIndex < numHands; handIndex += 1) {
-    const hand = keypoints.slice(handIndex * perHand, (handIndex + 1) * perHand);
-    const width = canvas.width;
-    const height = canvas.height;
-
-    ctx.strokeStyle = "#2dd4bf";
-    ctx.lineWidth = 2;
-    for (const [start, end] of HAND_CONNECTIONS) {
-      const startPoint = hand[start];
-      const endPoint = hand[end];
-      if (startPoint && endPoint) {
-        ctx.beginPath();
-        ctx.moveTo(startPoint.x * width, startPoint.y * height);
-        ctx.lineTo(endPoint.x * width, endPoint.y * height);
-        ctx.stroke();
-      }
-    }
-
-    ctx.fillStyle = "#c9b099";
-    for (const point of hand) {
-      ctx.beginPath();
-      ctx.arc(point.x * width, point.y * height, 3, 0, 2 * Math.PI);
-      ctx.fill();
-    }
-  }
-}
-
-function clearCanvas() {
-  const canvas = canvasRef.value;
-  const ctx = canvas?.getContext("2d");
-  if (!canvas || !ctx) return;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-}
-
 async function probeLiveVideoFrame(video: HTMLVideoElement) {
   const canvas = document.createElement("canvas");
   const width = Math.max(64, video.videoWidth || 320);
@@ -1139,8 +1474,14 @@ function sampleFrameSignature(ctx: CanvasRenderingContext2D, width: number, heig
   };
 }
 
+function handleViewportResize() {
+  syncOverlayCanvasSize();
+  drawImageOverlay();
+}
+
 onMounted(() => {
   void refreshVideoDevices();
+  window.addEventListener("resize", handleViewportResize);
   uiClockTimer = window.setInterval(() => {
     uiNow.value = Date.now();
   }, 1000);
@@ -1148,6 +1489,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopCamera();
+  revokeSourcePreview();
+  window.removeEventListener("resize", handleViewportResize);
   if (uiClockTimer !== null) {
     window.clearInterval(uiClockTimer);
     uiClockTimer = null;
@@ -1172,6 +1515,34 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 14px;
+}
+
+.mode-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(201, 176, 153, 0.14);
+}
+
+.mode-chip {
+  height: 36px;
+  padding: 0 16px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: #7d6c5e;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.mode-chip.active {
+  background: linear-gradient(180deg, rgba(201, 176, 153, 0.9), rgba(184, 154, 126, 0.82));
+  color: #fffaf4;
+  box-shadow: 0 8px 18px rgba(184, 154, 126, 0.22);
 }
 
 .control-button {
@@ -1201,12 +1572,23 @@ onBeforeUnmount(() => {
   min-height: 292px;
 }
 
+.preview-stage {
+  position: relative;
+  overflow: hidden;
+  border-radius: 10px;
+}
+
+.image-preview-stage {
+  background: #f0ece5;
+}
+
 .gesture-frame {
   height: 272px;
   margin-top: 0;
 }
 
-.preview-video {
+.preview-video,
+.preview-image {
   display: block;
   width: 100%;
   min-height: 272px;
@@ -1214,6 +1596,11 @@ onBeforeUnmount(() => {
   max-height: 408px;
   object-fit: cover;
   border-radius: 8px;
+  background: #f0ece5;
+}
+
+.image-preview-fit {
+  object-fit: contain;
   background: #f0ece5;
 }
 
@@ -1229,6 +1616,10 @@ onBeforeUnmount(() => {
   display: none;
 }
 
+.hidden-file-input {
+  display: none;
+}
+
 .recognition-summary {
   display: flex;
   flex-wrap: wrap;
@@ -1238,12 +1629,22 @@ onBeforeUnmount(() => {
 }
 
 .recognition-chip,
+.gesture-tag,
 .gesture-action-chip,
 .cockpit-page-tag,
 .map-badge {
   display: inline-flex;
   align-items: center;
   border-radius: 999px;
+}
+
+.gesture-tag {
+  padding: 6px 12px;
+  background: linear-gradient(180deg, rgba(255, 247, 238, 0.98), rgba(243, 231, 219, 0.96));
+  color: #5c483c;
+  font-size: 13px;
+  font-weight: 700;
+  border: 1px solid rgba(184, 162, 141, 0.18);
 }
 
 .recognition-chip {
