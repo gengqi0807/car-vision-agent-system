@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
-from datetime import datetime, timedelta
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 from uuid import uuid4
 
 import cv2
@@ -12,12 +15,18 @@ import numpy as np
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models.owner_gesture_record import OwnerGestureRecord
-from app.models.user_operation_log import UserOperationLog
-from app.schemas.gesture import ControlPanelState, GestureFrameResult, Keypoint
-from app.services.alert_service import AlertService
 from app.core.config import settings
 from app.core.database import SessionLocal
+from app.models.owner_gesture_record import OwnerGestureRecord
+from app.models.user_operation_log import UserOperationLog
+from app.schemas.gesture import (
+    ControlPanelState,
+    GestureFrameResult,
+    Keypoint,
+    OwnerGestureResult,
+    StreamState,
+)
+from app.services.alert_service import AlertService
 from app.services.monitor_service import MonitorService
 
 if TYPE_CHECKING:
@@ -26,11 +35,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+GESTURE_ACTION_MAP: dict[str, str] = {
+    "open_palm": "wake",
+    "fist": "confirm",
+    "index_circle": "volume_adjust",
+    "swipe_left": "prev_func",
+    "swipe_right": "next_func",
+    "thumbs_up": "call_answer",
+    "thumbs_down": "call_hangup",
+    "wave": "home",
+    "point": "idle",
+    "idle": "idle",
+    "unknown": "idle",
+    "未检测到手部": "idle",
+}
+
 
 class OwnerGestureService:
+    _instance: ClassVar["OwnerGestureService | None"] = None
     _feature_modes = ("home", "media", "comfort", "vehicle")
     _hands: Optional["MediaPipeHands"] = None
     _classifier: Optional["GestureClassifier"] = None
+    _stream_classifier: Optional["GestureClassifier"] = None
     _max_inference_edge = 640
     _hold_frame_count = 2
     _trigger_cooldown = timedelta(seconds=2)
@@ -47,13 +73,43 @@ class OwnerGestureService:
         "last_feedback": None,
     }
 
+    def __init__(self) -> None:
+        self._stream_lock = threading.Lock()
+        self._stream_thread: threading.Thread | None = None
+        self._stream_running = False
+        self._stream_source = ""
+        self._stream_loop: asyncio.AbstractEventLoop | None = None
+        self._ws_callbacks: list[tuple[Any, asyncio.AbstractEventLoop | None]] = []
+        self._control_callbacks: list[Any] = []
+        self._alert_callbacks: list[Any] = []
+        self._latest_stream_result: OwnerGestureResult | None = None
+        self._stream_state = StreamState(running=False)
+        self._live_panel_state = ControlPanelState(
+            **self._default_panel_state,
+            last_gesture=None,
+            last_command=None,
+            last_command_at=None,
+            updated_at=None,
+        )
+
+    @classmethod
+    def instance(cls) -> "OwnerGestureService":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
     @property
     def hands(self) -> "MediaPipeHands":
         if self._hands is None:
             from app.models_infer.mediapipe_hands import MediaPipeHands
 
-            self._hands = MediaPipeHands()
-            logger.info("OwnerGestureService MediaPipeHands 已加载")
+            self._hands = MediaPipeHands(
+                num_hands=settings.num_hands,
+                min_detection_confidence=settings.min_hand_detection_confidence,
+                min_presence_confidence=settings.min_hand_presence_confidence,
+                min_tracking_confidence=settings.min_hand_tracking_confidence,
+            )
+            logger.info("OwnerGestureService MediaPipeHands loaded for image inference")
         return self._hands
 
     @property
@@ -61,12 +117,44 @@ class OwnerGestureService:
         if self._classifier is None:
             from app.models_infer.gesture_classifier import GestureClassifier
 
-            self._classifier = GestureClassifier()
+            self._classifier = GestureClassifier(domain="owner")
         return self._classifier
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    @property
+    def stream_classifier(self) -> "GestureClassifier":
+        if self._stream_classifier is None:
+            from app.models_infer.gesture_classifier import GestureClassifier
+
+            self._stream_classifier = GestureClassifier(domain="owner")
+        return self._stream_classifier
+
+    @property
+    def stream_state(self) -> StreamState:
+        with self._stream_lock:
+            return self._stream_state
+
+    def register_ws_callback(
+        self,
+        callback: Any,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> None:
+        callback_loop = loop
+        if callback_loop is None:
+            try:
+                callback_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                callback_loop = None
+        self._ws_callbacks.append((callback, callback_loop))
+
+    def unregister_ws_callback(self, callback: Any) -> None:
+        self._ws_callbacks = [(cb, loop) for cb, loop in self._ws_callbacks if cb is not callback]
+
+    def register_control_callback(self, callback: Any) -> None:
+        self._control_callbacks.append(callback)
+
+    def register_alert_callback(self, callback: Any) -> None:
+        self._alert_callbacks.append(callback)
 
     async def process_frame(
         self,
@@ -77,26 +165,6 @@ class OwnerGestureService:
         user_id: int,
         session_id: str | None = None,
     ) -> GestureFrameResult:
-        """Run MediaPipe Hands inference on an uploaded image frame.
-
-        Parameters
-        ----------
-        image_bytes:
-            Raw image file bytes (JPEG / PNG / etc.).
-        filename:
-            Descriptive file name for logging / tracing.
-        db:
-            SQLAlchemy session for database operations.
-        user_id:
-            ID of the user performing the gesture.
-        session_id:
-            Optional session identifier; generated if not provided.
-
-        Returns
-        -------
-        GestureFrameResult
-            Detected keypoints, gesture label, and control action.
-        """
         started_at = perf_counter()
 
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -106,13 +174,11 @@ class OwnerGestureService:
             raise ValueError(f"无法解析图像文件：{filename}")
 
         frame = self._prepare_frame_for_inference(frame)
-        logger.info("正在处理车主手势帧 '%s'（%dx%d）", filename, frame.shape[1], frame.shape[0])
-        result = self.hands.infer(frame)
+        logger.info("Processing owner gesture frame '%s' (%dx%d)", filename, frame.shape[1], frame.shape[0])
+        infer_result = self.hands.infer(frame)
 
-        raw_kps = result["keypoints"]
-        num_hands = result.get("num_hands_detected", 0)
-
-        # ----- Rule-based gesture classification -----
+        raw_kps = infer_result["keypoints"]
+        num_hands = infer_result.get("num_hands_detected", 0)
         cls_result = self.classifier.classify(raw_kps, domain="owner")
         gesture_label = cls_result["gesture"]
         cls_conf = cls_result["confidence"]
@@ -121,11 +187,7 @@ class OwnerGestureService:
             cls_conf = 0.0
 
         active_session_id = session_id or uuid4().hex[:16]
-        recent_records = self._recent_session_records(
-            db,
-            user_id=user_id,
-            session_id=active_session_id,
-        )
+        recent_records = self._recent_session_records(db, user_id=user_id, session_id=active_session_id)
         previous_record = recent_records[0] if recent_records else None
         gesture_label = self._refine_motion_gesture(
             gesture=gesture_label,
@@ -141,11 +203,7 @@ class OwnerGestureService:
         )
         processing_time_ms = int((perf_counter() - started_at) * 1000)
 
-        keypoints = [
-            Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0))
-            for kp in raw_kps
-        ]
-
+        keypoints = [Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0)) for kp in raw_kps]
         record = OwnerGestureRecord(
             user_id=user_id,
             session_id=active_session_id,
@@ -170,11 +228,7 @@ class OwnerGestureService:
         db.commit()
         db.refresh(record)
 
-        panel_state = self._build_panel_state(
-            db,
-            user_id=user_id,
-            session_id=active_session_id,
-        )
+        panel_state = self._build_panel_state(db, user_id=user_id, session_id=active_session_id)
         if self._should_record_behavior(
             previous_record=previous_record,
             gesture=gesture_label,
@@ -191,7 +245,6 @@ class OwnerGestureService:
                 ),
             )
 
-        # ---------- 集成 MonitorService 监控日志（来自另一端） ----------
         await self._capture_monitor_log(
             event_type=(
                 "owner_gesture_success"
@@ -223,16 +276,62 @@ class OwnerGestureService:
             updated_at=datetime.utcnow(),
         )
 
-    def current_result(self) -> GestureFrameResult:
-        return GestureFrameResult(
-            gesture="手掌张开",
-            confidence=0.92,
-            keypoints=[
-                Keypoint(x=0.42, y=0.18, score=0.99),
-                Keypoint(x=0.48, y=0.26, score=0.98),
-            ],
-            updated_at=datetime.utcnow(),
-        )
+    def start(self, source: str, fps: int = 15) -> StreamState:
+        with self._stream_lock:
+            if self._stream_running:
+                return self._stream_state
+
+            self._configure_stream_runtime()
+            self._stream_running = True
+            self._stream_source = source
+            self._latest_stream_result = None
+            self._live_panel_state = ControlPanelState(
+                **self._default_panel_state,
+                last_gesture=None,
+                last_command=None,
+                last_command_at=None,
+                updated_at=None,
+            )
+
+            self._stream_thread = threading.Thread(
+                target=self._stream_loop_worker,
+                args=(source, fps),
+                daemon=True,
+                name="owner-gesture-stream",
+            )
+            self._stream_thread.start()
+            self._stream_state = StreamState(
+                running=True,
+                source=source,
+                fps=fps,
+                started_at=datetime.now(timezone.utc),
+            )
+            return self._stream_state
+
+    def stop(self) -> StreamState:
+        with self._stream_lock:
+            self._stream_running = False
+
+        if self._stream_thread and self._stream_thread.is_alive():
+            self._stream_thread.join(timeout=3.0)
+
+        with self._stream_lock:
+            self._stream_state = StreamState(running=False)
+            return self._stream_state
+
+    def current_stream_result(self) -> OwnerGestureResult:
+        with self._stream_lock:
+            if self._latest_stream_result is not None:
+                return self._latest_stream_result
+            return OwnerGestureResult(
+                gesture="unknown",
+                action="idle",
+                confidence=0.0,
+                keypoints=[],
+                hand_count=0,
+                panel_state=self._live_panel_state,
+                updated_at=datetime.now(timezone.utc),
+            )
 
     def control_panel(
         self,
@@ -242,6 +341,134 @@ class OwnerGestureService:
         session_id: str | None = None,
     ) -> ControlPanelState:
         return self._build_panel_state(db, user_id=user_id, session_id=session_id)
+
+    def _configure_stream_runtime(self) -> None:
+        from app.models_infer.mediapipe_hands import MediaPipeHands
+
+        MediaPipeHands.configure(
+            settings.resolved_hand_model_path,
+            num_hands=settings.num_hands,
+            min_detection_confidence=settings.min_hand_detection_confidence,
+            min_presence_confidence=settings.min_hand_presence_confidence,
+            min_tracking_confidence=settings.min_hand_tracking_confidence,
+        )
+        _ = self.stream_classifier
+
+    def _stream_loop_worker(self, source: str, fps: int) -> None:
+        from app.models_infer.mediapipe_hands import MediaPipeHands
+
+        capture = cv2.VideoCapture(self._resolve_stream_source(source))
+        if not capture.isOpened():
+            logger.warning("Failed to open owner-gesture stream source: %s", source)
+            with self._stream_lock:
+                self._stream_running = False
+                self._stream_state = StreamState(running=False)
+            return
+
+        frame_interval = 1.0 / max(fps, 1)
+
+        try:
+            while True:
+                with self._stream_lock:
+                    if not self._stream_running:
+                        break
+
+                tick_started = time.time()
+                ok, frame_bgr = capture.read()
+                if not ok:
+                    time.sleep(0.1)
+                    continue
+
+                try:
+                    prepared = self._prepare_frame_for_inference(frame_bgr)
+                    hands = MediaPipeHands.infer_video(prepared)
+                    primary_hand = hands[0] if hands else None
+                    gesture, confidence = self.stream_classifier.classify_frame(primary_hand)
+
+                    control_command, _ = self._map_gesture_to_command(gesture)
+                    action = GESTURE_ACTION_MAP.get(gesture, "idle")
+                    keypoints = (
+                        [Keypoint(x=point["x"], y=point["y"], score=point.get("z", 0.0)) for point in primary_hand]
+                        if primary_hand
+                        else []
+                    )
+
+                    panel_state = self._update_live_panel_state(
+                        gesture=gesture,
+                        control_command=control_command,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                    result = OwnerGestureResult(
+                        gesture=gesture,
+                        action=action,
+                        confidence=round(confidence, 4),
+                        keypoints=keypoints,
+                        hand_count=len(hands),
+                        panel_state=panel_state,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+
+                    with self._stream_lock:
+                        self._latest_stream_result = result
+
+                    if action != "idle":
+                        for callback in self._control_callbacks:
+                            try:
+                                callback(action)
+                            except Exception:
+                                logger.debug("Owner gesture control callback failed", exc_info=True)
+                        for callback in self._alert_callbacks:
+                            try:
+                                callback(gesture, confidence)
+                            except Exception:
+                                logger.debug("Owner gesture alert callback failed", exc_info=True)
+
+                    self._emit_ws_payload(result.model_dump(mode="json"))
+                except Exception:
+                    logger.debug("Owner gesture stream frame processing failed", exc_info=True)
+
+                elapsed = time.time() - tick_started
+                sleep_time = frame_interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+        finally:
+            capture.release()
+            MediaPipeHands.reset()
+            with self._stream_lock:
+                self._stream_running = False
+                self._stream_state = StreamState(running=False)
+
+    def _emit_ws_payload(self, payload: dict[str, Any]) -> None:
+        for callback, loop in list(self._ws_callbacks):
+            if loop is None:
+                continue
+            try:
+                asyncio.run_coroutine_threadsafe(callback(payload), loop)
+            except Exception:
+                logger.debug("Owner gesture websocket callback failed", exc_info=True)
+
+    def _resolve_stream_source(self, source: str) -> str | int:
+        stripped = source.strip()
+        if stripped.isdigit():
+            return int(stripped)
+        return stripped
+
+    def _update_live_panel_state(
+        self,
+        *,
+        gesture: str,
+        control_command: str | None,
+        updated_at: datetime,
+    ) -> ControlPanelState:
+        state = self._live_panel_state.model_dump()
+        state["last_gesture"] = gesture
+        state["updated_at"] = updated_at
+        if control_command:
+            self._apply_command_to_state(state, control_command)
+            state["last_command"] = control_command
+            state["last_command_at"] = updated_at
+        self._live_panel_state = ControlPanelState(**state)
+        return self._live_panel_state
 
     def _log_operation(self, db: Session, *, user_id: int, response_status: str) -> None:
         db.add(
@@ -255,12 +482,17 @@ class OwnerGestureService:
     def _map_gesture_to_command(self, gesture: str) -> tuple[str | None, bool]:
         command_map = {
             "open_palm": ("WakeSystem", True),
+            "palm": ("WakeSystem", True),
             "fist": ("ConfirmAction", True),
             "index_circle": ("AdjustVolume", True),
+            "circle_cw": ("AdjustVolume", True),
+            "circle_ccw": ("AdjustVolume", True),
             "swipe_left": ("SwitchPrevFeature", True),
             "swipe_right": ("SwitchNextFeature", True),
             "thumbs_up": ("AnswerCall", True),
+            "thumb_up": ("AnswerCall", True),
             "thumbs_down": ("HangUpCall", True),
+            "thumb_down": ("HangUpCall", True),
             "wave": ("ReturnHome", True),
         }
         return command_map.get(gesture, (None, False))
@@ -318,7 +550,6 @@ class OwnerGestureService:
                 and now - record.created_at < self._trigger_cooldown
             ):
                 return False
-
         return True
 
     def _should_log_operation(
@@ -385,7 +616,6 @@ class OwnerGestureService:
             record_query = record_query.where(OwnerGestureRecord.session_id == active_session_id)
 
         records = db.scalars(record_query.order_by(OwnerGestureRecord.created_at.asc())).all()
-
         for record in records:
             last_gesture = record.gesture
             updated_at = record.created_at
@@ -412,58 +642,56 @@ class OwnerGestureService:
         )
 
     def _apply_record_to_state(self, state: dict[str, object], record: OwnerGestureRecord) -> None:
-        if not record.is_triggered:
+        if not record.is_triggered or record.control_action == "None":
             return
+        self._apply_command_to_state(state, record.control_action)
 
-        command = record.control_action
+    def _apply_command_to_state(self, state: dict[str, object], command: str) -> None:
         if command == "WakeSystem":
             state["system_awake"] = True
             state["phone_call_active"] = False
             state["current_mode"] = "home"
             state["focus_tile"] = "home"
             state["last_feedback"] = "CMC 已唤醒，主页信息恢复显示。"
-        elif command == "ConfirmAction":
-            if not state["system_awake"]:
-                return
+            return
+
+        if not state["system_awake"]:
+            return
+
+        if command == "ConfirmAction":
             self._apply_confirm_action(state)
         elif command == "AdjustVolume":
-            if not state["system_awake"]:
-                return
             state["current_mode"] = "media"
             state["focus_tile"] = "media"
             state["media_playing"] = True
             state["volume"] = min(100, int(state["volume"]) + 6)
             state["last_feedback"] = f"媒体音量已调至 {state['volume']}%。"
         elif command == "SwitchPrevFeature":
-            if not state["system_awake"] or state["phone_call_active"]:
+            if state["phone_call_active"]:
                 return
             next_mode = self._shift_mode(str(state["current_mode"]), direction=-1)
             state["current_mode"] = next_mode
             state["focus_tile"] = next_mode
             state["last_feedback"] = f"已切换至{self._mode_label(next_mode)}界面。"
         elif command == "SwitchNextFeature":
-            if not state["system_awake"] or state["phone_call_active"]:
+            if state["phone_call_active"]:
                 return
             next_mode = self._shift_mode(str(state["current_mode"]), direction=1)
             state["current_mode"] = next_mode
             state["focus_tile"] = next_mode
             state["last_feedback"] = f"已切换至{self._mode_label(next_mode)}界面。"
         elif command == "AnswerCall":
-            if not state["system_awake"]:
-                return
             state["phone_call_active"] = True
             state["current_mode"] = "call"
             state["focus_tile"] = "call"
             state["last_feedback"] = "蓝牙电话已接通，通话界面接管前台。"
         elif command == "HangUpCall":
-            if not state["system_awake"]:
-                return
             state["phone_call_active"] = False
             state["current_mode"] = "home"
             state["focus_tile"] = "home"
             state["last_feedback"] = "通话已挂断，系统已回到主页。"
         elif command == "ReturnHome":
-            if not state["system_awake"] or state["phone_call_active"]:
+            if state["phone_call_active"]:
                 return
             state["current_mode"] = "home"
             state["focus_tile"] = "home"
@@ -475,26 +703,22 @@ class OwnerGestureService:
             state["focus_tile"] = "call"
             state["last_feedback"] = "当前正在通话，确认动作已转为通话内操作。"
             return
-
         if current_mode == "media":
             state["media_playing"] = not bool(state["media_playing"])
             state["focus_tile"] = "media"
             state["last_feedback"] = "媒体播放已确认继续。" if state["media_playing"] else "媒体播放已确认暂停。"
             return
-
         if current_mode == "comfort":
             state["comfort_scene"] = "舒享"
             state["climate_temperature"] = 22
             state["focus_tile"] = "comfort"
             state["last_feedback"] = "舒适模式已执行，空调与座椅联动完成。"
             return
-
         if current_mode == "vehicle":
             state["vehicle_status"] = "已完成整车检查"
             state["focus_tile"] = "vehicle"
             state["last_feedback"] = "车辆检查已执行，车况状态正常。"
             return
-
         state["current_mode"] = "home"
         state["focus_tile"] = "home"
         state["last_feedback"] = "主页快捷操作已确认执行。"
@@ -577,33 +801,27 @@ class OwnerGestureService:
     def _classify_swipe(self, points: list[tuple[float, float]]) -> str | None:
         if len(points) < 3:
             return None
-
         net_dx = points[-1][0] - points[0][0]
         net_dy = points[-1][1] - points[0][1]
         if abs(net_dx) < 0.16 or abs(net_dy) > 0.12:
             return None
-
         x_deltas = [right[0] - left[0] for left, right in zip(points, points[1:])]
         meaningful_deltas = [delta for delta in x_deltas if abs(delta) > 0.015]
         if len(meaningful_deltas) < 2:
             return None
-
         consistent_steps = sum(1 for delta in meaningful_deltas if delta * net_dx > 0)
         if consistent_steps < max(2, len(meaningful_deltas) - 1):
             return None
-
         return "swipe_right" if net_dx > 0 else "swipe_left"
 
     def _is_wave_motion(self, points: list[tuple[float, float]]) -> bool:
         if len(points) < 5:
             return False
-
         x_deltas = [right[0] - left[0] for left, right in zip(points, points[1:])]
         signs = [1 if delta > 0.02 else -1 if delta < -0.02 else 0 for delta in x_deltas]
         filtered_signs = [sign for sign in signs if sign != 0]
         if len(filtered_signs) < 3:
             return False
-
         direction_changes = sum(
             1 for previous, current in zip(filtered_signs, filtered_signs[1:]) if previous != current
         )
@@ -614,25 +832,21 @@ class OwnerGestureService:
     def _is_circle_motion(self, points: list[tuple[float, float]]) -> bool:
         if len(points) < 5:
             return False
-
         xs = [point[0] for point in points]
         ys = [point[1] for point in points]
         width = max(xs) - min(xs)
         height = max(ys) - min(ys)
         if width < 0.10 or height < 0.10:
             return False
-
         aspect_ratio = width / height if height else 0.0
         if not 0.6 <= aspect_ratio <= 1.6:
             return False
-
         center_x = sum(xs) / len(xs)
         center_y = sum(ys) / len(ys)
         radii = [math.hypot(x - center_x, y - center_y) for x, y in points]
         mean_radius = sum(radii) / len(radii)
         if mean_radius < 0.05:
             return False
-
         average_deviation = sum(abs(radius - mean_radius) for radius in radii) / len(radii)
         path_length = sum(
             math.hypot(right[0] - left[0], right[1] - left[1])
@@ -660,7 +874,6 @@ class OwnerGestureService:
             )
         return f"识别到手势 {gesture}，未触发控车指令，处理耗时 {processing_time_ms} ms。"
 
-    # ---------- 以下方法从另一端合并而来（监控日志） ----------
     async def _capture_monitor_log(
         self,
         *,

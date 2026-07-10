@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class Keypoint(BaseModel):
@@ -40,3 +40,26 @@ class GestureHistoryItem(BaseModel):
     gesture: str
     confidence: float
     updated_at: datetime
+
+
+class OwnerGestureResult(BaseModel):
+    gesture: str
+    action: str
+    confidence: float
+    keypoints: list[Keypoint]
+    hand_count: int = Field(default=0, description="检测到的手数量")
+    panel_state: ControlPanelState | None = None
+    updated_at: datetime
+
+
+class StreamControlRequest(BaseModel):
+    command: str = Field(default="start")
+    source: str = ""
+    fps: int = Field(default=15, ge=1, le=60)
+
+
+class StreamState(BaseModel):
+    running: bool
+    source: str = ""
+    fps: int = 15
+    started_at: datetime | None = None

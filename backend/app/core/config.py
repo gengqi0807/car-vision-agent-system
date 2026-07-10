@@ -16,6 +16,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
     app_name: str = Field(default="Car Vision Agent System")
     app_env: str = Field(default="development")
     api_v1_prefix: str = Field(default="/api/v1")
@@ -32,6 +33,7 @@ class Settings(BaseSettings):
     openapi_url: str = Field(default="/openapi.json")
     api_contact_name: str = Field(default="Car Vision Team")
     api_contact_email: str = Field(default="team@example.com")
+
     database_url: str | None = Field(default=None)
     mysql_host: str = Field(default="127.0.0.1")
     mysql_port: int = Field(default=3306)
@@ -55,6 +57,7 @@ class Settings(BaseSettings):
         default="",
         description="Optional secret used for HMAC-based lookup hashes.",
     )
+
     smtp_host: str = Field(default="smtp.163.com")
     smtp_port: int = Field(default=465)
     smtp_user: str = Field(default="")
@@ -63,6 +66,7 @@ class Settings(BaseSettings):
     smtp_use_ssl: bool = Field(default=True)
     email_code_expire_minutes: int = Field(default=5)
     email_code_cooldown_seconds: int = Field(default=60)
+
     alert_email_recipients: list[str] = Field(default_factory=list)
     alert_webhook_url: str = Field(default="")
     alert_webhook_timeout_seconds: float = Field(default=8.0)
@@ -71,6 +75,7 @@ class Settings(BaseSettings):
     alert_low_confidence_threshold: float = Field(default=0.6)
     alert_low_confidence_window_size: int = Field(default=3)
     alert_replay_window_minutes: int = Field(default=20)
+
     hyperlpr_detect_level: str = Field(default="high")
     hyperlpr_home_dir: str = Field(default="runtime")
     plate_confidence_threshold: float = Field(default=0.5)
@@ -91,6 +96,14 @@ class Settings(BaseSettings):
         default="",
         description="Optional override for pose_landmarker_lite.task.",
     )
+    gesture_classifier_model: str = Field(
+        default="gesture_classifier_svm.joblib",
+        description="Relative or absolute path to the owner-gesture classifier model.",
+    )
+    num_hands: int = Field(default=2)
+    min_hand_detection_confidence: float = Field(default=0.5)
+    min_hand_presence_confidence: float = Field(default=0.5)
+    min_hand_tracking_confidence: float = Field(default=0.5)
 
     @property
     def sqlalchemy_database_url(self) -> str:
@@ -114,15 +127,18 @@ class Settings(BaseSettings):
 
     @property
     def resolved_hand_model_path(self) -> str:
-        return self.hand_landmarker_model or os.path.join(
-            self.models_dir, "hand_landmarker.task"
-        )
+        return self.hand_landmarker_model or os.path.join(self.models_dir, "hand_landmarker.task")
 
     @property
     def resolved_pose_model_path(self) -> str:
-        return self.pose_landmarker_model or os.path.join(
-            self.models_dir, "pose_landmarker_lite.task"
-        )
+        return self.pose_landmarker_model or os.path.join(self.models_dir, "pose_landmarker_lite.task")
+
+    @property
+    def resolved_gesture_classifier_model_path(self) -> str:
+        classifier_path = self.gesture_classifier_model
+        if os.path.isabs(classifier_path):
+            return classifier_path
+        return os.path.join(self.models_dir, classifier_path)
 
 
 @lru_cache
