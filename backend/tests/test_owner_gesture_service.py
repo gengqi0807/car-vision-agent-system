@@ -281,3 +281,16 @@ def test_build_annotated_image_returns_data_url():
 
     assert annotated is not None
     assert annotated.startswith("data:image/jpeg;base64,")
+
+
+def test_should_trigger_immediately_for_image_input():
+    service = OwnerGestureService()
+
+    triggered = service._should_trigger(
+        gesture="fist",
+        control_command="ConfirmAction",
+        recent_records=[],
+        input_mode="image",
+    )
+
+    assert triggered is True

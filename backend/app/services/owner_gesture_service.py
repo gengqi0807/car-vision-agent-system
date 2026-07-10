@@ -201,6 +201,7 @@ class OwnerGestureService:
         db: Session,
         user_id: int,
         session_id: str | None = None,
+        input_mode: str = "camera",
     ) -> GestureFrameResult:
         started_at = perf_counter()
 
@@ -237,6 +238,7 @@ class OwnerGestureService:
             gesture=gesture_label,
             control_command=control_command,
             recent_records=recent_records,
+            input_mode=input_mode,
         )
         processing_time_ms = int((perf_counter() - started_at) * 1000)
         hands = self._group_hands(raw_kps)
@@ -576,9 +578,13 @@ class OwnerGestureService:
         gesture: str,
         control_command: str | None,
         recent_records: list[OwnerGestureRecord],
+        input_mode: str = "camera",
     ) -> bool:
         if not control_command:
             return False
+
+        if input_mode == "image":
+            return True
 
         required_hold_count = 1 if control_command in {
             "AdjustVolume",

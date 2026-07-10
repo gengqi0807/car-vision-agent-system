@@ -31,6 +31,7 @@ service = OwnerGestureService.instance()
 async def current_owner_gesture(
     file: UploadFile = File(...),
     session_id: str | None = Form(default=None),
+    input_mode: str = Form(default="camera"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> GestureFrameResult:
@@ -41,6 +42,7 @@ async def current_owner_gesture(
         db=db,
         user_id=current_user.id,
         session_id=session_id,
+        input_mode=input_mode,
     )
 
 

@@ -573,7 +573,7 @@ const inputStatusText = computed(() => {
   if (inputMode.value === "camera") {
     return cameraActive.value ? "实时模式：保留摄像头原画面，自适应节奏更新识别节点" : "摄像头未开启";
   }
-  return sourcePreviewUrl.value ? "图片模式：显示上传原图，并在前端叠加节点标注" : "图片模式：等待上传";
+  return sourcePreviewUrl.value ? "图片模式：显示上传原图，识别结果可直接驱动右侧 CMC" : "图片模式：等待上传";
 });
 
 const previewStatusText = computed(() => {
@@ -674,15 +674,21 @@ async function onImageSelected(event: Event) {
   }
 
   error.value = "";
-  resetRecognitionState();
   revokeSourcePreview();
+  clearImageOverlayCanvas();
   inputMode.value = "image";
   sourcePreviewUrl.value = URL.createObjectURL(file);
-  sessionId.value = createSessionId();
+  annotatedPreviewUrl.value = "";
+  result.value = null;
+  if (!sessionId.value) {
+    sessionId.value = createSessionId();
+    panelState.value = createDefaultPanelState();
+  }
 
   const formData = new FormData();
   formData.append("file", file);
   formData.append("session_id", sessionId.value);
+  formData.append("input_mode", "image");
 
   loading.value = true;
   try {
@@ -1280,6 +1286,7 @@ async function captureFrame() {
   const formData = new FormData();
   formData.append("file", blob, "owner-gesture-frame.jpg");
   formData.append("session_id", sessionId.value);
+  formData.append("input_mode", "camera");
   const inferStartedAt = performance.now();
 
   try {
