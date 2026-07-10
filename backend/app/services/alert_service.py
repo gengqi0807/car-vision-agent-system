@@ -5,7 +5,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from itertools import count
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.agents.notifier import Notifier
@@ -69,12 +69,14 @@ class AlertService:
         limit: int = 20,
         level: str | None = None,
         source: str | None = None,
+        keyword: str | None = None,
     ) -> list[AlertEvent]:
         query = select(AlertLog).order_by(AlertLog.created_at.desc())
         if level:
             query = query.where(AlertLog.level == level)
         if source:
             query = query.where(AlertLog.source == source)
+        query = self._apply_alert_keyword_filter(query, keyword)
 
         alerts = self.db.scalars(query.limit(limit)).all()
         return [self._to_alert_event(alert) for alert in alerts]
@@ -86,12 +88,14 @@ class AlertService:
         page_size: int = 5,
         level: str | None = None,
         source: str | None = None,
+        keyword: str | None = None,
     ) -> AlertEventPage:
         query = select(AlertLog).order_by(AlertLog.created_at.desc())
         if level:
             query = query.where(AlertLog.level == level)
         if source:
             query = query.where(AlertLog.source == source)
+        query = self._apply_alert_keyword_filter(query, keyword)
 
         total = int(
             self.db.scalar(
@@ -134,13 +138,20 @@ class AlertService:
         ).all()
         return [AlertPushRecord.model_validate(record) for record in records]
 
-    def list_behavior_logs(self, *, limit: int = 12) -> list[BehaviorLogRecord]:
-        records = self.db.scalars(
+    def list_behavior_logs(
+        self,
+        *,
+        limit: int = 12,
+        source: str | None = None,
+        keyword: str | None = None,
+    ) -> list[BehaviorLogRecord]:
+        query = (
             select(MonitorLog)
             .where(MonitorLog.category.in_(["plate", "owner_gesture", "police_gesture"]))
             .order_by(MonitorLog.created_at.desc())
-            .limit(limit)
-        ).all()
+        )
+        query = self._apply_behavior_filters(query, source=source, keyword=keyword)
+        records = self.db.scalars(query.limit(limit)).all()
         if records:
             return [
                 BehaviorLogRecord(
@@ -153,14 +164,22 @@ class AlertService:
                 for record in records
             ]
 
-        return list(_behavior_log_store)[:limit]
+        return self._filter_behavior_store(source=source, keyword=keyword)[:limit]
 
-    def list_behavior_logs_page(self, *, page: int = 1, page_size: int = 5) -> BehaviorLogPage:
+    def list_behavior_logs_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 5,
+        source: str | None = None,
+        keyword: str | None = None,
+    ) -> BehaviorLogPage:
         query = (
             select(MonitorLog)
             .where(MonitorLog.category.in_(["plate", "owner_gesture", "police_gesture"]))
             .order_by(MonitorLog.created_at.desc())
         )
+        query = self._apply_behavior_filters(query, source=source, keyword=keyword)
         total = int(
             self.db.scalar(
                 select(func.count()).select_from(query.order_by(None).subquery())
@@ -189,9 +208,10 @@ class AlertService:
                 total_pages=total_pages,
             )
 
-        fallback_total = len(_behavior_log_store)
+        fallback_items = self._filter_behavior_store(source=source, keyword=keyword)
+        fallback_total = len(fallback_items)
         page, total_pages, offset = self._resolve_page(total=fallback_total, page=page, page_size=page_size)
-        items = list(_behavior_log_store)[offset : offset + page_size]
+        items = fallback_items[offset : offset + page_size]
         return BehaviorLogPage(
             items=items,
             page=page,
@@ -277,12 +297,14 @@ class AlertService:
         limit: int = 20,
         user_id: int | None = None,
         operation_type: str | None = None,
+        keyword: str | None = None,
     ) -> list[OperationLogRecord]:
         query = select(UserOperationLog).order_by(UserOperationLog.created_at.desc())
         if user_id is not None:
             query = query.where(UserOperationLog.user_id == user_id)
         if operation_type:
             query = query.where(UserOperationLog.operation_type == operation_type)
+        query = self._apply_operation_keyword_filter(query, keyword)
 
         records = self.db.scalars(query.limit(limit)).all()
         return [OperationLogRecord.model_validate(record) for record in records]
@@ -294,12 +316,14 @@ class AlertService:
         page_size: int = 5,
         user_id: int | None = None,
         operation_type: str | None = None,
+        keyword: str | None = None,
     ) -> OperationLogPage:
         query = select(UserOperationLog).order_by(UserOperationLog.created_at.desc())
         if user_id is not None:
             query = query.where(UserOperationLog.user_id == user_id)
         if operation_type:
             query = query.where(UserOperationLog.operation_type == operation_type)
+        query = self._apply_operation_keyword_filter(query, keyword)
 
         total = int(
             self.db.scalar(
@@ -324,6 +348,7 @@ class AlertService:
         category: str | None = None,
         source: str | None = None,
         level: str | None = None,
+        keyword: str | None = None,
     ) -> list[MonitorLogRecord]:
         query = select(MonitorLog).order_by(MonitorLog.created_at.desc())
         if category:
@@ -332,6 +357,7 @@ class AlertService:
             query = query.where(MonitorLog.source == source)
         if level:
             query = query.where(MonitorLog.level == level)
+        query = self._apply_monitor_keyword_filter(query, keyword)
         records = self.db.scalars(query.limit(limit)).all()
         return [self._to_monitor_log(record) for record in records]
 
@@ -343,6 +369,7 @@ class AlertService:
         category: str | None = None,
         source: str | None = None,
         level: str | None = None,
+        keyword: str | None = None,
     ) -> MonitorLogPage:
         query = select(MonitorLog).order_by(MonitorLog.created_at.desc())
         if category:
@@ -351,6 +378,7 @@ class AlertService:
             query = query.where(MonitorLog.source == source)
         if level:
             query = query.where(MonitorLog.level == level)
+        query = self._apply_monitor_keyword_filter(query, keyword)
 
         total = int(
             self.db.scalar(
@@ -541,6 +569,81 @@ class AlertService:
         if source == "auth":
             return "user_operation"
         return "system"
+
+    def _apply_alert_keyword_filter(self, query, keyword: str | None):
+        value = self._normalize_keyword(keyword)
+        if value is None:
+            return query
+        pattern = f"%{value}%"
+        return query.where(
+            or_(
+                AlertLog.title.ilike(pattern),
+                AlertLog.summary.ilike(pattern),
+                AlertLog.event_type.ilike(pattern),
+                AlertLog.source.ilike(pattern),
+            )
+        )
+
+    def _apply_monitor_keyword_filter(self, query, keyword: str | None):
+        value = self._normalize_keyword(keyword)
+        if value is None:
+            return query
+        pattern = f"%{value}%"
+        return query.where(
+            or_(
+                MonitorLog.title.ilike(pattern),
+                MonitorLog.summary.ilike(pattern),
+                MonitorLog.event_type.ilike(pattern),
+                MonitorLog.status.ilike(pattern),
+                MonitorLog.source.ilike(pattern),
+            )
+        )
+
+    def _apply_operation_keyword_filter(self, query, keyword: str | None):
+        value = self._normalize_keyword(keyword)
+        if value is None:
+            return query
+        pattern = f"%{value}%"
+        return query.where(
+            or_(
+                UserOperationLog.operation_type.ilike(pattern),
+                UserOperationLog.response_status.ilike(pattern),
+            )
+        )
+
+    def _apply_behavior_filters(self, query, *, source: str | None, keyword: str | None):
+        if source:
+            query = query.where(MonitorLog.source == source)
+        return self._apply_monitor_keyword_filter(query, keyword)
+
+    def _filter_behavior_store(
+        self,
+        *,
+        source: str | None,
+        keyword: str | None,
+    ) -> list[BehaviorLogRecord]:
+        items = list(_behavior_log_store)
+        if source:
+            items = [item for item in items if item.source == source]
+
+        value = self._normalize_keyword(keyword)
+        if value is None:
+            return items
+
+        lowered = value.lower()
+        return [
+            item
+            for item in items
+            if lowered in item.source.lower()
+            or lowered in item.title.lower()
+            or lowered in item.summary.lower()
+        ]
+
+    def _normalize_keyword(self, keyword: str | None) -> str | None:
+        if keyword is None:
+            return None
+        value = keyword.strip()
+        return value or None
 
     def _resolve_page(self, *, total: int, page: int, page_size: int) -> tuple[int, int, int]:
         total_pages = max(1, (total + page_size - 1) // page_size)

@@ -103,6 +103,7 @@ export const fetchAlertTimelinePageApi = (params?: {
   page_size?: number;
   level?: string;
   source?: string;
+  keyword?: string;
 }) => request.get<PagedResult<AlertEvent>>("/alerts/timeline-page", { params });
 export const fetchBehaviorLogsApi = (limit = 24) =>
   request.get<BehaviorLogRecord[]>("/alerts/behavior-logs", {
@@ -111,6 +112,8 @@ export const fetchBehaviorLogsApi = (limit = 24) =>
 export const fetchBehaviorLogsPageApi = (params?: {
   page?: number;
   page_size?: number;
+  source?: string;
+  keyword?: string;
 }) => request.get<PagedResult<BehaviorLogRecord>>("/alerts/behavior-logs-page", { params });
 
 export const fetchMonitorLogsApi = (params?: {
@@ -125,6 +128,7 @@ export const fetchMonitorLogsPageApi = (params?: {
   category?: string;
   source?: string;
   level?: string;
+  keyword?: string;
 }) => request.get<PagedResult<MonitorLogRecord>>("/alerts/monitor-logs-page", { params });
 
 export const fetchOperationLogsApi = (params?: {
@@ -137,6 +141,7 @@ export const fetchOperationLogsPageApi = (params?: {
   page_size?: number;
   user_id?: number;
   operation_type?: string;
+  keyword?: string;
 }) => request.get<PagedResult<OperationLogRecord>>("/alerts/operation-logs-page", { params });
 
 export const fetchAlertReplayApi = (alertId: number) =>

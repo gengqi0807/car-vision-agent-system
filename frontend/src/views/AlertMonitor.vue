@@ -35,6 +35,41 @@
           <h4>告警时间线</h4>
           <span class="panel-hint">点击任一条可查看原因分析与事件回放</span>
         </div>
+        <div class="filter-row">
+          <select v-model="timelineFilters.level" class="filter-select">
+            <option value="">全部级别</option>
+            <option
+              v-for="option in alertLevelOptions"
+              :key="`timeline-level-${option.value}`"
+              :value="option.value"
+            >
+              {{ option.label }}
+            </option>
+          </select>
+          <select v-model="timelineFilters.source" class="filter-select">
+            <option value="">全部来源</option>
+            <option
+              v-for="option in alertSourceOptions"
+              :key="`timeline-source-${option.value}`"
+              :value="option.value"
+            >
+              {{ option.label }}
+            </option>
+          </select>
+          <input
+            v-model.trim="timelineFilters.keyword"
+            class="filter-input"
+            type="text"
+            placeholder="搜索标题、摘要、事件类型"
+            @keydown.enter.prevent="applyTimelineFilters"
+          />
+          <div class="filter-actions">
+            <button type="button" class="filter-button filter-button--primary" @click="applyTimelineFilters">
+              搜索
+            </button>
+            <button type="button" class="filter-button" @click="resetTimelineFilters">重置</button>
+          </div>
+        </div>
         <div class="panel-fixed-body panel-fixed-body--timeline">
           <div v-if="timelineState.items.length === 0" class="empty-state">暂无告警事件。</div>
           <div
@@ -217,6 +252,41 @@
           <h4>监控日志</h4>
           <span class="panel-hint">覆盖车牌识别、手势识别、交警手势与认证访问</span>
         </div>
+        <div class="filter-row">
+          <select v-model="monitorFilters.source" class="filter-select">
+            <option value="">全部来源</option>
+            <option
+              v-for="option in alertSourceOptions"
+              :key="`monitor-source-${option.value}`"
+              :value="option.value"
+            >
+              {{ option.label }}
+            </option>
+          </select>
+          <select v-model="monitorFilters.level" class="filter-select">
+            <option value="">全部级别</option>
+            <option
+              v-for="option in alertLevelOptions"
+              :key="`monitor-level-${option.value}`"
+              :value="option.value"
+            >
+              {{ option.label }}
+            </option>
+          </select>
+          <input
+            v-model.trim="monitorFilters.keyword"
+            class="filter-input"
+            type="text"
+            placeholder="搜索标题、摘要、事件类型"
+            @keydown.enter.prevent="applyMonitorFilters"
+          />
+          <div class="filter-actions">
+            <button type="button" class="filter-button filter-button--primary" @click="applyMonitorFilters">
+              搜索
+            </button>
+            <button type="button" class="filter-button" @click="resetMonitorFilters">重置</button>
+          </div>
+        </div>
         <div class="panel-fixed-body">
           <div v-if="monitorState.items.length === 0" class="empty-state">暂无监控日志。</div>
           <div v-for="log in monitorState.items" :key="log.id" class="behavior-log-item">
@@ -270,6 +340,31 @@
           <h4>用户操作日志</h4>
           <span class="panel-hint">用于审计登录、注册、资料更新等行为</span>
         </div>
+        <div class="filter-row">
+          <select v-model="operationFilters.operationType" class="filter-select">
+            <option value="">全部操作</option>
+            <option
+              v-for="option in operationTypeOptions"
+              :key="`operation-type-${option.value}`"
+              :value="option.value"
+            >
+              {{ option.label }}
+            </option>
+          </select>
+          <input
+            v-model.trim="operationFilters.keyword"
+            class="filter-input"
+            type="text"
+            placeholder="搜索操作类型、状态、用户"
+            @keydown.enter.prevent="applyOperationFilters"
+          />
+          <div class="filter-actions">
+            <button type="button" class="filter-button filter-button--primary" @click="applyOperationFilters">
+              搜索
+            </button>
+            <button type="button" class="filter-button" @click="resetOperationFilters">重置</button>
+          </div>
+        </div>
         <div class="panel-fixed-body">
           <div v-if="operationState.items.length === 0" class="empty-state">暂无用户操作日志。</div>
           <div v-for="record in operationState.items" :key="record.id" class="behavior-log-item">
@@ -319,6 +414,31 @@
       <div class="panel-heading">
         <h4>行为日志</h4>
         <span class="panel-hint">识别任务的普通运行记录，可用于辅助排查。</span>
+      </div>
+      <div class="filter-row">
+        <select v-model="behaviorFilters.source" class="filter-select">
+          <option value="">全部来源</option>
+          <option
+            v-for="option in behaviorSourceOptions"
+            :key="`behavior-source-${option.value}`"
+            :value="option.value"
+          >
+            {{ option.label }}
+          </option>
+        </select>
+        <input
+          v-model.trim="behaviorFilters.keyword"
+          class="filter-input"
+          type="text"
+          placeholder="搜索标题、摘要"
+          @keydown.enter.prevent="applyBehaviorFilters"
+        />
+        <div class="filter-actions">
+          <button type="button" class="filter-button filter-button--primary" @click="applyBehaviorFilters">
+            搜索
+          </button>
+          <button type="button" class="filter-button" @click="resetBehaviorFilters">重置</button>
+        </div>
       </div>
       <div class="panel-fixed-body panel-fixed-body--wide">
         <div v-if="behaviorState.items.length === 0" class="empty-state">暂无行为日志。</div>
@@ -437,6 +557,24 @@ const timelineState = createPagedState<AlertEvent>(5);
 const monitorState = createPagedState<MonitorLogRecord>(5);
 const operationState = createPagedState<OperationLogRecord>(5);
 const behaviorState = createPagedState<BehaviorLogRecord>(5);
+const timelineFilters = reactive({
+  level: "",
+  source: "",
+  keyword: ""
+});
+const monitorFilters = reactive({
+  source: "",
+  level: "",
+  keyword: ""
+});
+const operationFilters = reactive({
+  operationType: "",
+  keyword: ""
+});
+const behaviorFilters = reactive({
+  source: "",
+  keyword: ""
+});
 
 let refreshTimer: number | undefined;
 let socket: WebSocket | null = null;
@@ -453,6 +591,31 @@ const pieLegendItems = computed(() => [
   { key: "warning", label: "警告", value: overview.warning, color: "#d8a25c" },
   { key: "info", label: "提示", value: overview.info, color: "#7ea0c6" }
 ]);
+const alertLevelOptions = [
+  { value: "critical", label: "严重" },
+  { value: "warning", label: "警告" },
+  { value: "info", label: "提示" }
+];
+const alertSourceOptions = [
+  { value: "plate-recognition", label: "车牌识别" },
+  { value: "owner-gesture", label: "车主手势" },
+  { value: "police-gesture", label: "交警手势" },
+  { value: "auth", label: "用户认证" }
+];
+const behaviorSourceOptions = [
+  { value: "plate-recognition", label: "车牌识别" },
+  { value: "owner-gesture", label: "车主手势" },
+  { value: "police-gesture", label: "交警手势" }
+];
+const operationTypeOptions = [
+  { value: "login", label: "登录" },
+  { value: "register", label: "注册" },
+  { value: "email_login", label: "邮箱登录" },
+  { value: "update_profile", label: "资料更新" },
+  { value: "plate_recognition", label: "车牌识别" },
+  { value: "owner_gesture_recognition", label: "车主手势识别" },
+  { value: "police_gesture_recognition", label: "交警手势识别" }
+];
 const pieChartTotal = computed(() => pieLegendItems.value.reduce((sum, item) => sum + item.value, 0));
 const pieChartSegments = computed(() => {
   const total = pieChartTotal.value;
@@ -629,7 +792,10 @@ async function selectReplay(alertId: number) {
 async function loadTimelinePage(page = timelineState.page) {
   const response = await fetchAlertTimelinePageApi({
     page: normalizeRequestedPage(timelineState, page),
-    page_size: timelineState.pageSize
+    page_size: timelineState.pageSize,
+    level: timelineFilters.level || undefined,
+    source: timelineFilters.source || undefined,
+    keyword: timelineFilters.keyword || undefined
   });
   applyPageData(timelineState, response.data);
 
@@ -639,7 +805,8 @@ async function loadTimelinePage(page = timelineState.page) {
     return;
   }
 
-  if (selectedAlertId.value === null) {
+  const currentSelectionInPage = timelineState.items.some((item) => item.id === selectedAlertId.value);
+  if (selectedAlertId.value === null || !currentSelectionInPage) {
     await selectReplay(timelineState.items[0].id);
     return;
   }
@@ -654,7 +821,10 @@ async function loadTimelinePage(page = timelineState.page) {
 async function loadMonitorLogsPage(page = monitorState.page) {
   const response = await fetchMonitorLogsPageApi({
     page: normalizeRequestedPage(monitorState, page),
-    page_size: monitorState.pageSize
+    page_size: monitorState.pageSize,
+    source: monitorFilters.source || undefined,
+    level: monitorFilters.level || undefined,
+    keyword: monitorFilters.keyword || undefined
   });
   applyPageData(monitorState, response.data);
 }
@@ -662,7 +832,9 @@ async function loadMonitorLogsPage(page = monitorState.page) {
 async function loadOperationLogsPage(page = operationState.page) {
   const response = await fetchOperationLogsPageApi({
     page: normalizeRequestedPage(operationState, page),
-    page_size: operationState.pageSize
+    page_size: operationState.pageSize,
+    operation_type: operationFilters.operationType || undefined,
+    keyword: operationFilters.keyword || undefined
   });
   applyPageData(operationState, response.data);
 }
@@ -670,9 +842,53 @@ async function loadOperationLogsPage(page = operationState.page) {
 async function loadBehaviorLogsPage(page = behaviorState.page) {
   const response = await fetchBehaviorLogsPageApi({
     page: normalizeRequestedPage(behaviorState, page),
-    page_size: behaviorState.pageSize
+    page_size: behaviorState.pageSize,
+    source: behaviorFilters.source || undefined,
+    keyword: behaviorFilters.keyword || undefined
   });
   applyPageData(behaviorState, response.data);
+}
+
+function applyTimelineFilters() {
+  void loadTimelinePage(1);
+}
+
+function resetTimelineFilters() {
+  timelineFilters.level = "";
+  timelineFilters.source = "";
+  timelineFilters.keyword = "";
+  void loadTimelinePage(1);
+}
+
+function applyMonitorFilters() {
+  void loadMonitorLogsPage(1);
+}
+
+function resetMonitorFilters() {
+  monitorFilters.source = "";
+  monitorFilters.level = "";
+  monitorFilters.keyword = "";
+  void loadMonitorLogsPage(1);
+}
+
+function applyOperationFilters() {
+  void loadOperationLogsPage(1);
+}
+
+function resetOperationFilters() {
+  operationFilters.operationType = "";
+  operationFilters.keyword = "";
+  void loadOperationLogsPage(1);
+}
+
+function applyBehaviorFilters() {
+  void loadBehaviorLogsPage(1);
+}
+
+function resetBehaviorFilters() {
+  behaviorFilters.source = "";
+  behaviorFilters.keyword = "";
+  void loadBehaviorLogsPage(1);
 }
 
 async function loadAlertMonitor() {
@@ -765,6 +981,56 @@ onBeforeUnmount(() => {
   gap: 12px;
   margin-top: 14px;
   flex-wrap: wrap;
+}
+
+.filter-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.filter-select,
+.filter-input {
+  height: 38px;
+  border: 1px solid rgba(184, 162, 141, 0.35);
+  border-radius: 10px;
+  background: #fffdf9;
+  color: #5e4d41;
+}
+
+.filter-select {
+  min-width: 132px;
+  padding: 0 10px;
+}
+
+.filter-input {
+  flex: 1 1 220px;
+  min-width: 180px;
+  padding: 0 12px;
+}
+
+.filter-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.filter-button {
+  height: 38px;
+  padding: 0 14px;
+  border: 1px solid rgba(184, 162, 141, 0.35);
+  border-radius: 10px;
+  background: #f8f3ec;
+  color: #5e4d41;
+  cursor: pointer;
+}
+
+.filter-button--primary {
+  background: #7a5c46;
+  border-color: #7a5c46;
+  color: #fffaf3;
 }
 
 .page-arrow {
@@ -911,6 +1177,10 @@ onBeforeUnmount(() => {
   }
 
   .page-jump {
+    margin-left: 0;
+  }
+
+  .filter-actions {
     margin-left: 0;
   }
 
