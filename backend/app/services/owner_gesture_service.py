@@ -217,21 +217,24 @@ class OwnerGestureService:
 
         raw_kps = infer_result["keypoints"]
         num_hands = infer_result.get("num_hands_detected", 0)
-        cls_result = self.classifier.classify(raw_kps, domain="owner")
-        gesture_label = cls_result["gesture"]
-        cls_conf = cls_result["confidence"]
-        if num_hands == 0:
-            gesture_label = "未检测到手部"
-            cls_conf = 0.0
 
         active_session_id = session_id or uuid4().hex[:16]
         recent_records = self._recent_session_records(db, user_id=user_id, session_id=active_session_id)
         previous_record = recent_records[0] if recent_records else None
-        gesture_label = self._refine_motion_gesture(
-            gesture=gesture_label,
-            raw_keypoints=raw_kps,
-            recent_records=recent_records,
+        hands = self._group_hands(raw_kps)
+        primary_hand, image_gesture, image_confidence = self._select_primary_hand(
+            hands,
+            input_mode=input_mode,
         )
+        if image_gesture is not None and image_confidence is not None:
+            gesture_label, cls_conf = image_gesture, image_confidence
+        else:
+            gesture_label, cls_conf = self._classify_upload_gesture(
+                raw_keypoints=primary_hand,
+                num_hands=num_hands,
+                recent_records=recent_records,
+                input_mode=input_mode,
+            )
 
         control_command, _ = self._map_gesture_to_command(gesture_label)
         triggered = self._should_trigger(
@@ -241,23 +244,28 @@ class OwnerGestureService:
             input_mode=input_mode,
         )
         processing_time_ms = int((perf_counter() - started_at) * 1000)
-        hands = self._group_hands(raw_kps)
+        display_hands = [primary_hand] if input_mode == "image" and primary_hand else hands
         annotated_image = self._build_annotated_image(
             frame,
-            hands=hands,
+            hands=display_hands,
             gesture=gesture_label,
             confidence=cls_conf,
             control_command=control_command if triggered else None,
         )
 
-        keypoints = [Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0)) for kp in raw_kps]
+        response_keypoints_source = primary_hand if input_mode == "image" and primary_hand else raw_kps
+        keypoints = [
+            Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0))
+            for kp in response_keypoints_source
+        ]
+        record_keypoints = [Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0)) for kp in raw_kps]
         record = OwnerGestureRecord(
             user_id=user_id,
             session_id=active_session_id,
             gesture=gesture_label,
             confidence=round(cls_conf, 4),
             control_action=control_command or "None",
-            hand_landmarks=[kp.model_dump() for kp in keypoints],
+            hand_landmarks=[kp.model_dump() for kp in record_keypoints],
             is_triggered=triggered,
             processing_time_ms=processing_time_ms,
         )
@@ -659,6 +667,80 @@ class OwnerGestureService:
             if len(hand) == 21:
                 grouped.append(hand)
         return grouped
+
+    def _select_primary_hand(
+        self,
+        hands: list[list[dict]],
+        *,
+        input_mode: str,
+    ) -> tuple[list[dict], str | None, float | None]:
+        if not hands:
+            return [], None, None
+        if input_mode != "image" or len(hands) == 1:
+            return hands[0], None, None
+
+        best_hand = hands[0]
+        best_gesture = "unknown"
+        best_confidence = 0.0
+        best_rank = (-1, -1.0, -1.0)
+
+        for hand in hands:
+            gesture, confidence = self.classifier.classify_static(hand[:21])
+            rank = self._rank_image_hand_candidate(hand, gesture=gesture, confidence=confidence)
+            if rank > best_rank:
+                best_hand = hand
+                best_gesture = gesture
+                best_confidence = confidence
+                best_rank = rank
+
+        return best_hand, best_gesture, best_confidence
+
+    def _rank_image_hand_candidate(
+        self,
+        hand: list[dict],
+        *,
+        gesture: str,
+        confidence: float,
+    ) -> tuple[int, float, float]:
+        control_command, _ = self._map_gesture_to_command(gesture)
+        if control_command:
+            gesture_priority = 3
+        elif gesture not in {"unknown", "idle", "未检测到手部", "point"}:
+            gesture_priority = 2
+        elif gesture == "point":
+            gesture_priority = 1
+        else:
+            gesture_priority = 0
+        return gesture_priority, confidence, self._hand_bbox_area(hand)
+
+    def _hand_bbox_area(self, hand: list[dict]) -> float:
+        if not hand:
+            return 0.0
+        xs = [float(point["x"]) for point in hand]
+        ys = [float(point["y"]) for point in hand]
+        return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+    def _classify_upload_gesture(
+        self,
+        *,
+        raw_keypoints: list[dict],
+        num_hands: int,
+        recent_records: list[OwnerGestureRecord],
+        input_mode: str,
+    ) -> tuple[str, float]:
+        if num_hands == 0 or len(raw_keypoints) < 21:
+            return "未检测到手部", 0.0
+
+        if input_mode == "image":
+            return self.classifier.classify_static(raw_keypoints[:21])
+
+        cls_result = self.classifier.classify(raw_keypoints[:21], domain="owner")
+        gesture_label = self._refine_motion_gesture(
+            gesture=cls_result["gesture"],
+            raw_keypoints=raw_keypoints[:21],
+            recent_records=recent_records,
+        )
+        return gesture_label, cls_result["confidence"]
 
     def _build_annotated_image(
         self,

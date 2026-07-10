@@ -40,17 +40,18 @@ from app.models_infer.mediapipe_hands import MediaPipeHands
 # ----------------------------------------------------------------
 
 GESTURE_ACTION = {
-    "palm":        "wake         ← 唤醒",
+    "open_palm":   "wake         ← 唤醒",
     "fist":        "confirm      ← 确认",
-    "circle_cw":   "volume_up    ← 音量+",
-    "circle_ccw":  "volume_down  ← 音量-",
+    "index_circle":"volume      ← 音量调节",
     "swipe_left":  "prev_func    ← 上一个功能",
     "swipe_right": "next_func    ← 下一个功能",
-    "thumb_up":    "call_answer  ← 接听",
-    "thumb_down":  "call_hangup  ← 挂断",
+    "thumbs_up":   "call_answer  ← 接听",
+    "thumbs_down": "call_hangup  ← 挂断",
     "wave":        "home         ← 主页",
-    "pointing":    "idle         ← 食指追踪中",
+    "point":       "idle         ← 食指追踪中",
+    "idle":        "idle",
     "unknown":     "idle",
+    "未检测到手部":"idle",
 }
 
 
@@ -109,12 +110,24 @@ def draw_result(frame: np.ndarray, gesture: str, action: str, conf: float,
 
 
 def process_frame(frame_bgr: np.ndarray, classifier: GestureClassifier):
-    hands = MediaPipeHands.infer(frame_bgr)
+    hands = MediaPipeHands.infer_video(frame_bgr)
     hand_kp = hands[0] if hands else None
 
     gesture, conf = classifier.classify_frame(hand_kp)
     action = gesture_label(gesture)
     return gesture, action, conf, len(hands), hand_kp
+
+
+def process_image(frame_bgr: np.ndarray, hands_model: MediaPipeHands, classifier: GestureClassifier):
+    infer_result = hands_model.infer(frame_bgr)
+    raw_keypoints = infer_result["keypoints"]
+    num_hands = infer_result.get("num_hands_detected", 0)
+    if not raw_keypoints or num_hands == 0:
+        return "未检测到手部", "idle", 0.0, 0, None
+
+    gesture, conf = classifier.classify_static(raw_keypoints[:21])
+    action = gesture_label(gesture)
+    return gesture, action, conf, num_hands, raw_keypoints[:21]
 
 
 def main():
@@ -133,6 +146,7 @@ def main():
         return
 
     MediaPipeHands.configure(model_path=model_path)
+    hands_model = MediaPipeHands(model_path=model_path)
     classifier = GestureClassifier(domain="owner")
 
     # ---- 图片模式 ----
@@ -141,7 +155,7 @@ def main():
         if frame is None:
             print(f"❌ 无法读取图片: {args.image}")
             return
-        gesture, action, conf, hc, kp = process_frame(frame, classifier)
+        gesture, action, conf, hc, kp = process_image(frame, hands_model, classifier)
         frame = draw_result(frame, gesture, action, conf, hc, kp)
         print(f"Gesture: {gesture} | Action: {action} | Conf: {conf:.3f}")
         cv2.imshow("Owner Gesture — Image", frame)

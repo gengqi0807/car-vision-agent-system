@@ -1,5 +1,7 @@
+import asyncio
 from datetime import datetime, timedelta
 
+import cv2
 import numpy as np
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -294,3 +296,126 @@ def test_should_trigger_immediately_for_image_input():
     )
 
     assert triggered is True
+
+
+def test_classify_upload_gesture_image_mode_uses_single_hand_static_result():
+    service = OwnerGestureService()
+
+    class StubClassifier:
+        def classify_static(self, keypoints):
+            assert len(keypoints) == 21
+            return "fist", 0.91
+
+        def classify(self, keypoints, domain="owner"):
+            raise AssertionError("image mode should not use dynamic upload classify path")
+
+    service._classifier = StubClassifier()
+
+    gesture, confidence = service._classify_upload_gesture(
+        raw_keypoints=[{"x": 0.1, "y": 0.2, "z": 0.0} for _ in range(21)],
+        num_hands=1,
+        recent_records=[],
+        input_mode="image",
+    )
+
+    assert gesture == "fist"
+    assert confidence == 0.91
+
+
+def test_classify_upload_gesture_camera_mode_applies_motion_refinement():
+    service = OwnerGestureService()
+
+    class StubClassifier:
+        def classify(self, keypoints, domain="owner"):
+            assert len(keypoints) == 21
+            return {"gesture": "open_palm", "confidence": 0.82}
+
+    service._classifier = StubClassifier()
+    service._refine_motion_gesture = lambda **_: "wave"  # type: ignore[method-assign]
+
+    gesture, confidence = service._classify_upload_gesture(
+        raw_keypoints=[{"x": 0.1, "y": 0.2, "z": 0.0} for _ in range(21)],
+        num_hands=1,
+        recent_records=[],
+        input_mode="camera",
+    )
+
+    assert gesture == "wave"
+    assert confidence == 0.82
+
+
+def test_select_primary_hand_prefers_triggerable_image_hand():
+    service = OwnerGestureService()
+
+    left_hand = [{"x": 0.18, "y": 0.35 + index * 0.001, "z": 0.0} for index in range(21)]
+    right_hand = [{"x": 0.78, "y": 0.25 + index * 0.001, "z": 0.0} for index in range(21)]
+
+    class StubClassifier:
+        def classify_static(self, keypoints):
+            return ("point", 0.84) if keypoints[0]["x"] < 0.5 else ("thumbs_up", 0.88)
+
+    service._classifier = StubClassifier()
+
+    primary_hand, gesture, confidence = service._select_primary_hand(
+        [left_hand, right_hand],
+        input_mode="image",
+    )
+
+    assert primary_hand == right_hand
+    assert gesture == "thumbs_up"
+    assert confidence == 0.88
+
+
+def test_process_frame_image_mode_returns_selected_hand_keypoints_only(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'owner_gesture_upload.db'}", future=True)
+    testing_session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+
+    service = OwnerGestureService()
+
+    left_hand = [{"x": 0.18, "y": 0.35 + index * 0.001, "z": 0.0} for index in range(21)]
+    right_hand = [{"x": 0.78, "y": 0.25 + index * 0.001, "z": 0.0} for index in range(21)]
+
+    class StubHands:
+        def infer(self, _frame):
+            return {
+                "keypoints": left_hand + right_hand,
+                "num_hands_detected": 2,
+            }
+
+    class StubClassifier:
+        def classify_static(self, keypoints):
+            return ("point", 0.84) if keypoints[0]["x"] < 0.5 else ("thumbs_up", 0.88)
+
+    async def fake_capture_monitor_log(**_kwargs):
+        return None
+
+    service._hands = StubHands()
+    service._classifier = StubClassifier()
+    service._should_log_operation = lambda **_: False  # type: ignore[method-assign]
+    service._should_record_behavior = lambda **_: False  # type: ignore[method-assign]
+    service._capture_monitor_log = fake_capture_monitor_log  # type: ignore[method-assign]
+
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    ok, encoded = cv2.imencode(".jpg", frame)
+    assert ok is True
+
+    with testing_session() as db:
+        result = asyncio.run(
+            service.process_frame(
+                encoded.tobytes(),
+                "upload.jpg",
+                db=db,
+                user_id=1,
+                session_id="session-image",
+                input_mode="image",
+            )
+        )
+
+        stored = db.query(OwnerGestureRecord).all()
+
+    assert result.gesture == "thumbs_up"
+    assert len(result.keypoints) == 21
+    assert result.keypoints[0].x == right_hand[0]["x"]
+    assert len(stored) == 1
+    assert len(stored[0].hand_landmarks) == 42
