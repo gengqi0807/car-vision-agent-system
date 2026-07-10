@@ -117,6 +117,19 @@ def process_frame(frame_bgr: np.ndarray, classifier: GestureClassifier):
     return gesture, action, conf, len(hands), hand_kp
 
 
+def process_image(frame_bgr: np.ndarray, classifier: GestureClassifier):
+    """单张图片推理，绕过 classify_frame 的时序去抖逻辑，直接调用静态分类。"""
+    hands = MediaPipeHands.infer(frame_bgr)
+    hand_kp = hands[0] if hands else None
+
+    if hand_kp:
+        gesture, conf = classifier.classify_static(hand_kp)
+    else:
+        gesture, conf = "unknown", 0.0
+    action = gesture_label(gesture)
+    return gesture, action, conf, len(hands), hand_kp
+
+
 def main():
     parser = argparse.ArgumentParser(description="车主手势识别验证")
     group = parser.add_mutually_exclusive_group(required=True)
@@ -141,7 +154,7 @@ def main():
         if frame is None:
             print(f"❌ 无法读取图片: {args.image}")
             return
-        gesture, action, conf, hc, kp = process_frame(frame, classifier)
+        gesture, action, conf, hc, kp = process_image(frame, classifier)
         frame = draw_result(frame, gesture, action, conf, hc, kp)
         print(f"Gesture: {gesture} | Action: {action} | Conf: {conf:.3f}")
         cv2.imshow("Owner Gesture — Image", frame)
