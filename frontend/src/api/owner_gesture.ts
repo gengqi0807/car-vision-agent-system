@@ -48,6 +48,7 @@ export interface OwnerGestureStreamResult {
 export const fetchOwnerGestureApi = (formData: FormData) =>
   request.post<OwnerGestureFrameResult>("/owner-gesture/current", formData, {
     headers: { "Content-Type": "multipart/form-data" },
+    timeout: 60 * 1000,
   });
 
 export const fetchOwnerPanelApi = () => request.get<OwnerControlPanelState>("/owner-gesture/panel");

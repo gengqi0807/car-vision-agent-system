@@ -1,5 +1,12 @@
-当前版本默认使用 HyperLPR3，不再要求手动放置 YOLO 权重文件。
+当前默认使用这个车牌检测权重：
+- `backend/weights/open_traffic_flow_best.pt`
 
-这个目录可以保留为空。
+当前主流程是：
+- 先用车牌检测模型定位车牌框
+- 再把车牌区域交给 OCR 识别
 
-如果你后续想切回自定义检测模型方案，再把对应权重文件放到这里，并同步修改后端配置。
+如果后续更换模型，请同步修改：
+- `backend/.env` 中的 `PLATE_YOLO_MODEL_PATH`
+
+如果临时没有检测模型，也可以改回官方通用模型，例如：
+- `PLATE_YOLO_MODEL_PATH=yolov8n.pt`
