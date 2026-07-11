@@ -92,7 +92,15 @@
             </div>
 
             <div v-else-if="mode === 'video' && processedVideoUrl" class="preview-stage">
-              <video class="preview-video" :src="processedVideoUrl" controls playsinline />
+              <video
+                :key="processedVideoUrl"
+                class="preview-video"
+                :src="processedVideoUrl"
+                controls
+                playsinline
+                preload="metadata"
+                @error="handleProcessedVideoError"
+              />
             </div>
 
             <div v-else-if="mode === 'image' && imagePreviewUrl" class="preview-stage">
@@ -282,12 +290,13 @@ const streamInput = ref(readStoredValue(PLATE_STREAM_INPUT_STORAGE_KEY));
 const streamControl = ref<PlateStreamControlResponse | null>(null);
 const streamStatus = ref<"idle" | "starting" | "running">("idle");
 const playbackRefreshKey = ref(Date.now());
+const videoPreviewError = ref("");
 
 let statusTimer: number | null = null;
 
 const historyPageSize = 6;
 
-const processedVideoUrl = computed(() => videoResult.value?.processed_video_url ?? "");
+const processedVideoUrl = computed(() => normalizeMediaUrl(videoResult.value?.processed_video_url ?? ""));
 
 const currentDetections = computed(() => {
   if (mode.value === "image") {
@@ -445,6 +454,9 @@ const resultMeta = computed(() => {
   }
 
   if (mode.value === "video") {
+    if (videoPreviewError.value) {
+      return videoPreviewError.value;
+    }
     if (videoResult.value) {
       return `已处理 ${videoResult.value.processed_frame_count} 帧，识别到 ${videoResult.value.detections.length} 个唯一车牌。`;
     }
@@ -498,6 +510,7 @@ function resetImageState() {
 
 function resetVideoState() {
   videoResult.value = null;
+  videoPreviewError.value = "";
 }
 
 function setMode(nextMode: Mode) {
@@ -633,6 +646,10 @@ async function handleVideoFileChange(event: Event) {
   }
 }
 
+function handleProcessedVideoError() {
+  videoPreviewError.value = "处理已完成，但标注视频预览加载失败，请尝试使用“打开处理后视频”链接检查文件。";
+}
+
 async function startStream() {
   const rtspUrl = streamInput.value.trim();
   if (!rtspUrl) {
@@ -683,8 +700,29 @@ function extractErrorMessage(error: unknown, fallback: string) {
 function startStatusPolling() {
   stopStatusPolling();
   statusTimer = window.setInterval(async () => {
+    if (mode.value !== "stream" && streamStatus.value === "idle") {
+      return;
+    }
     await refreshStreamStatus();
   }, 3000);
+}
+
+function normalizeMediaUrl(url: string) {
+  if (!url) {
+    return "";
+  }
+  if (url.startsWith("/media/")) {
+    return url;
+  }
+  try {
+    const parsed = new URL(url);
+    if (parsed.pathname.startsWith("/media/")) {
+      return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    }
+  } catch {
+    return url;
+  }
+  return url;
 }
 
 function stopStatusPolling() {

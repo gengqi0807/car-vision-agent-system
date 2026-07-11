@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 
 from app.api.deps import get_current_user
@@ -67,7 +69,8 @@ async def recognize_plate_video(
 ) -> PlateVideoRecognitionResponse:
     video_bytes = await file.read()
     try:
-        response = service.recognize_video_bytes(
+        response = await asyncio.to_thread(
+            service.recognize_video_bytes,
             video_bytes,
             file.filename or "unknown.mp4",
             save_history=True,

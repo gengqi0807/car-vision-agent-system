@@ -16,6 +16,7 @@ export interface PlateVideoRecognitionResponse {
   source_filename: string;
   processed_video_url: string;
   detections: PlateDetection[];
+  unread_samples: string[];
   processed_frame_count: number;
   duration_seconds?: number | null;
 }
