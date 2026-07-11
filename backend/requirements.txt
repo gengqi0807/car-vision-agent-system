@@ -15,5 +15,5 @@ numpy>=2.1,<2.4; python_version >= "3.13"
 aiofiles==24.1.0
 hyperlpr3==0.1.3
 pytest==8.4.1
-scikit-learn>=1.3.0
+scikit-learn==1.5.1
 joblib>=1.3.0

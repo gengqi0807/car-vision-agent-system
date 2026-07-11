@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import dataclass, field
 import logging
 import math
 import threading
@@ -87,6 +88,21 @@ COMMAND_DISPLAY_MAP: dict[str, str] = {
 }
 
 
+@dataclass
+class RuntimeGestureRecord:
+    gesture: str
+    control_action: str
+    is_triggered: bool
+    created_at: datetime
+    hand_landmarks: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class RuntimeGestureSession:
+    panel_state: ControlPanelState
+    recent_records: list[RuntimeGestureRecord] = field(default_factory=list)
+
+
 class OwnerGestureService:
     _instance: ClassVar["OwnerGestureService | None"] = None
     _feature_modes = ("home", "media", "comfort", "vehicle")
@@ -119,6 +135,7 @@ class OwnerGestureService:
         self._ws_callbacks: list[tuple[Any, asyncio.AbstractEventLoop | None]] = []
         self._control_callbacks: list[Any] = []
         self._alert_callbacks: list[Any] = []
+        self._runtime_sessions: dict[tuple[int, str], RuntimeGestureSession] = {}
         self._latest_stream_result: OwnerGestureResult | None = None
         self._stream_state = StreamState(running=False)
         self._live_panel_state = ControlPanelState(
@@ -219,7 +236,12 @@ class OwnerGestureService:
         num_hands = infer_result.get("num_hands_detected", 0)
 
         active_session_id = session_id or uuid4().hex[:16]
-        recent_records = self._recent_session_records(db, user_id=user_id, session_id=active_session_id)
+        runtime_session: RuntimeGestureSession | None = None
+        if input_mode == "camera":
+            runtime_session = self._runtime_session(user_id=user_id, session_id=active_session_id)
+            recent_records = list(reversed(runtime_session.recent_records))
+        else:
+            recent_records = self._recent_session_records(db, user_id=user_id, session_id=active_session_id)
         previous_record = recent_records[0] if recent_records else None
         hands = self._group_hands(raw_kps)
         primary_hand, image_gesture, image_confidence = self._select_primary_hand(
@@ -228,6 +250,8 @@ class OwnerGestureService:
         )
         if image_gesture is not None and image_confidence is not None:
             gesture_label, cls_conf = image_gesture, image_confidence
+        elif input_mode == "camera":
+            gesture_label, cls_conf = self.stream_classifier.classify_frame(primary_hand if primary_hand else None)
         else:
             gesture_label, cls_conf = self._classify_upload_gesture(
                 raw_keypoints=primary_hand,
@@ -244,82 +268,91 @@ class OwnerGestureService:
             input_mode=input_mode,
         )
         processing_time_ms = int((perf_counter() - started_at) * 1000)
-        display_hands = [primary_hand] if input_mode == "image" and primary_hand else hands
-        annotated_image = self._build_annotated_image(
-            frame,
-            hands=display_hands,
-            gesture=gesture_label,
-            confidence=cls_conf,
-            control_command=control_command if triggered else None,
-        )
+        if input_mode == "image":
+            display_hands = [primary_hand] if primary_hand else hands
+            annotated_image = self._build_annotated_image(
+                frame,
+                hands=display_hands,
+                gesture=gesture_label,
+                confidence=cls_conf,
+                control_command=control_command if triggered else None,
+            )
+        else:
+            annotated_image = None
 
         response_keypoints_source = primary_hand if input_mode == "image" and primary_hand else raw_kps
         keypoints = [
             Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0))
             for kp in response_keypoints_source
         ]
-        record_keypoints = [Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0)) for kp in raw_kps]
-        record = OwnerGestureRecord(
-            user_id=user_id,
-            session_id=active_session_id,
-            gesture=gesture_label,
-            confidence=round(cls_conf, 4),
-            control_action=control_command or "None",
-            hand_landmarks=[kp.model_dump() for kp in record_keypoints],
-            is_triggered=triggered,
-            processing_time_ms=processing_time_ms,
-        )
-        db.add(record)
-        if self._should_log_operation(
-            previous_record=previous_record,
-            gesture=gesture_label,
-            triggered=triggered,
-        ):
-            self._log_operation(
-                db,
-                user_id=user_id,
-                response_status="Success" if num_hands > 0 else "NoHandDetected",
+        updated_at = datetime.utcnow()
+        if input_mode == "camera" and runtime_session is not None:
+            panel_state = self._update_runtime_session(
+                runtime_session,
+                gesture=gesture_label,
+                control_command=control_command if triggered else None,
+                updated_at=updated_at,
             )
-        db.commit()
-        db.refresh(record)
-
-        panel_state = self._build_panel_state(db, user_id=user_id, session_id=active_session_id)
-        if self._should_record_behavior(
-            previous_record=previous_record,
-            gesture=gesture_label,
-            triggered=triggered,
-        ):
-            AlertService(db).record_behavior(
-                source="owner-gesture",
-                title="手势控车识别完成" if triggered else "手势控车识别更新",
-                summary=self._build_behavior_summary(
+            runtime_session.recent_records.append(
+                RuntimeGestureRecord(
                     gesture=gesture_label,
+                    control_action=control_command or "None",
+                    is_triggered=triggered,
+                    created_at=updated_at,
+                    hand_landmarks=raw_kps,
+                )
+            )
+            if len(runtime_session.recent_records) > 12:
+                runtime_session.recent_records = runtime_session.recent_records[-12:]
+            if triggered or self._should_persist_camera_record(previous_record=previous_record, gesture=gesture_label):
+                self._persist_gesture_record(
+                    db,
+                    user_id=user_id,
+                    session_id=active_session_id,
+                    gesture=gesture_label,
+                    confidence=cls_conf,
                     control_command=control_command,
                     triggered=triggered,
                     processing_time_ms=processing_time_ms,
-                ),
+                    raw_kps=raw_kps,
+                    previous_record=previous_record,
+                    num_hands=num_hands,
+                )
+        else:
+            self._persist_gesture_record(
+                db,
+                user_id=user_id,
+                session_id=active_session_id,
+                gesture=gesture_label,
+                confidence=cls_conf,
+                control_command=control_command,
+                triggered=triggered,
+                processing_time_ms=processing_time_ms,
+                raw_kps=raw_kps,
+                previous_record=previous_record,
+                num_hands=num_hands,
             )
-
-        await self._capture_monitor_log(
-            event_type=(
-                "owner_gesture_success"
-                if cls_conf >= settings.alert_low_confidence_threshold
-                else "owner_gesture_low_confidence"
-            ),
-            title="车主手势帧处理完成",
-            summary=f"{filename} 已处理完成，置信度为 {cls_conf:.2f}，检测到 {num_hands} 只手。",
-            confidence=cls_conf,
-            details={
-                "filename": filename,
-                "num_hands_detected": num_hands,
-                "frame_width": int(frame.shape[1]),
-                "frame_height": int(frame.shape[0]),
-                "triggered": triggered,
-                "control_command": control_command,
-            },
-            trigger_alert=cls_conf < settings.alert_low_confidence_threshold,
-            level="info" if cls_conf >= settings.alert_low_confidence_threshold else "warning",
-        )
+            panel_state = self._build_panel_state(db, user_id=user_id, session_id=active_session_id)
+            await self._capture_monitor_log(
+                event_type=(
+                    "owner_gesture_success"
+                    if cls_conf >= settings.alert_low_confidence_threshold
+                    else "owner_gesture_low_confidence"
+                ),
+                title="车主手势帧处理完成",
+                summary=f"{filename} 已处理完成，置信度为 {cls_conf:.2f}，检测到 {num_hands} 只手。",
+                confidence=cls_conf,
+                details={
+                    "filename": filename,
+                    "num_hands_detected": num_hands,
+                    "frame_width": int(frame.shape[1]),
+                    "frame_height": int(frame.shape[0]),
+                    "triggered": triggered,
+                    "control_command": control_command,
+                },
+                trigger_alert=cls_conf < settings.alert_low_confidence_threshold,
+                level="info" if cls_conf >= settings.alert_low_confidence_threshold else "warning",
+            )
 
         return GestureFrameResult(
             gesture=gesture_label,
@@ -329,7 +362,7 @@ class OwnerGestureService:
             control_command=control_command,
             triggered=triggered,
             panel_state=panel_state,
-            updated_at=datetime.utcnow(),
+            updated_at=updated_at,
         )
 
     def start(self, source: str, fps: int = 15) -> StreamState:
@@ -397,6 +430,9 @@ class OwnerGestureService:
         *,
         session_id: str | None = None,
     ) -> ControlPanelState:
+        runtime_panel = self._latest_runtime_panel_state(user_id=user_id, session_id=session_id)
+        if runtime_panel is not None:
+            return runtime_panel
         return self._build_panel_state(db, user_id=user_id, session_id=session_id)
 
     def _configure_stream_runtime(self) -> None:
@@ -580,6 +616,63 @@ class OwnerGestureService:
             .limit(limit)
         ).all()
 
+    def _runtime_session(self, *, user_id: int, session_id: str) -> RuntimeGestureSession:
+        key = (user_id, session_id)
+        session = self._runtime_sessions.get(key)
+        if session is None:
+            session = RuntimeGestureSession(
+                panel_state=ControlPanelState(
+                    **self._default_panel_state,
+                    last_gesture=None,
+                    last_command=None,
+                    last_command_at=None,
+                    updated_at=None,
+                )
+            )
+            self._runtime_sessions[key] = session
+        return session
+
+    def _latest_runtime_panel_state(
+        self,
+        *,
+        user_id: int,
+        session_id: str | None = None,
+    ) -> ControlPanelState | None:
+        if session_id is not None:
+            session = self._runtime_sessions.get((user_id, session_id))
+            return session.panel_state if session is not None else None
+
+        latest_session: ControlPanelState | None = None
+        latest_at: datetime | None = None
+        for (runtime_user_id, _), session in self._runtime_sessions.items():
+            if runtime_user_id != user_id:
+                continue
+            updated_at = session.panel_state.updated_at
+            if updated_at is None:
+                continue
+            if latest_at is None or updated_at > latest_at:
+                latest_session = session.panel_state
+                latest_at = updated_at
+        return latest_session
+
+    def _update_runtime_session(
+        self,
+        session: RuntimeGestureSession,
+        *,
+        gesture: str,
+        control_command: str | None,
+        updated_at: datetime,
+    ) -> ControlPanelState:
+        state = session.panel_state.model_dump()
+        state["last_gesture"] = gesture
+        state["updated_at"] = updated_at
+        if control_command:
+            self._apply_command_to_state(state, control_command)
+            state["last_command"] = control_command
+            state["last_command_at"] = updated_at
+        session.panel_state = ControlPanelState(**state)
+        return session.panel_state
+
     def _should_trigger(
         self,
         *,
@@ -646,6 +739,71 @@ class OwnerGestureService:
         if previous_record is None:
             return True
         return previous_record.gesture != gesture
+
+    def _should_persist_camera_record(
+        self,
+        *,
+        previous_record: RuntimeGestureRecord | OwnerGestureRecord | None,
+        gesture: str,
+    ) -> bool:
+        if previous_record is None:
+            return True
+        return previous_record.gesture != gesture
+
+    def _persist_gesture_record(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        session_id: str,
+        gesture: str,
+        confidence: float,
+        control_command: str | None,
+        triggered: bool,
+        processing_time_ms: int,
+        raw_kps: list[dict],
+        previous_record: RuntimeGestureRecord | OwnerGestureRecord | None,
+        num_hands: int,
+    ) -> None:
+        record_keypoints = [Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0)) for kp in raw_kps]
+        record = OwnerGestureRecord(
+            user_id=user_id,
+            session_id=session_id,
+            gesture=gesture,
+            confidence=round(confidence, 4),
+            control_action=control_command or "None",
+            hand_landmarks=[kp.model_dump() for kp in record_keypoints],
+            is_triggered=triggered,
+            processing_time_ms=processing_time_ms,
+        )
+        db.add(record)
+        if self._should_log_operation(
+            previous_record=previous_record,
+            gesture=gesture,
+            triggered=triggered,
+        ):
+            self._log_operation(
+                db,
+                user_id=user_id,
+                response_status="Success" if num_hands > 0 else "NoHandDetected",
+            )
+        db.commit()
+        db.refresh(record)
+        if self._should_record_behavior(
+            previous_record=previous_record,
+            gesture=gesture,
+            triggered=triggered,
+        ):
+            AlertService(db).record_behavior(
+                source="owner-gesture",
+                title="手势控车识别完成" if triggered else "手势控车识别更新",
+                summary=self._build_behavior_summary(
+                    gesture=gesture,
+                    control_command=control_command,
+                    triggered=triggered,
+                    processing_time_ms=processing_time_ms,
+                ),
+            )
 
     def _prepare_frame_for_inference(self, frame: np.ndarray) -> np.ndarray:
         height, width = frame.shape[:2]
@@ -1038,15 +1196,17 @@ class OwnerGestureService:
         return float(x), float(y)
 
     def _classify_swipe(self, points: list[tuple[float, float]]) -> str | None:
-        if len(points) < 3:
+        if len(points) < 4:
             return None
         net_dx = points[-1][0] - points[0][0]
         net_dy = points[-1][1] - points[0][1]
         if abs(net_dx) < 0.16 or abs(net_dy) > 0.12:
             return None
         x_deltas = [right[0] - left[0] for left, right in zip(points, points[1:])]
-        meaningful_deltas = [delta for delta in x_deltas if abs(delta) > 0.015]
+        meaningful_deltas = [delta for delta in x_deltas if abs(delta) > 0.025]
         if len(meaningful_deltas) < 2:
+            return None
+        if max(abs(delta) for delta in meaningful_deltas) < 0.06:
             return None
         consistent_steps = sum(1 for delta in meaningful_deltas if delta * net_dx > 0)
         if consistent_steps < max(2, len(meaningful_deltas) - 1):
@@ -1057,16 +1217,17 @@ class OwnerGestureService:
         if len(points) < 5:
             return False
         x_deltas = [right[0] - left[0] for left, right in zip(points, points[1:])]
-        signs = [1 if delta > 0.02 else -1 if delta < -0.02 else 0 for delta in x_deltas]
+        signs = [1 if delta > 0.03 else -1 if delta < -0.03 else 0 for delta in x_deltas]
         filtered_signs = [sign for sign in signs if sign != 0]
-        if len(filtered_signs) < 3:
+        if len(filtered_signs) < 4:
             return False
         direction_changes = sum(
             1 for previous, current in zip(filtered_signs, filtered_signs[1:]) if previous != current
         )
         span_x = max(point[0] for point in points) - min(point[0] for point in points)
         net_dx = abs(points[-1][0] - points[0][0])
-        return direction_changes >= 2 and span_x >= 0.16 and net_dx <= 0.12
+        max_amplitude = max(abs(point[0] - points[0][0]) for point in points)
+        return direction_changes >= 2 and span_x >= 0.16 and net_dx <= 0.12 and max_amplitude >= 0.06
 
     def _is_circle_motion(self, points: list[tuple[float, float]]) -> bool:
         if len(points) < 5:

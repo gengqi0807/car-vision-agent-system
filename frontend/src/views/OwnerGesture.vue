@@ -356,12 +356,12 @@ const sourcePreviewUrl = ref("");
 const annotatedPreviewUrl = ref("");
 const uiNow = ref(Date.now());
 
-const baseFrameIntervalMs = 90;
+const baseFrameIntervalMs = 125;
 const previewIdealWidth = 960;
 const previewIdealHeight = 720;
-const captureMaxWidth = 416;
-const captureMaxHeight = 312;
-const captureJpegQuality = 0.58;
+const captureMaxWidth = 512;
+const captureMaxHeight = 384;
+const captureJpegQuality = 0.72;
 let mediaStream: MediaStream | null = null;
 let activeSourceVideo: HTMLVideoElement | null = null;
 let captureTimer: number | null = null;
@@ -372,7 +372,7 @@ let overlayFromKeypoints: Array<{ x: number; y: number }> = [];
 let overlayTargetKeypoints: Array<{ x: number; y: number }> = [];
 let overlayDisplayKeypoints: Array<{ x: number; y: number }> = [];
 let overlayTransitionStartedAt = 0;
-let overlayTransitionDurationMs = 120;
+let overlayTransitionDurationMs = 110;
 let lastInferenceDurationMs = 120;
 
 const HAND_CONNECTIONS: Array<[number, number]> = [
@@ -829,7 +829,7 @@ function updateOverlayKeypoints(keypoints: Array<{ x: number; y: number }>) {
   overlayFromKeypoints = overlayDisplayKeypoints.length ? overlayDisplayKeypoints.map((point) => ({ ...point })) : [];
   overlayTargetKeypoints = keypoints.map((point) => ({ x: point.x, y: point.y }));
   overlayTransitionStartedAt = now;
-  overlayTransitionDurationMs = Math.max(70, Math.min(160, lastInferenceDurationMs * 0.5));
+  overlayTransitionDurationMs = Math.max(80, Math.min(140, Math.round(lastInferenceDurationMs * 0.16)));
 
   if (overlayFromKeypoints.length !== overlayTargetKeypoints.length) {
     overlayFromKeypoints = overlayTargetKeypoints.map((point) => ({ ...point }));
@@ -1237,7 +1237,7 @@ function startCaptureLoop() {
     if (!cameraActive.value) return;
     await captureFrame();
     if (!cameraActive.value) return;
-    const nextDelay = Math.max(45, Math.min(110, lastInferenceDurationMs * 0.28 + baseFrameIntervalMs));
+    const nextDelay = Math.max(70, Math.min(150, Math.round(lastInferenceDurationMs * 0.22 + baseFrameIntervalMs)));
     captureTimer = window.setTimeout(() => {
       void tick();
     }, nextDelay);
@@ -1280,7 +1280,6 @@ async function captureFrame() {
   }
 
   requestInFlight = true;
-  loading.value = true;
   error.value = "";
 
   const formData = new FormData();
@@ -1307,7 +1306,6 @@ async function captureFrame() {
       error.value = err?.message || "识别失败";
     }
   } finally {
-    loading.value = false;
     requestInFlight = false;
   }
 }

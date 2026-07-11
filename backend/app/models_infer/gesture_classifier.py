@@ -39,6 +39,8 @@ class GestureClassifier:
     DYNAMIC_COOLDOWN_FRAMES = 18
     NO_HAND_REARM_FRAMES = 3
     STATIC_STABLE_FRAMES = 3
+    _DYNAMIC_LABELS = {"wave", "swipe_left", "swipe_right", "index_circle", "idle"}
+    _STATIC_LABELS = {"open_palm", "fist", "point", "thumbs_up", "thumbs_down", "unknown"}
 
     _WRIST = 0
     _THUMB_TIP = 4
@@ -114,6 +116,12 @@ class GestureClassifier:
         dynamic_gesture = self.tracker.update(keypoints) if self.tracker else None
 
         if dynamic_gesture:
+            if static_gesture in {"open_palm", "fist", "thumbs_up", "thumbs_down", "unknown"}:
+                dynamic_gesture = None
+            elif dynamic_gesture in {"wave", "swipe_left", "swipe_right"} and static_gesture != "point":
+                dynamic_gesture = None
+
+        if dynamic_gesture:
             self._cooldown = self.DYNAMIC_COOLDOWN_FRAMES
             self._stable_gesture = None
             self._stable_count = 0
@@ -139,10 +147,11 @@ class GestureClassifier:
         if len(keypoints) != self._PER_HAND:
             return "unknown", 0.0
 
+        heuristic_result = self._classify_heuristic(keypoints)
         ml_result = self._classify_ml(keypoints)
-        if ml_result is not None:
-            return ml_result
-        return self._classify_heuristic(keypoints)
+        if ml_result is None:
+            return heuristic_result
+        return self._merge_static_predictions(heuristic_result, ml_result)
 
     def _load_ml_model(self) -> None:
         try:
@@ -159,12 +168,60 @@ class GestureClassifier:
             self._ml_model = bundle["model"]
             self._ml_scaler = bundle["scaler"]
             self._ml_labels = bundle["label_names"]
+            normalized_labels = {
+                _OWNER_GESTURE_ALIASES.get(str(label), str(label))
+                for label in self._ml_labels
+            }
+            if not {"open_palm", "point", "thumbs_down"}.issubset(normalized_labels):
+                logger.warning(
+                    "Owner gesture classifier labels are incomplete for the current feature set: %s. "
+                    "Static recognition will prefer heuristic decisions for unsupported gestures.",
+                    sorted(normalized_labels),
+                )
             logger.info("Loaded owner-gesture classifier model from %s", model_path)
         except Exception as exc:
             logger.warning("Failed to load owner-gesture classifier model, fallback to heuristics: %s", exc)
             self._ml_model = None
             self._ml_scaler = None
             self._ml_labels = None
+
+    def _merge_static_predictions(
+        self,
+        heuristic_result: tuple[str, float],
+        ml_result: tuple[str, float],
+    ) -> tuple[str, float]:
+        heuristic_gesture, heuristic_conf = heuristic_result
+        ml_gesture, ml_conf = ml_result
+
+        if ml_gesture in self._DYNAMIC_LABELS:
+            return heuristic_result
+        if ml_gesture not in self._STATIC_LABELS:
+            return heuristic_result
+
+        if heuristic_gesture == ml_gesture:
+            return ml_gesture, max(heuristic_conf, ml_conf)
+
+        if heuristic_gesture == "open_palm":
+            return heuristic_result
+        if heuristic_gesture == "point":
+            if ml_gesture == "thumbs_up" and ml_conf >= 0.92:
+                return ml_result
+            return heuristic_result
+        if heuristic_gesture == "thumbs_down":
+            return heuristic_result
+        if heuristic_gesture == "thumbs_up":
+            if ml_gesture == "thumbs_up":
+                return ml_gesture, max(heuristic_conf, ml_conf)
+            return heuristic_result
+        if heuristic_gesture == "fist":
+            if ml_gesture == "fist":
+                return ml_gesture, max(heuristic_conf, ml_conf)
+            if ml_gesture == "thumbs_up" and ml_conf >= 0.94:
+                return ml_result
+            return heuristic_result
+        if heuristic_gesture == "unknown":
+            return ml_result
+        return heuristic_result
 
     def _classify_ml(self, keypoints: list[dict]) -> tuple[str, float] | None:
         if self._ml_model is None or self._ml_scaler is None or self._ml_labels is None:
@@ -369,9 +426,24 @@ class HandGestureTracker:
         start_x = self.history[0][1]
         end_x = self.history[-1][1]
         displacement = end_x - start_x
-        if displacement > 0.06:
+        if abs(displacement) < 0.16:
+            return None
+
+        y_positions = [item[2] for item in self.history]
+        net_dy = y_positions[-1] - y_positions[0]
+        if abs(net_dy) > 0.12:
+            return None
+
+        x_deltas = [right[1] - left[1] for left, right in zip(self.history, self.history[1:])]
+        meaningful_deltas = [delta for delta in x_deltas if abs(delta) > 0.025]
+        if len(meaningful_deltas) < 2:
+            return None
+        if max(abs(delta) for delta in meaningful_deltas) < 0.06:
+            return None
+
+        if displacement > 0.16:
             return "swipe_right"
-        if displacement < -0.06:
+        if displacement < -0.16:
             return "swipe_left"
         return None
 
@@ -382,10 +454,13 @@ class HandGestureTracker:
         wrist_x = [item[1] for item in self.history]
         reversals = 0
         previous_direction = 0
+        x_span = max(wrist_x) - min(wrist_x)
+        if x_span < 0.16:
+            return None
 
         for index in range(5, len(wrist_x)):
             diff = wrist_x[index] - wrist_x[index - 5]
-            if abs(diff) < 0.012:
+            if abs(diff) < 0.03:
                 continue
             current_direction = 1 if diff > 0 else -1
             if previous_direction != 0 and current_direction != previous_direction:
