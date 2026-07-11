@@ -6,7 +6,7 @@
   python verify_owner_gesture.py --image test_hand.jpg
 
   # 2) 视频文件测试
-  python verify_owner_gesture.py --video test.mp4
+  python verify_owner_gesture.py --video test.avi
 
   # 3) RTSP 流测试（需先启动 stream_core.py 推流）
   python verify_owner_gesture.py --rtsp rtsp://127.0.0.1:8554/test

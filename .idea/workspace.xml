@@ -5,20 +5,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="d266786f-ee78-41ea-9080-d512dbeddab5" name="更改" comment="">
-      <change afterPath="$PROJECT_DIR$/backend/app/models_infer/dynamic_lstm.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/owner_gesture_dataset_features/features_dynamic.npz" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/scripts/collect_dynamic_data.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/scripts/diag_circle.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/scripts/extract_dynamic_features.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/scripts/train_dynamic_lstm.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/$count" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/test.avi" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/app/models_infer/gesture_classifier.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/models_infer/gesture_classifier.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/app/schemas/gesture.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/schemas/gesture.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/app/services/owner_gesture_service.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/services/owner_gesture_service.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/models/gesture_classifier_svm.joblib" beforeDir="false" afterPath="$PROJECT_DIR$/backend/models/gesture_classifier_svm.joblib" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/backend/requirements.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/owner_gesture_dataset_features/features.npz" beforeDir="false" afterPath="$PROJECT_DIR$/owner_gesture_dataset_features/features.npz" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/scripts/extract_features.py" beforeDir="false" afterPath="$PROJECT_DIR$/scripts/extract_features.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/verify_owner_gesture.py" beforeDir="false" afterPath="$PROJECT_DIR$/verify_owner_gesture.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -36,7 +25,7 @@
   <component name="Git.Settings">
     <option name="RECENT_BRANCH_BY_REPOSITORY">
       <map>
-        <entry key="$PROJECT_DIR$" value="pull-fxh" />
+        <entry key="$PROJECT_DIR$" value="liutianyue_A_Hagrid" />
       </map>
     </option>
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
@@ -66,12 +55,13 @@
     "Python.verify_owner_gesture.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "git-widget-placeholder": "liutianyue__A__Hagrid",
-    "last_opened_file_path": "D:/",
+    "last_opened_file_path": "D:/car-vision-agent-system",
     "settings.editor.selected.configurable": "preferences.pluginManager"
   }
 }]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
+      <recent name="D:\car-vision-agent-system" />
       <recent name="C:\Users\Lenovo\Desktop\car-vision-agent-system" />
       <recent name="C:\Users\Lenovo\Desktop\car-vision-agent-system\scripts" />
     </key>
@@ -80,7 +70,7 @@
       <recent name="C:\Users\Lenovo\Desktop\car-vision-agent-system\scripts" />
     </key>
   </component>
-  <component name="RunManager" selected="Python.dataset_test">
+  <component name="RunManager" selected="Python.police_local">
     <configuration name="dataset_test" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
       <module name="car-vision-agent-system" />
       <option name="ENV_FILES" value="" />
