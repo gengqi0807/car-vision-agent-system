@@ -1,16 +1,17 @@
 """
-run_recognition.py — 交警手势识别主程序
+recognize_camera.py — 摄像头实时交警手势识别
 
-使用 police/ 包（MediaPipe Pose + Hand + 状态机）进行：
-  - 人体骨架检测（面部关键点 + 身体骨骼 + 手部骨架连线）
-  - 8 种标准交警手势实时分类：停止/直行/左转弯/左待转/右转弯/变道/减速/靠边停车
-  - 画面叠加：骨架 + "动作开始"/"动作识别中"/识别结果/置信度
-  - 可选：集成 CTPGREngine（PyTorch pose_model.pt + lstm.pt RNN）做二次验证
+使用规则模型（MediaPipe Pose + Hand + 状态机）+ 深度学习模型（CTPGREngine）
+实时识别摄像头画面中的交警手势。
+
+- 规则模型：左上角展示（含状态机状态 + 双手区域 + 识别结果）
+- DL 模型：左下角展示（手势名 + 置信度）
+- 整体逻辑与视频识别（run_recognition.py）保持一致，区分仅在于摄像头实时输入
 
 Usage:
-    python run_recognition.py --source test.mp4
-    python run_recognition.py --source 0                  # 摄像头
-    python run_recognition.py --source rtsp://...         # RTSP 流
+    python recognize_camera.py
+    python recognize_camera.py --camera 1
+    python recognize_camera.py --camera 0 --no-dl
 """
 
 import os
@@ -49,14 +50,12 @@ except ImportError as e:
 
 
 def parse_args():
-    """解析命令行参数。"""
     parser = argparse.ArgumentParser(
-        description="交警手势识别系统 — 骨架可视化 + 8 种手势分类",
+        description="摄像头实时交警手势识别"
     )
     parser.add_argument(
-        "--source", "-s",
-        default="test.mp4",
-        help="视频源：本地文件路径、RTSP URL 或摄像头索引（默认: test.mp4）"
+        "--camera", "-c", type=int, default=0,
+        help="摄像头索引（默认: 0）"
     )
     parser.add_argument(
         "--pose-model",
@@ -67,10 +66,6 @@ def parse_args():
         "--hand-model",
         default=police_cfg.HAND_MODEL_PATH,
         help=f"MediaPipe Hand 模型路径（默认: {police_cfg.HAND_MODEL_PATH}）"
-    )
-    parser.add_argument(
-        "--no-mirror", action="store_true",
-        help="禁用摄像头镜像"
     )
     parser.add_argument(
         "--skip", type=int, default=police_cfg.SKIP_FRAMES,
@@ -86,7 +81,7 @@ def parse_args():
     )
     parser.add_argument(
         "--no-dl", action="store_true",
-        help="禁用 CTPGREngine 深度学习模型（仅使用规则模型）"
+        help="禁用深度学习模型（仅规则）"
     )
     parser.add_argument(
         "--dl-skip", type=int, default=3,
@@ -99,8 +94,6 @@ def main():
     args = parse_args()
 
     # 应用命令行覆盖
-    if args.no_mirror:
-        police_cfg.CAMERA_MIRRORED = False
     police_cfg.SKIP_FRAMES = args.skip
     police_cfg.INFER_SCALE = args.scale
 
@@ -109,7 +102,6 @@ def main():
     # ================================================================
     if not os.path.exists(args.pose_model):
         print(f"[ERROR] Pose 模型不存在 -> {args.pose_model}")
-        print("  请确认 backend/pose_landmarker_lite.task 文件存在")
         return
 
     print(f"[LOAD] Pose 模型: {args.pose_model}")
@@ -126,7 +118,7 @@ def main():
             print(f"[WARN] Hand 模型未找到 ({args.hand_model})，仅使用 Pose")
 
     # ================================================================
-    # 1.5 加载 CTPGREngine 深度学习模型（pose_model.pt + lstm.pt RNN）
+    # 2. 加载 CTPGREngine 深度学习模型
     # ================================================================
     dl_engine = None
     if _DL_AVAILABLE and not args.no_dl:
@@ -138,36 +130,31 @@ def main():
             import traceback
             print(f"[WARN] CTPGREngine 初始化失败: {e}")
             traceback.print_exc()
-            print("[WARN] 将仅使用规则模型，DL 模型不可用")
             dl_engine = None
     else:
-        print(f"[INFO] 深度学习模型未启用  (_DL_AVAILABLE={_DL_AVAILABLE}, no_dl={args.no_dl})")
+        print(f"[INFO] 深度学习模型未启用")
 
     # ================================================================
-    # 2. 打开视频源
+    # 3. 打开摄像头
     # ================================================================
-    source = args.source
-    if source.isdigit():
-        source = int(source)
-
-    cap = cv2.VideoCapture(source)
+    cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
-        print(f"[ERROR] 无法打开视频源 -> {source}")
+        print(f"[ERROR] 无法打开摄像头 -> 索引 {args.camera}")
         pose_detector.close()
         if hand_detector:
             hand_detector.close()
         return
 
-    fps_video = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_delay = 1.0 / (fps_video * 0.6) if fps_video > 0 else 1.0 / 15  # 播放速度为原始60%
-    print(f"[ OK ] 视频源已打开  SKIP={police_cfg.SKIP_FRAMES}  "
-          f"SCALE={police_cfg.INFER_SCALE:.2f}  "
-          f"视频FPS={fps_video:.0f}  总帧={total_frames}  播放延迟={frame_delay:.1f}ms")
+    fps_cam = cap.get(cv2.CAP_PROP_FPS)
+    if fps_cam <= 0:
+        fps_cam = 30
+    print(f"[ OK ] 摄像头已打开  index={args.camera}  "
+          f"FPS≈{fps_cam:.0f}  SKIP={police_cfg.SKIP_FRAMES}  "
+          f"SCALE={police_cfg.INFER_SCALE:.2f}")
     print("       按 'q' 键退出\n")
 
     # ================================================================
-    # 3. 初始化状态机 + 状态变量
+    # 4. 初始化状态机 + 状态变量
     # ================================================================
     state_machine = GestureStateMachine()
     frame_counter = 0
@@ -193,18 +180,17 @@ def main():
     dl_gesture = "loading..."
     dl_confidence = 0.0
     dl_counter = 0
-    dl_error_once = False  # DL 错误只打印一次
+    dl_error_once = False
 
-    # 显示缩放（视频窗口缩小）
-    DISPLAY_SCALE = 0.65  # 画面缩小到 65%
+    DISPLAY_SCALE = 0.7
 
     # ---- 主循环 ----
     while True:
-        t0 = time.time()  # 帧开始时间
+        t0 = time.time()
 
         ret, frame = cap.read()
         if not ret:
-            print("\n视频播放结束。")
+            print("\n摄像头读取失败，退出。")
             break
 
         frame_counter += 1
@@ -214,14 +200,14 @@ def main():
         now = time.time()
         elapsed = now - last_time
         if elapsed > 0:
-            fps = int(1.0 / elapsed)
+            fps = 30 if elapsed <= 0 else int(1.0 / elapsed)
         last_time = now
 
         global_frame += 1
         h, w = frame.shape[:2]
 
         # ============================================================
-        # 4. AI 推理（跳帧执行）
+        # 5. AI 推理（跳帧执行）
         # ============================================================
         if should_infer:
             pose_result = detect_pose(pose_detector, frame)
@@ -241,7 +227,7 @@ def main():
             else:
                 world_landmarks = last_world_landmarks
 
-            # ---- 绘制 Pose 骨架（33 个关键点 + 连线） ----
+            # ---- 绘制 Pose 骨架 ----
             draw_pose_landmarks(frame, landmarks, h, w)
 
             # ---- 提取像素关键点 ----
@@ -335,7 +321,7 @@ def main():
             left_palm_ori  = classify_palm_orientation(last_hand_left, body_right_2d, body_up_2d)
             right_palm_ori = classify_palm_orientation(last_hand_right, body_right_2d, body_up_2d)
 
-            # ---- 状态机更新（8 种交警手势分类） ----
+            # ---- 状态机更新 ----
             if feat is not None:
                 result = state_machine.update(
                     feat, left_palm_ori, right_palm_ori,
@@ -354,7 +340,7 @@ def main():
             last_hand_left = None
             last_hand_right = None
 
-        # ---- 深度学习模型推理（CTPGREngine: pose_model.pt + lstm.pt RNN） ----
+        # ---- 深度学习模型推理 ----
         if dl_engine is not None and should_infer and frame_counter % args.dl_skip == 0:
             dl_counter += 1
             dl_h, dl_w = 256, 256
@@ -369,8 +355,6 @@ def main():
                     dl_error_once = True
                 dl_gesture = "DL error"
                 dl_confidence = 0.0
-            if dl_counter % 30 == 0:
-                print(f"  [DL] 第{dl_counter}次推理 → {dl_gesture} ({dl_confidence:.0%})", end="\r")
 
         # ---- 非推理帧：绘制缓存骨架（防止闪烁） ----
         if not should_infer and last_landmarks is not None:
@@ -385,7 +369,7 @@ def main():
                 draw_wrist_marker(frame, last_landmarks, 16, h, w, side='R')
 
         # ============================================================
-        # 5. 画面文字叠加
+        # 6. 画面文字叠加
         # ============================================================
         # 结果展示计时器
         if result_display_timer > 0:
@@ -394,93 +378,129 @@ def main():
             display_result = None
             display_confidence = 0.0
 
-        status_y = 30
+        # ---- 顶部标题栏 ----
+        title_bar_h = 36
+        cv2.rectangle(frame, (0, 0), (w, title_bar_h), (30, 30, 30), -1)
+        cv2.putText(frame, "Camera Gesture Recognition",
+                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 2)
 
+        # ---- 左上角：规则模型结果 ----
+        rule_x, rule_y = 10, title_bar_h + 12
+        box_w, box_h = 280, 120
+
+        # 半透明背景
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (rule_x, rule_y), (rule_x + box_w, rule_y + box_h),
+                      (40, 40, 40), -1)
+        frame = cv2.addWeighted(overlay, 0.55, frame, 0.45, 0)
+
+        # 标题
+        cv2.putText(frame, "Rule Model", (rule_x + 10, rule_y + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+        line_y = rule_y + 40
+
+        # 状态
         if last_landmarks is None:
-            # 未检测到人体
-            frame = draw_chinese_text(frame, "未检测到人体",
-                                      (10, status_y), (0, 0, 255), 36)
-
+            status_text = "No person"
+            status_color = (0, 0, 255)
         elif state_machine.state == police_cfg.STATE_ACTIVE:
-            # 动作识别中（黄色）
-            frame = draw_chinese_text(frame, "动作识别中...",
-                                      (10, status_y), (0, 255, 255), 30)
-
+            status_text = "识别中..."
+            status_color = (0, 255, 255)
         elif state_machine.cooldown_counter > 0:
-            # 冷却中
-            frame = draw_chinese_text(
-                frame, f"冷却中 {state_machine.cooldown_counter}",
-                (10, status_y), (128, 128, 128), 28)
-
+            status_text = f"冷却 {state_machine.cooldown_counter}"
+            status_color = (128, 128, 128)
         elif display_result is not None:
-            # 刚完成的识别结果（绿色）
-            text = f"交警手势: {display_result}"
-            frame = draw_chinese_text(frame, text, (10, status_y), (0, 255, 0), 36)
-            if display_confidence > 0:
-                conf_text = f"置信度: {display_confidence:.0%}"
-                frame = draw_chinese_text(frame, conf_text, (10, 75),
-                                          (0, 200, 0), 22)
-
+            status_text = display_result
+            status_color = (0, 255, 0)
         else:
-            # 等待动作
-            frame = draw_chinese_text(frame, "等待动作...",
-                                      (10, status_y), (255, 255, 255), 30)
+            status_text = "等待动作"
+            status_color = (255, 255, 255)
 
-        # ---- 动作开始时文字提示 ----
+        frame = draw_chinese_text(frame, status_text,
+                                  (rule_x + 10, line_y), status_color, 22)
+        line_y += 24
+
+        # 置信度（规则模型）
+        if display_result is not None and display_confidence > 0:
+            cv2.putText(frame, f"{display_confidence:.0%}",
+                        (rule_x + 10, line_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 0), 2)
+        else:
+            cv2.putText(frame, "---",
+                        (rule_x + 10, line_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (128, 128, 128), 2)
+        line_y += 22
+
+        # 双手区域
+        if last_feat is not None:
+            left_region  = last_feat.get("left_region", "?")
+            right_region = last_feat.get("right_region", "?")
+            left_raise   = last_feat.get("left_raise", 0.0)
+            right_raise  = last_feat.get("right_raise", 0.0)
+        else:
+            left_region = right_region = "?"
+            left_raise = right_raise = 0.0
+
+        cv2.putText(frame, f"L: {left_region}  ({left_raise:+.2f})",
+                    (rule_x + 10, line_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 2)
+        line_y += 20
+        cv2.putText(frame, f"R: {right_region} ({right_raise:+.2f})",
+                    (rule_x + 10, line_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 100, 255), 2)
+
+        # ---- 左下角：深度学习模型结果 ----
+        if dl_engine is not None:
+            dl_x, dl_y = 10, h - 85
+            dl_box_w, dl_box_h = 280, 72
+
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (dl_x, dl_y), (dl_x + dl_box_w, dl_y + dl_box_h),
+                          (25, 25, 50), -1)
+            frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+
+            cv2.putText(frame, "DL Model", (dl_x + 10, dl_y + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
+            frame = draw_chinese_text(frame, dl_gesture,
+                                      (dl_x + 10, dl_y + 40), (255, 200, 0), 22)
+            cv2.putText(frame, f"{dl_confidence:.0%}",
+                        (dl_x + 10, dl_y + 62),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 160, 80), 2)
+        else:
+            dl_x, dl_y = 10, h - 60
+            cv2.putText(frame, "DL: N/A", (dl_x + 10, dl_y + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 2)
+
+        # ---- 右上角：信息 ----
+        info_x = w - 210
+        cv2.putText(frame, f"FPS: {fps}  Frame: {global_frame}",
+                    (info_x, title_bar_h + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 2)
+        cv2.putText(frame, f"State: {state_machine.state_name}",
+                    (info_x, title_bar_h + 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 2)
+        cv2.putText(frame, f"Cam: {args.camera}",
+                    (info_x, title_bar_h + 64),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 2)
+
+        # ---- 动作开始文字提示 ----
         if last_feat is not None and state_machine.state == police_cfg.STATE_ACTIVE:
             fc = state_machine.action_data.get("frame_count", 0) if state_machine.action_data else 0
             if fc == 1:
                 frame = draw_chinese_text(frame, "动作开始！",
-                                          (10, status_y + 45), (0, 255, 0), 28)
-
-        # ---- FPS 和帧号 ----
-        cv2.putText(frame, f"FPS: {fps}  Frame: {global_frame}",
-                    (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-
-        # ---- 右上角：状态 + 双手高度区域 ----
-        if last_feat is not None:
-            rxx = w - 220
-            cv2.putText(frame, f"State: {state_machine.state_name}",
-                        (rxx, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-            left_region = last_feat.get("left_region", "?")
-            right_region = last_feat.get("right_region", "?")
-            cv2.putText(frame, f"L: {left_region}",
-                        (rxx, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 2)
-            cv2.putText(frame, f"R: {right_region}",
-                        (rxx, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 100, 255), 2)
-
-        # ---- 底部：深度学习模型结果（CTPGREngine: pose_model.pt + lstm.pt RNN） ----
-        if dl_engine is not None:
-            dl_bottom_y = h - 45
-            # 分隔线
-            cv2.line(frame, (10, dl_bottom_y - 5), (w - 10, dl_bottom_y - 5),
-                     (80, 80, 80), 1)
-            cv2.putText(frame, "DL:", (10, dl_bottom_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 2)
-            # 手势名
-            frame = draw_chinese_text(frame, dl_gesture,
-                                      (50, dl_bottom_y - 8), (255, 200, 0), 24)
-            # 置信度
-            cv2.putText(frame, f"{dl_confidence:.0%}",
-                        (50, dl_bottom_y + 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 160, 80), 2)
+                                          (10, title_bar_h + 140), (0, 255, 0), 28)
 
         # ---- 显示 ----
         display_frame = cv2.resize(frame, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE)
-        cv2.imshow("Police Gesture Recognition", display_frame)
+        cv2.imshow("Camera Gesture Recognition", display_frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             print("\n用户按下 'q' 键，退出。")
             break
 
-        # ---- 帧率控制（限制播放速度） ----
-        elapsed_frame = time.time() - t0
-        sleep_ms = int((frame_delay - elapsed_frame) * 1000)
-        if sleep_ms > 1:
-            cv2.waitKey(sleep_ms)
-
     # ================================================================
-    # 6. 清理资源
+    # 7. 清理资源
     # ================================================================
     cap.release()
     cv2.destroyAllWindows()
