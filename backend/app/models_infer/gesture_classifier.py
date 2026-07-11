@@ -9,8 +9,8 @@
   - pointing  : 仅食指伸展 → 用于触发动态追踪
 
 动态手势（通过 HandGestureTracker 时序状态机）:
-  - circle_cw : 食指尖顺时针画圈 → 音量+
-  - circle_ccw: 食指尖逆时针画圈 → 音量-
+  - swipe_up   : 手腕向上滑动 → 音量+
+  - swipe_down : 手腕向下滑动 → 音量-
   - swipe_left : 手腕向左滑动 → 上一个功能
   - swipe_right: 手腕向右滑动 → 下一个功能
   - wave       : 手腕往复摆动 → 返回主页
@@ -31,7 +31,10 @@ logger = logging.getLogger(__name__)
 class GestureClassifier:
     """手势分类器，支持 domain="owner" / "police" 两种模式。
 
-    owner 模式下优先使用训练的 SVM 模型，模型不存在时回退到启发式规则。
+    owner 模式下：
+      - 静态手势: 训练好的 SVM 模型，不存在时回退到启发式规则
+      - 动态手势: 训练好的 BiLSTM 模型，不存在时回退到 HandGestureTracker 启发式
+      - meta-router: 融合静态/动态分支，选择置信度更高的输出
     """
 
     # ----------------------------------------------------------------
@@ -40,6 +43,12 @@ class GestureClassifier:
     DYNAMIC_COOLDOWN_FRAMES: int = 18  # 动态触发后抑制静态的帧数 (~0.6s @30fps)
     NO_HAND_REARM_FRAMES: int = 3      # 手消失多少帧算「手势边界」，重新武装
     STATIC_STABLE_FRAMES: int = 3      # 静态手势需连续稳定几帧才输出
+
+    # Meta-router: 动态 LSTM 置信度需比静态高多少才切换为动态输出
+    DYNAMIC_CONF_MARGIN: float = 0.05
+
+    # wave（主页）需连续确认的帧数，防误触发
+    WAVE_STABLE_FRAMES: int = 5
 
     def __init__(self, domain: str = "owner"):
         self.domain = domain
@@ -50,15 +59,20 @@ class GestureClassifier:
         self._ml_scaler = None
         self._ml_labels = None
 
+        # 动态 LSTM 分类器（仅在 owner 模式下加载）
+        self._dynamic_lstm = None
+
         # 时序保护状态
         self._cooldown: int = 0
         self._no_hand: int = 0
         self._stable_gesture: str | None = None
         self._stable_count: int = 0
+        self._wave_count: int = 0            # wave 连续确认计数
 
-        # 尝试加载训练好的 SVM 模型
+        # 尝试加载训练好的 SVM 模型 + 动态 LSTM 模型
         if domain == "owner":
             self._load_ml_model()
+            self._load_dynamic_lstm()
 
     # ----------------------------------------------------------------
     # ML 模型加载与推理
@@ -82,6 +96,17 @@ class GestureClassifier:
         except Exception as e:
             logger.warning("加载 SVM 模型失败，回退到启发式规则: %s", e)
             self._ml_model = None
+
+    def _load_dynamic_lstm(self) -> None:
+        """尝试加载动态手势 LSTM 模型。加载失败不影响静态分类。"""
+        try:
+            from app.models_infer.dynamic_lstm import DynamicLSTMClassifier
+            self._dynamic_lstm = DynamicLSTMClassifier()
+            if not self._dynamic_lstm.is_loaded:
+                logger.info("动态 LSTM 模型未加载，动态手势回退到启发式规则")
+        except Exception as e:
+            logger.warning("初始化动态 LSTM 失败: %s", e)
+            self._dynamic_lstm = None
 
     def _classify_ml(self, keypoints: list[dict]) -> tuple[str, float] | None:
         """使用 SVM 模型预测手势。失败返回 None，由调用方回退到启发式规则。"""
@@ -134,23 +159,28 @@ class GestureClassifier:
         return self._classify_heuristic(keypoints)
 
     # ----------------------------------------------------------------
-    # 统一入口：静态 + 动态 + 时序去抖
+    # 统一入口：静态 SVM + 动态 LSTM/Tracker + meta-router + 时序去抖
     # ----------------------------------------------------------------
 
     def classify_frame(self, keypoints: list[dict] | None) -> tuple[str, float]:
         """
-        统一手势分类入口，融合静态识别、动态追踪、时序去抖。
+        统一手势分类入口，融合静态识别、动态追踪、meta-router、时序去抖。
 
-        传入 None 表示当前帧无手。
-        - 动态手势触发后进入冷却期，抑制静态输出返回 idle
-        - 手消失 ≥ NO_HAND_REARM_FRAMES 帧 → 解除冷却（手势边界）
-        - 静态手势需连续稳定 STATIC_STABLE_FRAMES 帧才输出
+        路由逻辑:
+          1. 无手 → 触发 LSTM 边界分段判定（对完整轨迹一次分类）
+                 → 重置 tracker/LSTM 缓冲
+                 → 手消失 ≥ REARM 帧 → 解除冷却
+          2. 有手 → 静态 SVM + 动态 LSTM 滑动窗口打分
+                 → meta-router: 动态置信度 > 静态 + margin → 输出动态
+                 → 动态触发后冷却期内抑制静态
+                 → 静态需连续稳定 K 帧才输出
 
         Returns:
             (gesture_name, confidence)
         """
-        # ---- 无手：重置 tracker + 计数 ----
+        # ---- 无手：边界分段 + 重置 ----
         if keypoints is None:
+            boundary_result = self._handle_boundary()
             if self.tracker:
                 self.tracker.reset()
             self._no_hand += 1
@@ -158,6 +188,11 @@ class GestureClassifier:
             self._stable_count = 0
             if self._no_hand >= self.NO_HAND_REARM_FRAMES:
                 self._cooldown = 0  # 手势边界 → 解除冷却
+
+            # 边界分段有有效动态结果 → 立即输出
+            if boundary_result[0] != "unknown":
+                self._cooldown = self.DYNAMIC_COOLDOWN_FRAMES
+                return boundary_result
             return "unknown", 0.0
 
         if len(keypoints) != 21:
@@ -165,25 +200,67 @@ class GestureClassifier:
 
         self._no_hand = 0
 
-        # ---- 静态 + 动态推理 ----
+        # ---- 静态 SVM ----
         static_gesture, static_conf = self.classify_static(keypoints)
-        dynamic = self.tracker.update(keypoints) if self.tracker else None
 
-        # 1) 动态触发：立即输出 + 进入冷却
-        if dynamic:
-            self._cooldown = self.DYNAMIC_COOLDOWN_FRAMES
-            self._stable_gesture = None
-            self._stable_count = 0
-            return dynamic, 0.85
+        # ---- 动态分支 ----
+        dynamic_gesture: str | None = None
+        dynamic_conf: float = 0.0
 
-        # 2) 冷却期：抑制所有静态输出
+        # 优先 LSTM（如果已加载）
+        lstm_result = self._classify_dynamic_lstm(keypoints)
+        if lstm_result is not None:
+            dynamic_gesture, dynamic_conf = lstm_result
+        elif self.tracker:
+            # 回退到启发式状态机
+            heuristic = self.tracker.update(keypoints)
+            if heuristic:
+                dynamic_gesture, dynamic_conf = heuristic, 0.85
+
+        # ---- meta-router ----
+        wave_confirmed_this_frame = False
+
+        if dynamic_gesture and dynamic_gesture != "unknown":
+            should_fire_dynamic = False
+            if static_gesture == "unknown" or static_gesture == "pointing":
+                # 静态不可靠时，动态直接触发
+                should_fire_dynamic = True
+            elif dynamic_conf > static_conf + self.DYNAMIC_CONF_MARGIN:
+                # 动态置信度显著高于静态 → 动态优先
+                should_fire_dynamic = True
+
+            if should_fire_dynamic:
+                # wave（主页）需要连续5帧确认才输出，防误触发
+                if dynamic_gesture == "wave":
+                    self._wave_count += 1
+                    wave_confirmed_this_frame = True
+                    if self._wave_count >= self.WAVE_STABLE_FRAMES:
+                        self._cooldown = self.DYNAMIC_COOLDOWN_FRAMES
+                        self._stable_gesture = None
+                        self._stable_count = 0
+                        self._wave_count = 0
+                        return dynamic_gesture, round(dynamic_conf, 4)
+                    return "idle", 0.0
+
+                # 其他动态手势直接触发
+                self._cooldown = self.DYNAMIC_COOLDOWN_FRAMES
+                self._stable_gesture = None
+                self._stable_count = 0
+                self._wave_count = 0
+                return dynamic_gesture, round(dynamic_conf, 4)
+
+        # 本帧未确认 wave → 重置连续计数（中断则从头来）
+        if not wave_confirmed_this_frame:
+            self._wave_count = 0
+
+        # ---- 冷却期 ----
         if self._cooldown > 0:
             self._cooldown -= 1
             self._stable_gesture = None
             self._stable_count = 0
             return "idle", 0.0
 
-        # 3) 冷却结束：静态需连续稳定 K 帧才输出
+        # ---- 静态稳定投票 ----
         if static_gesture == self._stable_gesture:
             self._stable_count += 1
         else:
@@ -191,9 +268,51 @@ class GestureClassifier:
             self._stable_count = 1
 
         if self._stable_count >= self.STATIC_STABLE_FRAMES:
-            return static_gesture, static_conf
+            return static_gesture, round(static_conf, 4)
 
         return "idle", 0.0
+
+    # ----------------------------------------------------------------
+    # 动态 LSTM 推理 + 边界分段
+    # ----------------------------------------------------------------
+
+    def _classify_dynamic_lstm(self, keypoints: list[dict]) -> tuple[str, float] | None:
+        """使用 LSTM 滑动窗口对当前帧打分。返回 (gesture, conf) 或 None。"""
+        if self._dynamic_lstm is None or not self._dynamic_lstm.is_loaded:
+            return None
+        try:
+            gesture, conf = self._dynamic_lstm.classify(keypoints, is_boundary=False)
+            if gesture == "unknown":
+                return None
+            return gesture, conf
+        except Exception as e:
+            logger.debug("动态 LSTM 推理异常: %s", e)
+            return None
+
+    def _handle_boundary(self) -> tuple[str, float]:
+        """
+        手消失时触发边界分段：对累积的完整轨迹做一次 LSTM 最终判定。
+
+        Returns:
+            (gesture, confidence) — 有效动态手势或 unknown
+        """
+        if self._dynamic_lstm is None or not self._dynamic_lstm.is_loaded:
+            return "unknown", 0.0
+        try:
+            trajectory = self._dynamic_lstm.get_trajectory()
+            min_len = self._dynamic_lstm.MIN_SEQUENCE_LENGTH
+            if trajectory.shape[0] < min_len:
+                self._dynamic_lstm.reset_trajectory()
+                return "unknown", 0.0
+
+            result = self._dynamic_lstm.classify_sequence(trajectory)
+            self._dynamic_lstm.reset_trajectory()
+            return result
+        except Exception as e:
+            logger.debug("边界分段判定异常: %s", e)
+            if self._dynamic_lstm:
+                self._dynamic_lstm.reset_trajectory()
+            return "unknown", 0.0
 
     def _classify_heuristic(self, keypoints: list[dict]) -> tuple[str, float]:
 
@@ -286,8 +405,8 @@ class HandGestureTracker:
     追踪手部运动轨迹，识别动态手势。
 
     三种动态手势:
-      - 画圈 (circle_cw / circle_ccw): 食指尖累积转角 ≥ 300° 且轨道半径稳定
-      - 滑动 (swipe_left / swipe_right): 手腕 x 方向位移超阈值
+      - 垂直滑动 (swipe_up / swipe_down): 手腕 y 方向位移超阈值
+      - 水平滑动 (swipe_left / swipe_right): 手腕 x 方向位移超阈值
       - 挥手 (wave): 手腕 x 方向往复反转 ≥ 2 次
 
     每帧调用 update()，识别成功后自动 reset。
@@ -307,7 +426,7 @@ class HandGestureTracker:
         """
         输入 21 关键点，返回识别的动态手势名称或 None。
 
-        手势优先级: 挥手 > 画圈 > 滑动
+        手势优先级: 挥手 > 垂直滑动 > 水平滑动
         """
         if len(keypoints) != 21:
             return None
@@ -334,13 +453,13 @@ class HandGestureTracker:
             self.reset()
             return wave
 
-        # 画圈
-        circle = self._detect_circle()
-        if circle:
+        # 垂直滑动 (swipe_up / swipe_down)
+        vertical_swipe = self._detect_swipe_vertical()
+        if vertical_swipe:
             self.reset()
-            return circle
+            return vertical_swipe
 
-        # 滑动
+        # 水平滑动 (swipe_left / swipe_right)
         swipe = self._detect_swipe()
         if swipe:
             self.reset()
@@ -349,44 +468,28 @@ class HandGestureTracker:
         return None
 
     # ------------------------------------------------------------
-    # 画圈检测
+    # 垂直滑动检测 (swipe_up / swipe_down)
     # ------------------------------------------------------------
 
-    def _detect_circle(self) -> str | None:
-        if len(self.history) < 15:
+    def _detect_swipe_vertical(self) -> str | None:
+        if len(self.history) < 8:
             return None
 
-        points = [(h[3], h[4]) for h in self.history[-30:]]  # (tip_x, tip_y)
+        start_y = self.history[0][2]    # wrist_y
+        end_y = self.history[-1][2]
+        displacement = end_y - start_y  # 正=向下, 负=向上
 
-        cx = sum(p[0] for p in points) / len(points)
-        cy = sum(p[1] for p in points) / len(points)
+        threshold = 0.06  # 归一化坐标阈值
 
-        # 累积转角
-        total_angle = 0.0
-        for i in range(1, len(points)):
-            a1 = math.atan2(points[i - 1][1] - cy, points[i - 1][0] - cx)
-            a2 = math.atan2(points[i][1] - cy, points[i][0] - cx)
-            d = a2 - a1
-            while d > math.pi:
-                d -= 2 * math.pi
-            while d < -math.pi:
-                d += 2 * math.pi
-            total_angle += d
-
-        # 半径稳定性
-        radii = [math.hypot(p[0] - cx, p[1] - cy) for p in points]
-        mean_r = sum(radii) / len(radii)
-        if mean_r < 0.015:  # 轨道太小不可靠
-            return None
-        max_dev = max(abs(r - mean_r) for r in radii) / mean_r
-
-        if abs(total_angle) >= math.radians(300) and max_dev < 0.55:
-            return "circle_cw" if total_angle > 0 else "circle_ccw"
+        if displacement < -threshold:
+            return "swipe_up"
+        elif displacement > threshold:
+            return "swipe_down"
 
         return None
 
     # ------------------------------------------------------------
-    # 滑动检测
+    # 水平滑动检测 (swipe_left / swipe_right)
     # ------------------------------------------------------------
 
     def _detect_swipe(self) -> str | None:
