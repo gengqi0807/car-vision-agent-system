@@ -84,7 +84,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    config.CAMERA_MIRRORED = not args.no_mirror
+    if args.no_mirror:
+        config.CAMERA_MIRRORED = False
     config.SKIP_FRAMES = args.skip
 
     # ---- 检查模型 ----

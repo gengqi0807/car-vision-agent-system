@@ -89,7 +89,8 @@ def main():
     args = parse_args()
 
     # 应用命令行覆盖
-    config.CAMERA_MIRRORED = not args.no_mirror
+    if args.no_mirror:
+        config.CAMERA_MIRRORED = False
     config.SKIP_FRAMES = args.skip
     config.INFER_SCALE = args.scale
 
