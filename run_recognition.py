@@ -355,9 +355,9 @@ def main():
             last_hand_right = None
 
         # ---- 深度学习模型推理（CTPGREngine: pose_model.pt + lstm.pt RNN） ----
-        if dl_engine is not None and should_infer and frame_counter % args.dl_skip == 0:
+        if dl_engine is not None and frame_counter % args.dl_skip == 0:
             dl_counter += 1
-            dl_h, dl_w = 256, 256
+            dl_h, dl_w = 512, 512  # 与训练时 RESIZE_SIZE 一致
             dl_frame = cv2.resize(frame, (dl_w, dl_h))
             try:
                 dl_result = dl_engine.predict_frame(dl_frame)
@@ -449,21 +449,34 @@ def main():
             cv2.putText(frame, f"R: {right_region}",
                         (rxx, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 100, 255), 2)
 
-        # ---- 底部：深度学习模型结果（CTPGREngine: pose_model.pt + lstm.pt RNN） ----
+        # ---- 右下角：深度学习模型结果（CTPGREngine: pose_model.pt + lstm.pt RNN） ----
         if dl_engine is not None:
-            dl_bottom_y = h - 45
-            # 分隔线
-            cv2.line(frame, (10, dl_bottom_y - 5), (w - 10, dl_bottom_y - 5),
-                     (80, 80, 80), 1)
-            cv2.putText(frame, "DL:", (10, dl_bottom_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 2)
-            # 手势名
+            # 面板尺寸与位置 — 右下角
+            panel_w, panel_h = 260, 80
+            panel_x, panel_y = w - panel_w - 15, h - panel_h - 15
+
+            # 半透明背景
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (panel_x, panel_y),
+                          (panel_x + panel_w, panel_y + panel_h), (20, 20, 50), -1)
+            cv2.rectangle(overlay, (panel_x, panel_y),
+                          (panel_x + panel_w, panel_y + panel_h), (0, 200, 255), 2)
+            frame = cv2.addWeighted(overlay, 0.65, frame, 0.35, 0)
+
+            # 标题
+            cv2.putText(frame, "-- DL Model --",
+                        (panel_x + 10, panel_y + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+            # 手势中文名（亮橙色，大号）
             frame = draw_chinese_text(frame, dl_gesture,
-                                      (50, dl_bottom_y - 8), (255, 200, 0), 24)
-            # 置信度
-            cv2.putText(frame, f"{dl_confidence:.0%}",
-                        (50, dl_bottom_y + 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 160, 80), 2)
+                                      (panel_x + 10, panel_y + 32),
+                                      (0, 215, 255), 28)
+
+            # 置信度（白色，加粗）
+            cv2.putText(frame, f"conf: {dl_confidence:.1%}",
+                        (panel_x + 10, panel_y + 68),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
         # ---- 显示 ----
         display_frame = cv2.resize(frame, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE)
