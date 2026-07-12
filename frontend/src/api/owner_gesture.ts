@@ -25,6 +25,7 @@ export interface OwnerControlPanelState {
 
 export interface OwnerGestureFrameResult {
   gesture: string;
+  action: string | null;
   confidence: number;
   keypoints: OwnerGestureKeypoint[];
   annotated_image: string | null;

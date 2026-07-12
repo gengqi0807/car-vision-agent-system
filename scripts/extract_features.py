@@ -24,18 +24,15 @@ from app.models_infer.mediapipe_hands import MediaPipeHands
 # ----------------------------------------------------------------
 # 标签映射：子目录名 → 手势名 → 数字标签
 # ----------------------------------------------------------------
+# 仅静态手势（图片/视频逐帧 → 单帧 63 维 SVM 训练）
+# 动态手势（circle_cw/ccw, swipe_left/right, wave）由 extract_dynamic_features.py 独立处理
 LABEL_MAP = {
     "call":        "thumb_up",     # 0
-    "wave":        "wave",         # 1
-    "fist":        "fist",         # 2
+    "fist":        "fist",         # 1
+    "palm":        "palm",         # 2
     # 后续扩充：
-    # "palm":       "palm",        # 3
-    # "thumb_down": "thumb_down",  # 4
-    # "pointing":   "pointing",    # 5
-    # "circle_cw":  "circle_cw",   # 6
-    # "circle_ccw": "circle_ccw",  # 7
-    # "swipe_left": "swipe_left",  # 8
-    # "swipe_right":"swipe_right", # 9
+    # "thumb_down": "thumb_down",  # 3
+    # "pointing":   "pointing",    # 4
 }
 
 FOLDER_TO_INT = {folder: i for i, folder in enumerate(LABEL_MAP.keys())}

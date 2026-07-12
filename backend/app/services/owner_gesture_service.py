@@ -5,6 +5,7 @@ import base64
 from dataclasses import dataclass, field
 import logging
 import math
+from pathlib import Path
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,17 @@ from app.schemas.gesture import (
 from app.services.alert_service import AlertService
 from app.services.monitor_service import MonitorService
 
+try:
+    from police.visualization import draw_chinese_text
+except ModuleNotFoundError:
+    import sys
+
+    project_root = Path(__file__).resolve().parents[3]
+    project_root_str = str(project_root)
+    if project_root_str not in sys.path:
+        sys.path.insert(0, project_root_str)
+    from police.visualization import draw_chinese_text
+
 if TYPE_CHECKING:
     from app.models_infer.gesture_classifier import GestureClassifier
     from app.models_infer.mediapipe_hands import MediaPipeHands
@@ -48,64 +60,100 @@ HAND_CONNECTIONS: tuple[tuple[int, int], ...] = (
 
 GESTURE_ACTION_MAP: dict[str, str] = {
     "open_palm": "wake",
+    "palm": "wake",
     "fist": "confirm",
-    "index_circle": "volume_adjust",
+    "index_circle": "idle",
+    "circle_cw": "volume_down",
+    "circle_ccw": "volume_up",
     "swipe_left": "prev_func",
     "swipe_right": "next_func",
     "thumbs_up": "call_answer",
+    "thumb_up": "call_answer",
     "thumbs_down": "call_hangup",
+    "thumb_down": "call_hangup",
     "wave": "home",
     "point": "idle",
+    "pointing": "idle",
     "idle": "idle",
     "unknown": "idle",
     "未检测到手部": "idle",
 }
 
 GESTURE_DISPLAY_MAP: dict[str, str] = {
-    "open_palm": "OPEN PALM",
-    "fist": "FIST",
-    "point": "POINT",
-    "index_circle": "INDEX CIRCLE",
-    "swipe_left": "SWIPE LEFT",
-    "swipe_right": "SWIPE RIGHT",
-    "thumbs_up": "THUMBS UP",
-    "thumbs_down": "THUMBS DOWN",
-    "wave": "WAVE",
-    "idle": "IDLE",
-    "unknown": "UNKNOWN",
-    "未检测到手部": "NO HAND",
+    "open_palm": "张开手掌",
+    "palm": "张开手掌",
+    "fist": "握拳",
+    "point": "待机",
+    "pointing": "待机",
+    "index_circle": "单指画圈",
+    "circle_cw": "顺时针画圈",
+    "circle_ccw": "逆时针画圈",
+    "swipe_left": "向左滑动",
+    "swipe_right": "向右滑动",
+    "thumbs_up": "拇指向上",
+    "thumb_up": "拇指向上",
+    "thumbs_down": "拇指向下",
+    "thumb_down": "拇指向下",
+    "wave": "挥手",
+    "idle": "待机",
+    "unknown": "未识别",
+    "未检测到手部": "未检测到手部",
 }
 
 COMMAND_DISPLAY_MAP: dict[str, str] = {
-    "WakeSystem": "WAKE SYSTEM",
-    "ConfirmAction": "CONFIRM",
-    "AdjustVolume": "ADJUST VOLUME",
-    "SwitchPrevFeature": "PREV FEATURE",
-    "SwitchNextFeature": "NEXT FEATURE",
-    "AnswerCall": "ANSWER CALL",
-    "HangUpCall": "HANG UP",
-    "ReturnHome": "RETURN HOME",
+    "WakeSystem": "系统唤醒",
+    "ConfirmAction": "确认执行",
+    "AdjustVolume": "音量调节",
+    "AdjustVolumeUp": "音量升高",
+    "AdjustVolumeDown": "音量降低",
+    "SwitchPrevFeature": "切换上一个功能",
+    "SwitchNextFeature": "切换下一个功能",
+    "AnswerCall": "接听电话",
+    "HangUpCall": "挂断电话",
+    "ReturnHome": "返回主页",
+}
+
+GESTURE_ACTION_DISPLAY_MAP: dict[str, str] = {
+    "wake": "唤醒",
+    "confirm": "确认",
+    "volume_adjust": "音量调节",
+    "volume_up": "音量增加",
+    "volume_down": "音量降低",
+    "prev_func": "切换上一个功能",
+    "next_func": "切换下一个功能",
+    "call_answer": "接听",
+    "call_hangup": "挂断",
+    "home": "返回主页",
+    "idle": "等待动作",
 }
 
 GESTURE_LOG_LABEL_MAP: dict[str, str] = {
     "open_palm": "张开手掌",
+    "palm": "张开手掌",
     "fist": "握拳",
-    "point": "指向",
+    "point": "待机",
+    "pointing": "待机",
     "index_circle": "画圈",
+    "circle_cw": "顺时针画圈",
+    "circle_ccw": "逆时针画圈",
     "swipe_left": "向左挥动",
     "swipe_right": "向右挥动",
     "thumbs_up": "竖起大拇指",
+    "thumb_up": "竖起大拇指",
     "thumbs_down": "倒拇指",
+    "thumb_down": "倒拇指",
     "wave": "挥手",
     "idle": "待机",
     "unknown": "未知",
-    "鏈娴嬪埌鎵嬮儴": "未检测到手部",
+    "未检测到手部": "未检测到手部",
 }
 
 COMMAND_LOG_LABEL_MAP: dict[str, str] = {
     "WakeSystem": "唤醒系统",
     "ConfirmAction": "确认操作",
     "AdjustVolume": "调节音量",
+    "AdjustVolumeUp": "提高音量",
+    "AdjustVolumeDown": "降低音量",
     "SwitchPrevFeature": "切换上一个功能",
     "SwitchNextFeature": "切换下一个功能",
     "AnswerCall": "接听电话",
@@ -138,7 +186,7 @@ class OwnerGestureService:
     _classifier: Optional["GestureClassifier"] = None
     _stream_classifier: Optional["GestureClassifier"] = None
     _max_inference_edge = 640
-    _max_annotated_edge = 420
+    _max_annotated_edge = 1024
     _hold_frame_count = 2
     _trigger_cooldown = timedelta(seconds=2)
     _idle_behavior_interval = timedelta(seconds=30)
@@ -174,6 +222,7 @@ class OwnerGestureService:
             last_command_at=None,
             updated_at=None,
         )
+        self._camera_runtime_ready = False
 
     @classmethod
     def instance(cls) -> "OwnerGestureService":
@@ -257,12 +306,20 @@ class OwnerGestureService:
             await self._capture_error(filename, "owner_gesture_decode_error", "无法解析图像字节数据。")
             raise ValueError(f"无法解析图像文件：{filename}")
 
-        frame = self._prepare_frame_for_inference(frame)
+        original_frame = frame
+        if input_mode == "camera":
+            frame = self._prepare_frame_for_inference(frame)
         logger.info("Processing owner gesture frame '%s' (%dx%d)", filename, frame.shape[1], frame.shape[0])
-        infer_result = self.hands.infer(frame)
 
-        raw_kps = infer_result["keypoints"]
-        num_hands = infer_result.get("num_hands_detected", 0)
+        if input_mode == "camera":
+            hands = self._infer_camera_hands(frame)
+            raw_kps = [point for hand in hands for point in hand]
+            num_hands = len(hands)
+        else:
+            infer_result = self.hands.infer(original_frame)
+            raw_kps = infer_result["keypoints"]
+            num_hands = infer_result.get("num_hands_detected", 0)
+            hands = self._group_hands(raw_kps)
 
         active_session_id = session_id or uuid4().hex[:16]
         runtime_session: RuntimeGestureSession | None = None
@@ -272,24 +329,31 @@ class OwnerGestureService:
         else:
             recent_records = self._recent_session_records(db, user_id=user_id, session_id=active_session_id)
         previous_record = recent_records[0] if recent_records else None
-        hands = self._group_hands(raw_kps)
-        primary_hand, image_gesture, image_confidence = self._select_primary_hand(
-            hands,
-            input_mode=input_mode,
-        )
-        if image_gesture is not None and image_confidence is not None:
-            gesture_label, cls_conf = image_gesture, image_confidence
-        elif input_mode == "camera":
-            gesture_label, cls_conf = self.stream_classifier.classify_frame(primary_hand if primary_hand else None)
+        if input_mode == "image":
+            primary_hand = hands[0] if hands else []
+            image_gesture = None
+            image_confidence = None
         else:
-            gesture_label, cls_conf = self._classify_upload_gesture(
+            primary_hand, image_gesture, image_confidence = self._select_primary_hand(
+                hands,
+                input_mode=input_mode,
+            )
+
+        if input_mode == "camera":
+            raw_gesture_label, cls_conf = self.stream_classifier.classify_frame(primary_hand if primary_hand else None)
+        elif image_gesture is not None and image_confidence is not None:
+            raw_gesture_label, cls_conf = image_gesture, image_confidence
+        else:
+            raw_gesture_label, cls_conf = self._classify_upload_gesture(
                 raw_keypoints=primary_hand,
                 num_hands=num_hands,
                 recent_records=recent_records,
                 input_mode=input_mode,
             )
 
-        control_command, _ = self._map_gesture_to_command(gesture_label)
+        control_command, _ = self._map_gesture_to_command(raw_gesture_label)
+        action = GESTURE_ACTION_MAP.get(raw_gesture_label, "idle")
+        gesture_label = self._normalize_public_gesture(raw_gesture_label)
         triggered = self._should_trigger(
             gesture=gesture_label,
             control_command=control_command,
@@ -297,19 +361,16 @@ class OwnerGestureService:
             input_mode=input_mode,
         )
         processing_time_ms = int((perf_counter() - started_at) * 1000)
-        if input_mode == "image":
-            display_hands = [primary_hand] if primary_hand else hands
-            annotated_image = self._build_annotated_image(
-                frame,
-                hands=display_hands,
-                gesture=gesture_label,
-                confidence=cls_conf,
-                control_command=control_command if triggered else None,
-            )
-        else:
-            annotated_image = None
+        display_hands = [primary_hand] if primary_hand else hands
+        annotated_image = self._build_annotated_image(
+            original_frame if input_mode == "image" else frame,
+            hands=display_hands,
+            gesture=gesture_label,
+            confidence=cls_conf,
+            control_command=control_command if triggered else None,
+        )
 
-        response_keypoints_source = primary_hand if input_mode == "image" and primary_hand else raw_kps
+        response_keypoints_source = primary_hand if primary_hand else raw_kps
         keypoints = [
             Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0))
             for kp in response_keypoints_source
@@ -397,6 +458,7 @@ class OwnerGestureService:
 
         return GestureFrameResult(
             gesture=gesture_label,
+            action=action,
             confidence=round(cls_conf, 4),
             keypoints=keypoints,
             annotated_image=annotated_image,
@@ -488,6 +550,13 @@ class OwnerGestureService:
         )
         _ = self.stream_classifier
 
+    def _infer_camera_hands(self, frame: np.ndarray) -> list[list[dict]]:
+        if not self._camera_runtime_ready:
+            self._camera_runtime_ready = True
+
+        infer_result = self.hands.infer(frame)
+        return self._group_hands(infer_result["keypoints"])
+
     def _stream_loop_worker(self, source: str, fps: int) -> None:
         from app.models_infer.mediapipe_hands import MediaPipeHands
 
@@ -516,11 +585,11 @@ class OwnerGestureService:
                 try:
                     prepared = self._prepare_frame_for_inference(frame_bgr)
                     hands = MediaPipeHands.infer_video(prepared)
-                    primary_hand = hands[0] if hands else None
-                    gesture, confidence = self.stream_classifier.classify_frame(primary_hand)
-
-                    control_command, _ = self._map_gesture_to_command(gesture)
-                    action = GESTURE_ACTION_MAP.get(gesture, "idle")
+                    primary_hand, _, _ = self._select_primary_hand(hands, input_mode="camera")
+                    raw_gesture, confidence = self.stream_classifier.classify_frame(primary_hand if primary_hand else None)
+                    control_command, _ = self._map_gesture_to_command(raw_gesture)
+                    action = GESTURE_ACTION_MAP.get(raw_gesture, "idle")
+                    gesture = self._normalize_public_gesture(raw_gesture)
                     keypoints = (
                         [Keypoint(x=point["x"], y=point["y"], score=point.get("z", 0.0)) for point in primary_hand]
                         if primary_hand
@@ -534,7 +603,7 @@ class OwnerGestureService:
                     )
                     annotated_image = self._build_annotated_image(
                         prepared,
-                        hands=hands,
+                        hands=[primary_hand] if primary_hand else hands,
                         gesture=gesture,
                         confidence=confidence,
                         control_command=control_command if action != "idle" else None,
@@ -626,9 +695,8 @@ class OwnerGestureService:
             "open_palm": ("WakeSystem", True),
             "palm": ("WakeSystem", True),
             "fist": ("ConfirmAction", True),
-            "index_circle": ("AdjustVolume", True),
-            "circle_cw": ("AdjustVolume", True),
-            "circle_ccw": ("AdjustVolume", True),
+            "circle_cw": ("AdjustVolumeDown", True),
+            "circle_ccw": ("AdjustVolumeUp", True),
             "swipe_left": ("SwitchPrevFeature", True),
             "swipe_right": ("SwitchNextFeature", True),
             "thumbs_up": ("AnswerCall", True),
@@ -730,6 +798,8 @@ class OwnerGestureService:
 
         required_hold_count = 1 if control_command in {
             "AdjustVolume",
+            "AdjustVolumeUp",
+            "AdjustVolumeDown",
             "SwitchPrevFeature",
             "SwitchNextFeature",
             "ReturnHome",
@@ -906,7 +976,9 @@ class OwnerGestureService:
     ) -> tuple[list[dict], str | None, float | None]:
         if not hands:
             return [], None, None
-        if input_mode != "image" or len(hands) == 1:
+        if len(hands) == 1:
+            return hands[0], None, None
+        if input_mode == "camera":
             return hands[0], None, None
 
         best_hand = hands[0]
@@ -923,7 +995,9 @@ class OwnerGestureService:
                 best_confidence = confidence
                 best_rank = rank
 
-        return best_hand, best_gesture, best_confidence
+        if input_mode == "image":
+            return best_hand, best_gesture, best_confidence
+        return best_hand, None, None
 
     def _rank_image_hand_candidate(
         self,
@@ -972,6 +1046,15 @@ class OwnerGestureService:
         )
         return gesture_label, cls_result["confidence"]
 
+    def _normalize_public_gesture(self, gesture: str) -> str:
+        if gesture == "circle_cw":
+            return "circle_ccw"
+        if gesture == "circle_ccw":
+            return "circle_cw"
+        if gesture in {"point", "pointing", "index_circle"}:
+            return "idle"
+        return gesture
+
     def _build_annotated_image(
         self,
         frame: np.ndarray,
@@ -983,62 +1066,54 @@ class OwnerGestureService:
     ) -> str | None:
         annotated = frame.copy()
         height, width = annotated.shape[:2]
+        longest_edge = max(width, height)
+        header_height = max(96, min(152, int(height * 0.13)))
+        title_font_size = 26 if longest_edge < 900 else 32 if longest_edge < 1400 else 40
+        meta_font_size = 20 if longest_edge < 900 else 24 if longest_edge < 1400 else 30
+        point_radius = 4 if longest_edge < 900 else 5 if longest_edge < 1400 else 7
+        line_thickness = 1 if longest_edge < 900 else 2
+
+        overlay = annotated.copy()
+        cv2.rectangle(overlay, (0, 0), (width, header_height), (0, 0, 0), -1)
+        annotated = cv2.addWeighted(overlay, 0.45, annotated, 0.55, 0)
 
         for hand in hands:
             points: list[tuple[int, int]] = []
-            for point in hand:
-                x = int(min(max(float(point["x"]) * width, 0), width - 1))
-                y = int(min(max(float(point["y"]) * height, 0), height - 1))
+            for landmark in hand:
+                x = int(min(max(float(landmark["x"]) * width, 0), width - 1))
+                y = int(min(max(float(landmark["y"]) * height, 0), height - 1))
                 points.append((x, y))
 
             for start_index, end_index in HAND_CONNECTIONS:
-                start_point = points[start_index]
-                end_point = points[end_index]
-                cv2.line(annotated, start_point, end_point, (67, 163, 224), 2, cv2.LINE_AA)
+                cv2.line(
+                    annotated,
+                    points[start_index],
+                    points[end_index],
+                    (255, 255, 255),
+                    line_thickness,
+                    cv2.LINE_AA,
+                )
 
-            for point in points:
-                cv2.circle(annotated, point, 4, (220, 196, 174), -1, cv2.LINE_AA)
-                cv2.circle(annotated, point, 6, (58, 88, 120), 1, cv2.LINE_AA)
+            for index, point in enumerate(points):
+                color = (0, 255, 255) if index in {4, 8, 12, 16, 20} else (255, 255, 255)
+                cv2.circle(annotated, point, point_radius, color, -1, cv2.LINE_AA)
 
-        label = GESTURE_DISPLAY_MAP.get(gesture, gesture)
-        summary = f"{label}  {confidence * 100:.1f}%"
-        if control_command:
-            summary = f"{summary}  |  {COMMAND_DISPLAY_MAP.get(control_command, control_command)}"
-
-        self._draw_summary_bar(
+        gesture_text = GESTURE_DISPLAY_MAP.get(gesture, gesture)
+        annotated = draw_chinese_text(
             annotated,
-            summary=summary,
-            hands_detected=len(hands),
+            f"手势: {gesture_text}",
+            (10, 10),
+            (0, 255, 0),
+            title_font_size,
+        )
+        annotated = draw_chinese_text(
+            annotated,
+            f"置信度: {confidence:.3f}  |  手部: {len(hands)}",
+            (10, max(42, int(header_height * 0.46))),
+            (200, 200, 200),
+            meta_font_size,
         )
         return self._encode_frame_to_data_url(annotated)
-
-    def _draw_summary_bar(self, frame: np.ndarray, *, summary: str, hands_detected: int) -> None:
-        height, width = frame.shape[:2]
-        bar_height = min(58, max(40, height // 8))
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, 0), (width, bar_height), (36, 44, 56), -1)
-        cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
-
-        cv2.putText(
-            frame,
-            summary,
-            (16, min(bar_height - 16, 30)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.62,
-            (243, 240, 234),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            f"HANDS: {hands_detected}",
-            (16, bar_height - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (207, 215, 225),
-            1,
-            cv2.LINE_AA,
-        )
 
     def _encode_frame_to_data_url(self, frame: np.ndarray) -> str | None:
         preview = frame
@@ -1052,7 +1127,7 @@ class OwnerGestureService:
                 interpolation=cv2.INTER_AREA,
             )
 
-        ok, buffer = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 68])
+        ok, buffer = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
         if not ok:
             return None
         encoded = base64.b64encode(buffer.tobytes()).decode("ascii")
@@ -1129,12 +1204,16 @@ class OwnerGestureService:
 
         if command == "ConfirmAction":
             self._apply_confirm_action(state)
-        elif command == "AdjustVolume":
+        elif command in {"AdjustVolume", "AdjustVolumeUp", "AdjustVolumeDown"}:
             state["current_mode"] = "media"
             state["focus_tile"] = "media"
             state["media_playing"] = True
-            state["volume"] = min(100, int(state["volume"]) + 6)
-            state["last_feedback"] = f"媒体音量已调至 {state['volume']}%。"
+            if command == "AdjustVolumeDown":
+                state["volume"] = max(0, int(state["volume"]) - 6)
+                state["last_feedback"] = f"媒体音量已下调至 {state['volume']}%。"
+            else:
+                state["volume"] = min(100, int(state["volume"]) + 6)
+                state["last_feedback"] = f"媒体音量已调至 {state['volume']}%。"
         elif command == "SwitchPrevFeature":
             if state["phone_call_active"]:
                 return

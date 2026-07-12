@@ -28,6 +28,7 @@ class ControlPanelState(BaseModel):
 
 class GestureFrameResult(BaseModel):
     gesture: str
+    action: str | None = None
     confidence: float
     keypoints: list[Keypoint]
     annotated_image: str | None = None

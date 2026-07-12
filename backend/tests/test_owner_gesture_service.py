@@ -308,6 +308,17 @@ def test_classify_static_can_keep_high_confidence_ml_thumbs_up_when_heuristic_is
     assert confidence == 0.96
 
 
+def test_classify_static_prefers_high_confidence_ml_fist_over_ambiguous_heuristic_thumbs_up():
+    classifier = GestureClassifier(domain="owner")
+    classifier._classify_ml = lambda _keypoints: ("fist", 0.91)  # type: ignore[method-assign]
+    classifier._classify_heuristic = lambda _keypoints: ("thumbs_up", 0.88)  # type: ignore[method-assign]
+
+    gesture, confidence = classifier.classify_static([{"x": 0.0, "y": 0.0, "z": 0.0} for _ in range(21)])
+
+    assert gesture == "fist"
+    assert confidence == 0.91
+
+
 def test_prepare_frame_for_inference_downsizes_large_frames():
     service = OwnerGestureService()
     frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
@@ -416,7 +427,7 @@ def test_select_primary_hand_prefers_triggerable_image_hand():
     assert confidence == 0.88
 
 
-def test_process_frame_image_mode_returns_selected_hand_keypoints_only(tmp_path):
+def test_process_frame_image_mode_matches_verify_script_first_hand_logic(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'owner_gesture_upload.db'}", future=True)
     testing_session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     Base.metadata.create_all(bind=engine)
@@ -426,8 +437,11 @@ def test_process_frame_image_mode_returns_selected_hand_keypoints_only(tmp_path)
     left_hand = [{"x": 0.18, "y": 0.35 + index * 0.001, "z": 0.0} for index in range(21)]
     right_hand = [{"x": 0.78, "y": 0.25 + index * 0.001, "z": 0.0} for index in range(21)]
 
+    seen_shapes: list[tuple[int, int]] = []
+
     class StubHands:
-        def infer(self, _frame):
+        def infer(self, frame):
+            seen_shapes.append((frame.shape[1], frame.shape[0]))
             return {
                 "keypoints": left_hand + right_hand,
                 "num_hands_detected": 2,
@@ -446,7 +460,7 @@ def test_process_frame_image_mode_returns_selected_hand_keypoints_only(tmp_path)
     service._should_record_behavior = lambda **_: False  # type: ignore[method-assign]
     service._capture_monitor_log = fake_capture_monitor_log  # type: ignore[method-assign]
 
-    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
     ok, encoded = cv2.imencode(".jpg", frame)
     assert ok is True
 
@@ -464,8 +478,9 @@ def test_process_frame_image_mode_returns_selected_hand_keypoints_only(tmp_path)
 
         stored = db.query(OwnerGestureRecord).all()
 
-    assert result.gesture == "thumbs_up"
+    assert seen_shapes == [(1920, 1080)]
+    assert result.gesture == "idle"
     assert len(result.keypoints) == 21
-    assert result.keypoints[0].x == right_hand[0]["x"]
+    assert result.keypoints[0].x == left_hand[0]["x"]
     assert len(stored) == 1
     assert len(stored[0].hand_landmarks) == 42

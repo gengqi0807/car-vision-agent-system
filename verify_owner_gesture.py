@@ -6,7 +6,7 @@
   python verify_owner_gesture.py --image test_hand.jpg
 
   # 2) 视频文件测试
-  python verify_owner_gesture.py --video test.mp4
+  python verify_owner_gesture.py --video test.avi
 
   # 3) RTSP 流测试（需先启动 stream_core.py 推流）
   python verify_owner_gesture.py --rtsp rtsp://127.0.0.1:8554/test
@@ -41,14 +41,20 @@ from app.models_infer.mediapipe_hands import MediaPipeHands
 
 GESTURE_ACTION = {
     "open_palm":   "wake         ← 唤醒",
+    "palm":        "wake         ← 唤醒",
     "fist":        "confirm      ← 确认",
     "index_circle":"volume      ← 音量调节",
+    "circle_cw":   "volume_down  ← 音量-",
+    "circle_ccw":  "volume_up    ← 音量+",
     "swipe_left":  "prev_func    ← 上一个功能",
     "swipe_right": "next_func    ← 下一个功能",
     "thumbs_up":   "call_answer  ← 接听",
+    "thumb_up":    "call_answer  ← 接听",
     "thumbs_down": "call_hangup  ← 挂断",
+    "thumb_down":  "call_hangup  ← 挂断",
     "wave":        "home         ← 主页",
     "point":       "idle         ← 食指追踪中",
+    "pointing":    "idle         ← 食指追踪中",
     "idle":        "idle",
     "unknown":     "idle",
     "未检测到手部":"idle",
@@ -109,13 +115,16 @@ def draw_result(frame: np.ndarray, gesture: str, action: str, conf: float,
 # ----------------------------------------------------------------
 
 
-def process_frame(frame_bgr: np.ndarray, classifier: GestureClassifier):
-    hands = MediaPipeHands.infer_video(frame_bgr)
+def process_frame(frame_bgr: np.ndarray, hands_model: MediaPipeHands, classifier: GestureClassifier):
+    infer_result = hands_model.infer(frame_bgr)
+    raw_keypoints = infer_result["keypoints"]
+    num_hands = infer_result.get("num_hands_detected", 0)
+    hands = [raw_keypoints[index:index + 21] for index in range(0, len(raw_keypoints), 21)]
     hand_kp = hands[0] if hands else None
 
     gesture, conf = classifier.classify_frame(hand_kp)
     action = gesture_label(gesture)
-    return gesture, action, conf, len(hands), hand_kp
+    return gesture, action, conf, num_hands, hand_kp
 
 
 def process_image(frame_bgr: np.ndarray, hands_model: MediaPipeHands, classifier: GestureClassifier):
@@ -187,7 +196,7 @@ def main():
         if not ret:
             break
 
-        gesture, action, conf, hc, kp = process_frame(frame, classifier)
+        gesture, action, conf, hc, kp = process_frame(frame, hands_model, classifier)
         frame = draw_result(frame, gesture, action, conf, hc, kp)
 
         # FPS 显示

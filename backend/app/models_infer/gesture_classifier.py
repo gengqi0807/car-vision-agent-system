@@ -1,4 +1,4 @@
-"""Owner and police gesture classifier with optional ML/static+dynamic fusion."""
+"""Owner and police gesture classifier with optional static and dynamic fusion."""
 
 from __future__ import annotations
 
@@ -22,8 +22,9 @@ _OWNER_GESTURE_ALIASES = {
     "thumbs_down": "thumbs_down",
     "pointing": "point",
     "point": "point",
-    "circle_cw": "point",
-    "circle_ccw": "point",
+    "index_circle": "index_circle",
+    "circle_cw": "circle_cw",
+    "circle_ccw": "circle_ccw",
     "fist": "fist",
     "wave": "wave",
     "swipe_left": "swipe_left",
@@ -33,13 +34,30 @@ _OWNER_GESTURE_ALIASES = {
 }
 
 
+def _normalize_owner_gesture(gesture: str) -> str:
+    return _OWNER_GESTURE_ALIASES.get(gesture, gesture)
+
+
 class GestureClassifier:
     """Gesture classifier for owner and police domains."""
 
     DYNAMIC_COOLDOWN_FRAMES = 18
     NO_HAND_REARM_FRAMES = 3
     STATIC_STABLE_FRAMES = 3
-    _DYNAMIC_LABELS = {"wave", "swipe_left", "swipe_right", "index_circle", "idle"}
+    DYNAMIC_CONF_MARGIN = 0.05
+    MOTION_FIRE_THRESHOLD = 0.0004
+    SUSTAINED_MOTION_FRAMES = 4
+    WAVE_STABLE_FRAMES = 5
+
+    _DYNAMIC_LABELS = {
+        "wave",
+        "swipe_left",
+        "swipe_right",
+        "index_circle",
+        "circle_cw",
+        "circle_ccw",
+        "idle",
+    }
     _STATIC_LABELS = {"open_palm", "fist", "point", "thumbs_up", "thumbs_down", "unknown"}
 
     _WRIST = 0
@@ -77,13 +95,19 @@ class GestureClassifier:
         self._ml_model = None
         self._ml_scaler = None
         self._ml_labels = None
+        self._dynamic_lstm = None
         self._cooldown = 0
         self._no_hand = 0
         self._stable_gesture: str | None = None
         self._stable_count = 0
+        self._wave_count = 0
+        self._motion_history: list[tuple[float, float]] = []
+        self._motion_history_max = 15
+        self._motion_frames = 0
 
         if domain == "owner":
             self._load_ml_model()
+            self._load_dynamic_lstm()
 
     def classify(self, keypoints: list[dict], domain: _Domain | None = None) -> dict:
         target_domain = domain or self.domain
@@ -99,13 +123,19 @@ class GestureClassifier:
 
     def classify_frame(self, keypoints: list[dict] | None) -> tuple[str, float]:
         if keypoints is None:
-            if self.tracker:
-                self.tracker.reset()
+            boundary_result = self._handle_boundary()
+            self._reset_runtime_trackers()
             self._no_hand += 1
             self._stable_gesture = None
             self._stable_count = 0
+            self._wave_count = 0
+            self._motion_history.clear()
+            self._motion_frames = 0
             if self._no_hand >= self.NO_HAND_REARM_FRAMES:
                 self._cooldown = 0
+            if boundary_result[0] != "unknown":
+                self._cooldown = self.DYNAMIC_COOLDOWN_FRAMES
+                return boundary_result
             return "unknown", 0.0
 
         if len(keypoints) != self._PER_HAND:
@@ -113,19 +143,47 @@ class GestureClassifier:
 
         self._no_hand = 0
         static_gesture, static_conf = self.classify_static(keypoints)
-        dynamic_gesture = self.tracker.update(keypoints) if self.tracker else None
+        dynamic_gesture, dynamic_conf = self._classify_dynamic(keypoints)
 
         if dynamic_gesture:
-            if static_gesture in {"open_palm", "fist", "thumbs_up", "thumbs_down", "unknown"}:
-                dynamic_gesture = None
-            elif dynamic_gesture in {"wave", "swipe_left", "swipe_right"} and static_gesture != "point":
-                dynamic_gesture = None
+            motion_energy = self._update_motion(keypoints)
+            should_fire_dynamic = False
 
-        if dynamic_gesture:
-            self._cooldown = self.DYNAMIC_COOLDOWN_FRAMES
+            if static_gesture in {"point", "unknown"}:
+                should_fire_dynamic = True
+                self._motion_frames = min(self._motion_frames + 1, 10)
+            elif motion_energy > self.MOTION_FIRE_THRESHOLD:
+                self._motion_frames += 1
+                adjusted_static_conf = static_conf * (0.35 if static_gesture in {"open_palm", "fist"} else 0.65)
+                if self._motion_frames >= self.SUSTAINED_MOTION_FRAMES:
+                    should_fire_dynamic = dynamic_conf >= 0.20
+                else:
+                    should_fire_dynamic = dynamic_conf > adjusted_static_conf + 0.02
+            elif dynamic_conf > static_conf + self.DYNAMIC_CONF_MARGIN:
+                should_fire_dynamic = True
+                self._motion_frames = max(0, self._motion_frames - 1)
+            else:
+                self._motion_frames = max(0, self._motion_frames - 1)
+
+            if should_fire_dynamic:
+                if dynamic_gesture == "wave":
+                    self._wave_count += 1
+                    if self._wave_count < self.WAVE_STABLE_FRAMES:
+                        self._stable_gesture = None
+                        self._stable_count = 0
+                        return "idle", 0.0
+                self._cooldown = self.DYNAMIC_COOLDOWN_FRAMES
+                self._stable_gesture = None
+                self._stable_count = 0
+                self._wave_count = 0
+                self._reset_dynamic_sequence()
+                return dynamic_gesture, round(dynamic_conf, 4)
+
             self._stable_gesture = None
             self._stable_count = 0
-            return dynamic_gesture, 0.85
+            return "idle", 0.0
+
+        self._wave_count = 0
 
         if self._cooldown > 0:
             self._cooldown -= 1
@@ -140,7 +198,7 @@ class GestureClassifier:
             self._stable_count = 1
 
         if self._stable_count >= self.STATIC_STABLE_FRAMES:
-            return static_gesture, static_conf
+            return static_gesture, round(static_conf, 4)
         return "idle", 0.0
 
     def classify_static(self, keypoints: list[dict]) -> tuple[str, float]:
@@ -168,10 +226,7 @@ class GestureClassifier:
             self._ml_model = bundle["model"]
             self._ml_scaler = bundle["scaler"]
             self._ml_labels = bundle["label_names"]
-            normalized_labels = {
-                _OWNER_GESTURE_ALIASES.get(str(label), str(label))
-                for label in self._ml_labels
-            }
+            normalized_labels = {_normalize_owner_gesture(str(label)) for label in self._ml_labels}
             if not {"open_palm", "point", "thumbs_down"}.issubset(normalized_labels):
                 logger.warning(
                     "Owner gesture classifier labels are incomplete for the current feature set: %s. "
@@ -184,6 +239,17 @@ class GestureClassifier:
             self._ml_model = None
             self._ml_scaler = None
             self._ml_labels = None
+
+    def _load_dynamic_lstm(self) -> None:
+        try:
+            from app.models_infer.dynamic_lstm import DynamicLSTMClassifier
+
+            self._dynamic_lstm = DynamicLSTMClassifier()
+            if not self._dynamic_lstm.is_loaded:
+                logger.info("Owner gesture dynamic LSTM model not loaded, fallback to heuristics tracker")
+        except Exception as exc:
+            logger.warning("Failed to initialize owner gesture dynamic LSTM, fallback to heuristics: %s", exc)
+            self._dynamic_lstm = None
 
     def _merge_static_predictions(
         self,
@@ -200,7 +266,6 @@ class GestureClassifier:
 
         if heuristic_gesture == ml_gesture:
             return ml_gesture, max(heuristic_conf, ml_conf)
-
         if heuristic_gesture == "open_palm":
             return heuristic_result
         if heuristic_gesture == "point":
@@ -212,6 +277,11 @@ class GestureClassifier:
         if heuristic_gesture == "thumbs_up":
             if ml_gesture == "thumbs_up":
                 return ml_gesture, max(heuristic_conf, ml_conf)
+            # Some fist poses expose the thumb tip above the wrist, which can fool
+            # the heuristic into "thumbs_up". If the trained classifier strongly
+            # prefers fist, trust the model for this ambiguous boundary.
+            if ml_gesture == "fist" and ml_conf >= 0.84:
+                return ml_result
             return heuristic_result
         if heuristic_gesture == "fist":
             if ml_gesture == "fist":
@@ -245,11 +315,55 @@ class GestureClassifier:
                 raw_gesture = str(self._ml_labels[idx])
                 confidence = 0.75
 
-            gesture = _OWNER_GESTURE_ALIASES.get(raw_gesture, raw_gesture)
+            gesture = _normalize_owner_gesture(raw_gesture)
             return gesture, confidence
         except Exception as exc:
             logger.debug("Owner gesture ML inference failed: %s", exc)
             return None
+
+    def _classify_dynamic(self, keypoints: list[dict]) -> tuple[str | None, float]:
+        if self._dynamic_lstm is not None and self._dynamic_lstm.is_loaded:
+            try:
+                gesture, confidence = self._dynamic_lstm.classify(keypoints, is_boundary=False)
+                gesture = _normalize_owner_gesture(gesture)
+                if gesture != "unknown":
+                    return gesture, confidence
+            except Exception as exc:
+                logger.debug("Owner gesture dynamic LSTM inference failed: %s", exc)
+
+        if self.tracker is None:
+            return None, 0.0
+
+        gesture = self.tracker.update(keypoints)
+        if gesture is None:
+            return None, 0.0
+        return _normalize_owner_gesture(gesture), 0.85
+
+    def _handle_boundary(self) -> tuple[str, float]:
+        if self._dynamic_lstm is None or not self._dynamic_lstm.is_loaded:
+            return "unknown", 0.0
+        try:
+            trajectory = self._dynamic_lstm.get_trajectory()
+            if trajectory.shape[0] < self._dynamic_lstm.MIN_SEQUENCE_LENGTH:
+                self._dynamic_lstm.reset_trajectory()
+                return "unknown", 0.0
+            gesture, confidence = self._dynamic_lstm.classify_sequence(trajectory)
+            self._dynamic_lstm.reset_trajectory()
+            return _normalize_owner_gesture(gesture), confidence
+        except Exception as exc:
+            logger.debug("Owner gesture dynamic boundary inference failed: %s", exc)
+            self._dynamic_lstm.reset_trajectory()
+            return "unknown", 0.0
+
+    def _reset_runtime_trackers(self) -> None:
+        if self.tracker:
+            self.tracker.reset()
+
+    def _reset_dynamic_sequence(self) -> None:
+        if self.tracker:
+            self.tracker.reset()
+        if self._dynamic_lstm is not None:
+            self._dynamic_lstm.reset_trajectory()
 
     def _classify_heuristic(self, keypoints: list[dict]) -> tuple[str, float]:
         hand = keypoints[: self._PER_HAND]
@@ -294,6 +408,23 @@ class GestureClassifier:
         if ext_count <= 1:
             return "fist", 0.60
         return "unknown", 0.40
+
+    def _update_motion(self, keypoints: list[dict]) -> float:
+        if len(keypoints) != self._PER_HAND:
+            return 0.0
+
+        wrist_x = float(keypoints[self._WRIST]["x"])
+        wrist_y = float(keypoints[self._WRIST]["y"])
+        self._motion_history.append((wrist_x, wrist_y))
+        if len(self._motion_history) > self._motion_history_max:
+            self._motion_history = self._motion_history[-self._motion_history_max :]
+
+        if len(self._motion_history) < 5:
+            return 0.0
+
+        xs = [point[0] for point in self._motion_history]
+        ys = [point[1] for point in self._motion_history]
+        return float(np.var(xs)) + float(np.var(ys))
 
     def _classify_police(self, keypoints: list[dict]) -> dict:
         n_poses = len(keypoints) // self._PER_PERSON
@@ -361,10 +492,10 @@ class HandGestureTracker:
         self.history.append(
             (
                 self.frame_count,
-                wrist["x"],
-                wrist["y"],
-                index_tip["x"],
-                index_tip["y"],
+                float(wrist["x"]),
+                float(wrist["y"]),
+                float(index_tip["x"]),
+                float(index_tip["y"]),
             )
         )
         if len(self.history) > self._max_history:
@@ -391,33 +522,54 @@ class HandGestureTracker:
         return None
 
     def _detect_circle(self) -> str | None:
-        if len(self.history) < 15:
+        if len(self.history) < 12:
             return None
 
-        points = [(item[3], item[4]) for item in self.history[-30:]]
-        center_x = sum(point[0] for point in points) / len(points)
-        center_y = sum(point[1] for point in points) / len(points)
+        xs = np.array([item[3] for item in self.history[-30:]], dtype=np.float64)
+        ys = np.array([item[4] for item in self.history[-30:]], dtype=np.float64)
+
+        if len(xs) >= 3:
+            kernel = np.ones(3) / 3.0
+            xs_smooth = np.convolve(xs, kernel, mode="valid")
+            ys_smooth = np.convolve(ys, kernel, mode="valid")
+        else:
+            xs_smooth = xs
+            ys_smooth = ys
 
         total_angle = 0.0
-        for index in range(1, len(points)):
-            angle_a = math.atan2(points[index - 1][1] - center_y, points[index - 1][0] - center_x)
-            angle_b = math.atan2(points[index][1] - center_y, points[index][0] - center_x)
-            diff = angle_b - angle_a
-            while diff > math.pi:
-                diff -= 2 * math.pi
-            while diff < -math.pi:
-                diff += 2 * math.pi
-            total_angle += diff
+        valid_steps = 0
+        for index in range(1, len(xs_smooth) - 1):
+            v1_x = xs_smooth[index] - xs_smooth[index - 1]
+            v1_y = ys_smooth[index] - ys_smooth[index - 1]
+            v2_x = xs_smooth[index + 1] - xs_smooth[index]
+            v2_y = ys_smooth[index + 1] - ys_smooth[index]
 
-        radii = [math.hypot(point[0] - center_x, point[1] - center_y) for point in points]
-        mean_radius = sum(radii) / len(radii)
-        if mean_radius < 0.015:
+            mag1 = math.hypot(v1_x, v1_y)
+            mag2 = math.hypot(v2_x, v2_y)
+            if mag1 < 0.0015 or mag2 < 0.0015:
+                continue
+
+            cos_angle = (v1_x * v2_x + v1_y * v2_y) / (mag1 * mag2)
+            cos_angle = max(-1.0, min(1.0, cos_angle))
+            angle = math.acos(cos_angle)
+            cross = v1_x * v2_y - v1_y * v2_x
+            if cross > 0:
+                angle = -angle
+
+            total_angle += angle
+            valid_steps += 1
+
+        if valid_steps < 6 or abs(total_angle) <= 5.0:
             return None
 
-        max_deviation = max(abs(radius - mean_radius) for radius in radii) / mean_radius
-        if abs(total_angle) >= math.radians(300) and max_deviation < 0.55:
-            return "index_circle"
-        return None
+        net_x = float(xs[-1] - xs[0])
+        net_y = float(ys[-1] - ys[0])
+        net_dist = math.hypot(net_x, net_y)
+        span = max(float(np.max(xs) - np.min(xs)), float(np.max(ys) - np.min(ys)))
+        if net_dist >= 0.05 or span <= 0.03:
+            return None
+
+        return "circle_ccw" if total_angle > 0 else "circle_cw"
 
     def _detect_swipe(self) -> str | None:
         if len(self.history) < 8:
