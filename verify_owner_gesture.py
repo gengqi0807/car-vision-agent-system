@@ -42,8 +42,8 @@ from app.models_infer.mediapipe_hands import MediaPipeHands
 GESTURE_ACTION = {
     "palm":        "wake         ← 唤醒",
     "fist":        "confirm      ← 确认",
-    "swipe_up":    "volume_up    ← 音量+",
-    "swipe_down":  "volume_down  ← 音量-",
+    "circle_ccw":  "volume_down  ← 音量-",
+    "circle_cw":   "volume_up    ← 音量+",
     "swipe_left":  "prev_func    ← 上一个功能",
     "swipe_right": "next_func    ← 下一个功能",
     "thumb_up":    "call_answer  ← 接听",

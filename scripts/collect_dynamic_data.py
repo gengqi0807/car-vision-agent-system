@@ -4,8 +4,8 @@
 用摄像头或视频文件录制动态手势片段，保存为 .avi 文件。
 
 用法:
-  # 采集 swipe_up (向上滑动)
-  python scripts/collect_dynamic_data.py --gesture swipe_up --count 10
+  # 采集 circle_ccw (逆时针画圈)
+  python scripts/collect_dynamic_data.py --gesture circle_ccw --count 10
 
   # 采集所有动态手势（逐一录制）
   python scripts/collect_dynamic_data.py --all --count 5
@@ -21,10 +21,10 @@
 
 输出目录:
   owner_gesture_dataset_/
-    swipe_up/
+    circle_cw/
       subj_001_r1.avi
       subj_001_r2.avi
-    swipe_down/
+    circle_ccw/
       ...
 """
 
@@ -41,7 +41,7 @@ DATASET_DIR = PROJECT_ROOT / "owner_gesture_dataset_"
 DEFAULT_DURATION = 3  # 秒
 DEFAULT_FPS = 20
 
-DYNAMIC_GESTURES = ["swipe_up", "swipe_down", "swipe_left", "swipe_right", "wave"]
+DYNAMIC_GESTURES = ["circle_ccw", "circle_cw", "swipe_left", "swipe_right", "wave"]
 
 
 def get_next_filename(gesture_dir: Path) -> str:

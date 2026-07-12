@@ -219,7 +219,7 @@ def main():
 
     # --- 3. 构建模型 -----------------------------------------------------------
     model = BiLSTMGesture(
-        input_size=63,
+        input_size=67,
         hidden_size=HIDDEN_SIZE,
         num_layers=NUM_LAYERS,
         num_classes=n_classes,
@@ -315,7 +315,7 @@ def main():
         "num_layers": NUM_LAYERS,
         "dropout": DROPOUT,
         "label_names": label_names.tolist(),
-        "input_size": 63,
+        "input_size": 67,
     }
     torch.save(checkpoint, MODEL_OUTPUT)
     print(f"\n[DONE] 模型已保存: {MODEL_OUTPUT}")

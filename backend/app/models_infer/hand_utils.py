@@ -31,6 +31,23 @@ def normalize_hand_landmarks_array(kp: list[dict]) -> np.ndarray:
     return np.array(normalize_hand_landmarks(kp), dtype=np.float32)
 
 
+def normalize_hand_with_trajectory(kp: list[dict]) -> np.ndarray:
+    """
+    返回 67 维特征 = 63维归一化姿态 + 4维绝对轨迹坐标（不做手腕中心化）。
+
+    63 维 = 手腕中心化 + 手大小归一化的 21 关键点 xyz（同 normalize_hand_landmarks）
+    4 维 = [wrist_x, wrist_y, index_tip_x, index_tip_y] 原始图像坐标
+
+    保留轨迹坐标使 LSTM 能感知手在画面中的运动（画圈、滑动、挥手），
+    这对 circle / swipe / wave 等动态手势至关重要。
+    """
+    pose = normalize_hand_landmarks_array(kp)  # (63,)
+    wrist_x, wrist_y = kp[0]["x"], kp[0]["y"]
+    tip_x, tip_y = kp[8]["x"], kp[8]["y"]
+    traj = np.array([wrist_x, wrist_y, tip_x, tip_y], dtype=np.float32)
+    return np.concatenate([pose, traj])
+
+
 # ----------------------------------------------------------------
 # 模型包装器（joblib 序列化需要模块级别定义）
 # ----------------------------------------------------------------

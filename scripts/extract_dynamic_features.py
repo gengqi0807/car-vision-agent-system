@@ -7,10 +7,10 @@
 
 数据目录结构:
   owner_gesture_dataset_/
-    swipe_up/
+    circle_ccw/
       subj1_r1.avi
       subj2_r1.avi
-    swipe_down/
+    circle_cw/
       ...
     swipe_left/
       ...
@@ -36,15 +36,15 @@ BACKEND_DIR = PROJECT_ROOT / "backend"
 sys.path.insert(0, str(BACKEND_DIR))
 
 from app.core.config import settings
-from app.models_infer.hand_utils import normalize_hand_landmarks_array
+from app.models_infer.hand_utils import normalize_hand_with_trajectory
 from app.models_infer.mediapipe_hands import MediaPipeHands
 
 # ----------------------------------------------------------------
 # 动态手势标签映射
 # ----------------------------------------------------------------
 DYNAMIC_LABEL_MAP = {
-    "swipe_up":    0,
-    "swipe_down":  1,
+    "circle_ccw":  0,
+    "circle_cw":   1,
     "swipe_left":  2,
     "swipe_right": 3,
     "wave":        4,
@@ -120,7 +120,7 @@ def main():
 
                 hands = MediaPipeHands.infer(frame)
                 if hands and len(hands[0]) == 21:
-                    feat = normalize_hand_landmarks_array(hands[0])
+                    feat = normalize_hand_with_trajectory(hands[0])
                     frame_features.append(feat)
                     valid_frames += 1
                 # 如果手丢失，插入 NaN 占位（可选：用前一帧填充）

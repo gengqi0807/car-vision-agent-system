@@ -2,7 +2,7 @@
 动态手势 BiLSTM 模型定义 + 推理分类器。
 
 模型: 2 层双向 LSTM
-  - input:  (T, 63)  归一化后的逐帧 21 关键点 xyz
+  - input:  (T, 67)  63维归一化姿态 + 4维绝对轨迹坐标[手腕x/y, 食指尖x/y]
   - hidden: 128 (双向 → 256)
   - output: num_classes (softmax)
 
@@ -134,8 +134,8 @@ class DynamicLSTMClassifier:
       - 置信度阈值: 低于 threshold → unknown
     """
 
-    # 每帧特征维度
-    FEATURE_DIM: int = 63
+    # 每帧特征维度（63 归一化姿态 + 4 绝对轨迹坐标）
+    FEATURE_DIM: int = 67
 
     # 模型输入要求的最少帧数
     MIN_SEQUENCE_LENGTH: int = 10
@@ -193,7 +193,7 @@ class DynamicLSTMClassifier:
                 return
 
             self._model = BiLSTMGesture(
-                input_size=self.FEATURE_DIM,
+                input_size=checkpoint.get("input_size", self.FEATURE_DIM),
                 hidden_size=checkpoint.get("hidden_size", 128),
                 num_layers=checkpoint.get("num_layers", 2),
                 num_classes=num_classes,
@@ -229,9 +229,9 @@ class DynamicLSTMClassifier:
 
     @staticmethod
     def _normalize_frame(keypoints: list[dict]) -> np.ndarray:
-        """单帧归一化，返回 (63,) float32。与静态特征提取保持一致。"""
-        from app.models_infer.hand_utils import normalize_hand_landmarks_array
-        return normalize_hand_landmarks_array(keypoints)
+        """单帧归一化 + 轨迹拼接，返回 (67,) float32。"""
+        from app.models_infer.hand_utils import normalize_hand_with_trajectory
+        return normalize_hand_with_trajectory(keypoints)
 
     # ----------------------------------------------------------------
     # 运动能量门控

@@ -28,8 +28,8 @@ class GestureHistoryItem(BaseModel):
 
 class OwnerGestureResult(BaseModel):
     """单帧推理结果，包含手势 + 映射后的车机动作。"""
-    gesture: str        # 手势原始标签: palm, fist, swipe_up, swipe_down, swipe_left, swipe_right, thumb_up, thumb_down, wave, pointing, unknown
-    action: str         # 映射后的车机动作: wake, confirm, volume_up, volume_down, prev_func, next_func, call_answer, call_hangup, home, idle
+    gesture: str        # 手势原始标签: palm, fist, circle_ccw, circle_cw, swipe_left, swipe_right, thumb_up, thumb_down, wave, pointing, unknown
+    action: str         # 映射后的车机动作: wake, confirm, volume_down, volume_up, prev_func, next_func, call_answer, call_hangup, home, idle
     confidence: float
     keypoints: list[Keypoint]
     hand_count: int = Field(default=0, description="检测到的手数量")

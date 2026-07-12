@@ -22,7 +22,7 @@ sys.path.insert(0, str(BACKEND_DIR))
 
 from app.core.config import settings
 from app.models_infer.mediapipe_hands import MediaPipeHands
-from app.models_infer.hand_utils import normalize_hand_landmarks_array
+from app.models_infer.hand_utils import normalize_hand_with_trajectory
 from app.models_infer.dynamic_lstm import DynamicLSTMClassifier
 
 # --- 数据集路径 ---
@@ -57,7 +57,7 @@ for gesture_name in ["circle_cw", "circle_ccw"]:
                 break
             hand = MediaPipeHands.infer(frame)
             if hand and len(hand[0]) == 21:
-                seq.append(normalize_hand_landmarks_array(hand[0]))
+                seq.append(normalize_hand_with_trajectory(hand[0]))
         cap.release()
 
         total += 1

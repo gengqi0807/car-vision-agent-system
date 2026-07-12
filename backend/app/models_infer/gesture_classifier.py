@@ -9,8 +9,8 @@
   - pointing  : 仅食指伸展 → 用于触发动态追踪
 
 动态手势（通过 HandGestureTracker 时序状态机）:
-  - swipe_up   : 手腕向上滑动 → 音量+
-  - swipe_down : 手腕向下滑动 → 音量-
+  - circle_ccw : 逆时针画圈 → 音量-
+  - circle_cw  : 顺时针画圈 → 音量+
   - swipe_left : 手腕向左滑动 → 上一个功能
   - swipe_right: 手腕向右滑动 → 下一个功能
   - wave       : 手腕往复摆动 → 返回主页
@@ -47,6 +47,12 @@ class GestureClassifier:
     # Meta-router: 动态 LSTM 置信度需比静态高多少才切换为动态输出
     DYNAMIC_CONF_MARGIN: float = 0.05
 
+    # 运动能量阈值：超过此值认为手在显著运动，倾向动态手势
+    MOTION_FIRE_THRESHOLD: float = 0.0004
+
+    # 持续运动帧数：超过此值强制让动态手势胜出（抑制静态"确认/唤醒"误判）
+    SUSTAINED_MOTION_FRAMES: int = 4
+
     # wave（主页）需连续确认的帧数，防误触发
     WAVE_STABLE_FRAMES: int = 5
 
@@ -68,6 +74,11 @@ class GestureClassifier:
         self._stable_gesture: str | None = None
         self._stable_count: int = 0
         self._wave_count: int = 0            # wave 连续确认计数
+
+        # 运动追踪（独立于 LSTM，用于元路由器判断"手是否在运动"）
+        self._motion_history: list[tuple[float, float]] = []  # (wrist_x, wrist_y)
+        self._motion_history_max: int = 15
+        self._motion_frames: int = 0          # 连续高运动帧计数
 
         # 尝试加载训练好的 SVM 模型 + 动态 LSTM 模型
         if domain == "owner":
@@ -186,6 +197,8 @@ class GestureClassifier:
             self._no_hand += 1
             self._stable_gesture = None
             self._stable_count = 0
+            self._motion_history.clear()
+            self._motion_frames = 0
             if self._no_hand >= self.NO_HAND_REARM_FRAMES:
                 self._cooldown = 0  # 手势边界 → 解除冷却
 
@@ -221,13 +234,36 @@ class GestureClassifier:
         wave_confirmed_this_frame = False
 
         if dynamic_gesture and dynamic_gesture != "unknown":
+            # 运动能量（独立于 LSTM，基于手腕轨迹方差）
+            motion_energy = self._update_motion(keypoints)
+
             should_fire_dynamic = False
+
             if static_gesture == "unknown" or static_gesture == "pointing":
                 # 静态不可靠时，动态直接触发
                 should_fire_dynamic = True
+                self._motion_frames = min(self._motion_frames + 1, 10)
+            elif motion_energy > self.MOTION_FIRE_THRESHOLD:
+                # 手在显著运动 → 大幅惩罚静止手势（fist/palm 不应该运动中触发）
+                self._motion_frames += 1
+                if static_gesture in ("fist", "palm"):
+                    # 运动中出现的 "确认/唤醒" 几乎一定是误判 → 惩罚 65%
+                    adjusted_static_conf = static_conf * 0.35
+                else:
+                    adjusted_static_conf = static_conf * 0.65
+
+                if self._motion_frames >= self.SUSTAINED_MOTION_FRAMES:
+                    # 持续运动 N 帧 → 确定是动态手势，低置信也触发
+                    should_fire_dynamic = dynamic_conf >= 0.20
+                else:
+                    # 刚开始运动 → 动态只需打赢被惩罚后的静态
+                    should_fire_dynamic = dynamic_conf > adjusted_static_conf + 0.02
             elif dynamic_conf > static_conf + self.DYNAMIC_CONF_MARGIN:
-                # 动态置信度显著高于静态 → 动态优先
+                # 低运动但动态置信度显著高于静态 → 动态优先
                 should_fire_dynamic = True
+                self._motion_frames = max(0, self._motion_frames - 1)
+            else:
+                self._motion_frames = max(0, self._motion_frames - 1)
 
             if should_fire_dynamic:
                 # wave（主页）需要连续5帧确认才输出，防误触发
@@ -349,6 +385,30 @@ class GestureClassifier:
         return "unknown", 0.40
 
     # ----------------------------------------------------------------
+    # 运动追踪（供元路由器使用）
+    # ----------------------------------------------------------------
+
+    def _update_motion(self, keypoints: list[dict]) -> float:
+        """更新手腕运动缓冲区，返回当前运动能量（归一化坐标方差）。
+
+        独立于 LSTM，确保启发式 tracker 回退时也能受益。
+        """
+        if len(keypoints) != 21:
+            return 0.0
+
+        wrist_x, wrist_y = keypoints[0]["x"], keypoints[0]["y"]
+        self._motion_history.append((wrist_x, wrist_y))
+        if len(self._motion_history) > self._motion_history_max:
+            self._motion_history = self._motion_history[-self._motion_history_max:]
+
+        if len(self._motion_history) < 5:
+            return 0.0
+
+        xs = [p[0] for p in self._motion_history]
+        ys = [p[1] for p in self._motion_history]
+        return float(np.var(xs)) + float(np.var(ys))
+
+    # ----------------------------------------------------------------
     # 手指伸展判定
     # ----------------------------------------------------------------
 
@@ -405,7 +465,7 @@ class HandGestureTracker:
     追踪手部运动轨迹，识别动态手势。
 
     三种动态手势:
-      - 垂直滑动 (swipe_up / swipe_down): 手腕 y 方向位移超阈值
+      - 画圈 (circle_cw / circle_ccw): 手腕轨迹累计转角 ≈ 2π 且闭环
       - 水平滑动 (swipe_left / swipe_right): 手腕 x 方向位移超阈值
       - 挥手 (wave): 手腕 x 方向往复反转 ≥ 2 次
 
@@ -426,7 +486,7 @@ class HandGestureTracker:
         """
         输入 21 关键点，返回识别的动态手势名称或 None。
 
-        手势优先级: 挥手 > 垂直滑动 > 水平滑动
+        手势优先级: 挥手 > 画圈 > 水平滑动
         """
         if len(keypoints) != 21:
             return None
@@ -453,11 +513,11 @@ class HandGestureTracker:
             self.reset()
             return wave
 
-        # 垂直滑动 (swipe_up / swipe_down)
-        vertical_swipe = self._detect_swipe_vertical()
-        if vertical_swipe:
+        # 画圈 (circle_cw / circle_ccw)
+        circle = self._detect_circle()
+        if circle:
             self.reset()
-            return vertical_swipe
+            return circle
 
         # 水平滑动 (swipe_left / swipe_right)
         swipe = self._detect_swipe()
@@ -468,7 +528,75 @@ class HandGestureTracker:
         return None
 
     # ------------------------------------------------------------
-    # 垂直滑动检测 (swipe_up / swipe_down)
+    # 画圈检测 (circle_cw / circle_ccw)
+    # ------------------------------------------------------------
+
+    def _detect_circle(self) -> str | None:
+        """检测画圈手势，基于累计转向角 + 闭环判定。"""
+        if len(self.history) < 12:
+            return None
+
+        xs = np.array([h[1] for h in self.history], dtype=np.float64)
+        ys = np.array([h[2] for h in self.history], dtype=np.float64)
+
+        # 平滑降噪（3点均值滤波）
+        if len(xs) >= 3:
+            kernel = np.ones(3) / 3.0
+            xs_smooth = np.convolve(xs, kernel, mode='valid')
+            ys_smooth = np.convolve(ys, kernel, mode='valid')
+        else:
+            xs_smooth, ys_smooth = xs, ys
+
+        total_angle = 0.0
+        valid_steps = 0
+        n = len(xs_smooth)
+
+        for i in range(1, n - 1):
+            v1_x = xs_smooth[i] - xs_smooth[i - 1]
+            v1_y = ys_smooth[i] - ys_smooth[i - 1]
+            v2_x = xs_smooth[i + 1] - xs_smooth[i]
+            v2_y = ys_smooth[i + 1] - ys_smooth[i]
+
+            mag1 = math.hypot(v1_x, v1_y)
+            mag2 = math.hypot(v2_x, v2_y)
+            if mag1 < 0.0015 or mag2 < 0.0015:
+                continue
+
+            cos_angle = (v1_x * v2_x + v1_y * v2_y) / (mag1 * mag2)
+            cos_angle = max(-1.0, min(1.0, cos_angle))
+            angle = math.acos(cos_angle)
+
+            # 叉积判断顺时针/逆时针 (屏幕坐标系 y 向下，与数学坐标系相反)
+            cross = v1_x * v2_y - v1_y * v2_x
+            if cross > 0:
+                angle = -angle
+
+            total_angle += angle
+            valid_steps += 1
+
+        if valid_steps < 6:
+            return None
+
+        # 累计转角 > 5.0 rad (~286°) 认为画了圈
+        if abs(total_angle) > 5.0:
+            # 闭环：起点和终点接近
+            net_x = xs[-1] - xs[0]
+            net_y = ys[-1] - ys[0]
+            net_dist = math.hypot(net_x, net_y)
+
+            # 轨迹范围（过滤原地抖动）
+            x_range = float(np.max(xs) - np.min(xs))
+            y_range = float(np.max(ys) - np.min(ys))
+            span = max(x_range, y_range)
+
+            if net_dist < 0.05 and span > 0.03:
+                # total_angle > 0 → 逆时针 (ccw), total_angle < 0 → 顺时针 (cw)
+                return "circle_ccw" if total_angle > 0 else "circle_cw"
+
+        return None
+
+    # ------------------------------------------------------------
+    # 垂直滑动检测 (swipe_up / swipe_down) — 已废弃，保留供参考
     # ------------------------------------------------------------
 
     def _detect_swipe_vertical(self) -> str | None:
