@@ -10,9 +10,6 @@
           <button type="button" class="mode-btn" :class="{ active: mode === 'camera' }" @click="setMode('camera')">
             实时识别
           </button>
-          <button type="button" class="mode-btn" :class="{ active: mode === 'image' }" @click="setMode('image')">
-            图片识别
-          </button>
           <button type="button" class="mode-btn" :class="{ active: mode === 'video' }" @click="setMode('video')">
             视频识别
           </button>
@@ -30,14 +27,12 @@
         <label v-else class="upload-zone">
           <input
             class="hidden-input"
-            :accept="mode === 'video' ? 'video/*' : 'image/*'"
+            accept="video/*"
             type="file"
-            @change="mode === 'video' ? onVideoFileChange($event) : onImageFileChange($event)"
+            @change="onVideoFileChange($event)"
           />
-          <div class="main">{{ mode === "video" ? "点击上传交警手势视频" : "点击上传交警手势图片" }}</div>
-          <div class="sub">
-            {{ mode === "video" ? "处理完成后会生成标注视频并保留识别结果" : "支持 JPG、PNG、WEBP" }}
-          </div>
+          <div class="main">点击上传交警手势视频</div>
+          <div class="sub">处理完成后会生成标注视频并保留识别结果</div>
         </label>
 
         <div class="video-status" v-if="error">
@@ -74,22 +69,9 @@
             />
           </div>
 
-          <div v-else-if="imageDisplayUrl" class="preview-stage">
-            <div class="image-frame">
-              <img :src="imageDisplayUrl" class="preview-image" @load="onImgLoad" />
-              <canvas
-                v-if="!imageResult?.annotated_image"
-                ref="canvasRef"
-                class="overlay-canvas"
-                :width="canvasW"
-                :height="canvasH"
-              />
-            </div>
-          </div>
-
           <div v-else class="image-placeholder police-frame">
-            {{ mode === "video" ? "交警手势视频" : "交警手势图片" }}
-            <div class="small">{{ mode === "video" ? "上传视频后这里显示标注结果" : "上传图片后这里显示关键点标注" }}</div>
+            交警手势视频
+            <div class="small">上传视频后这里显示标注结果</div>
           </div>
         </div>
 
@@ -99,7 +81,7 @@
         <div class="stream-meta" v-else-if="mode === 'video' && videoProgress">
           {{ buildVideoProgressText(videoProgress) }}
         </div>
-        <div class="stream-meta" v-else-if="loading">{{ mode === "video" ? "正在处理视频 ..." : "识别中 ..." }}</div>
+        <div class="stream-meta" v-else-if="loading">正在处理视频 ...</div>
 
         <template v-if="currentResult">
           <div class="summary-row">
@@ -119,24 +101,10 @@
           <div class="stream-meta" v-else-if="mode === 'camera'">
             实时模式：直接显示后端按识别模型标注后的画面
           </div>
-          <div class="stream-meta" v-else>
-            检测到 {{ currentResult.keypoints.length }} 个关键点
-          </div>
         </template>
       </article>
 
       <article class="panel side-panel">
-        <h4>识别结果</h4>
-        <div
-          class="result-item"
-          v-for="item in candidateList"
-          :key="item.value"
-          :class="{ inactive: item.value !== currentGesture }"
-        >
-          <span>{{ item.label }}</span>
-          <span class="val">{{ item.value === currentGesture ? `${(currentConfidence * 100).toFixed(1)}%` : "--" }}</span>
-        </div>
-
         <div class="support-label">支持手势</div>
         <div class="support-tags">停止 · 直行 · 左转弯 · 左待转 · 右转弯 · 变道 · 减速 · 靠边停车</div>
 
@@ -178,21 +146,15 @@ import {
   type PoliceGestureVideoResult
 } from "@/api/police_gesture";
 
-type Mode = "camera" | "image" | "video";
+type Mode = "camera" | "video";
 
 const mode = ref<Mode>("camera");
 const loading = ref(false);
 const error = ref("");
-const previewUrl = ref("");
-const imageResult = ref<PoliceGestureFrameResult | null>(null);
 const cameraResult = ref<PoliceGestureFrameResult | null>(null);
 const videoResult = ref<PoliceGestureVideoResult | null>(null);
 const videoProgress = ref<PoliceGestureVideoProgress | null>(null);
 const historyItems = ref<PoliceGestureHistoryItem[]>([]);
-
-const canvasRef = ref<HTMLCanvasElement | null>(null);
-const canvasW = ref(300);
-const canvasH = ref(220);
 
 const videoRef = ref<HTMLVideoElement | null>(null);
 const captureCanvasRef = ref<HTMLCanvasElement | null>(null);
@@ -222,26 +184,11 @@ const GESTURE_LABELS: Record<string, string> = {
   "未检测到人体": "未检测到人体"
 };
 
-const candidateList = [
-  { value: "stop", label: "停止信号" },
-  { value: "go_straight", label: "直行信号" },
-  { value: "left_turn", label: "左转弯信号" },
-  { value: "left_wait_turn", label: "左待转信号" },
-  { value: "right_turn", label: "右转弯信号" },
-  { value: "lane_change", label: "变道信号" },
-  { value: "slow_down", label: "减速慢行信号" },
-  { value: "pull_over", label: "靠边停车信号" }
-];
-
 const currentResult = computed(() => {
   if (mode.value === "camera") return cameraResult.value;
-  if (mode.value === "video") return videoResult.value;
-  return imageResult.value;
+  return videoResult.value;
 });
-const currentGesture = computed(() => currentResult.value?.gesture ?? "");
-const currentConfidence = computed(() => currentResult.value?.confidence ?? 0);
-const gestureLabel = computed(() => formatGesture(currentGesture.value));
-const imageDisplayUrl = computed(() => imageResult.value?.annotated_image || previewUrl.value);
+const gestureLabel = computed(() => formatGesture(currentResult.value?.gesture ?? ""));
 const cameraDisplayUrl = computed(() => cameraResult.value?.annotated_image || "");
 const processedVideoUrl = computed(() => normalizeMediaUrl(videoResult.value?.processed_video_url ?? ""));
 const previewStreamUrl = computed(() => {
@@ -275,11 +222,6 @@ function setMode(nextMode: Mode) {
   mode.value = nextMode;
   videoPreviewStarted.value = false;
   error.value = "";
-  resetPreview();
-  if (nextMode !== "image") {
-    imageResult.value = null;
-    clearCanvas();
-  }
   if (nextMode !== "camera") {
     cameraResult.value = null;
   }
@@ -287,13 +229,6 @@ function setMode(nextMode: Mode) {
     videoProgress.value = null;
     videoResult.value = null;
   }
-}
-
-function resetPreview() {
-  if (previewUrl.value) {
-    URL.revokeObjectURL(previewUrl.value);
-  }
-  previewUrl.value = "";
 }
 
 async function loadHistory() {
@@ -305,46 +240,11 @@ async function loadHistory() {
   }
 }
 
-async function onImageFileChange(event: Event) {
-  const input = event.target as HTMLInputElement;
-  const file = input.files?.[0];
-  if (!file) return;
-
-  resetPreview();
-  imageResult.value = null;
-  error.value = "";
-  loading.value = true;
-  previewUrl.value = URL.createObjectURL(file);
-
-  try {
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("input_mode", "image");
-    const { data } = await fetchPoliceGestureApi(formData);
-    imageResult.value = data;
-    await nextTick();
-    if (!data.annotated_image) {
-      drawImageKeypoints(data.keypoints);
-    } else {
-      clearCanvas();
-    }
-    await loadHistory();
-  } catch (err) {
-    imageResult.value = null;
-    clearCanvas();
-    error.value = extractErrorMessage(err, "图片识别失败");
-  } finally {
-    loading.value = false;
-    input.value = "";
-  }
-}
-
 async function onVideoFileChange(event: Event) {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
   if (!file) return;
 
-  resetPreview();
   videoResult.value = null;
   error.value = "";
   loading.value = true;
@@ -483,73 +383,8 @@ function scheduleNextVideoProgressPoll(taskId: string, afterFailure = false) {
   }, nextDelay);
 }
 
-function onImgLoad(event: Event) {
-  const image = event.target as HTMLImageElement;
-  canvasW.value = image.clientWidth || 300;
-  canvasH.value = image.clientHeight || 220;
-  if (imageResult.value && !imageResult.value.annotated_image) {
-    drawImageKeypoints(imageResult.value.keypoints);
-  }
-}
-
 function handleVideoPreviewLoad() {
   videoPreviewStarted.value = true;
-}
-
-const POSE_CONNECTIONS: [number, number][] = [
-  [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
-  [11, 23], [12, 24], [23, 24],
-  [23, 25], [25, 27], [24, 26], [26, 28],
-  [0, 1], [0, 4], [1, 2], [2, 3], [4, 5], [5, 6]
-];
-
-const SIMPLE_CONNECTIONS: [number, number][] = [
-  [0, 1], [1, 2], [3, 4], [4, 5], [13, 0], [13, 3], [0, 6], [3, 9], [6, 7], [7, 8], [9, 10], [10, 11], [12, 13]
-];
-
-function drawImageKeypoints(keypoints: Array<{ x: number; y: number }>) {
-  const canvas = canvasRef.value;
-  const ctx = canvas?.getContext("2d");
-  if (!canvas || !ctx) return;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  drawSkeleton(ctx, canvas.width, canvas.height, keypoints);
-}
-
-function drawSkeleton(
-  ctx: CanvasRenderingContext2D,
-  width: number,
-  height: number,
-  points: Array<{ x: number; y: number }>
-) {
-  if (!points.length) return;
-  const usePose = points.length >= 33;
-  const connections = usePose ? POSE_CONNECTIONS : SIMPLE_CONNECTIONS;
-  ctx.strokeStyle = "#2dd4bf";
-  ctx.lineWidth = 2;
-  for (const [start, end] of connections) {
-    const startPoint = points[start];
-    const endPoint = points[end];
-    if (!startPoint || !endPoint) continue;
-    ctx.beginPath();
-    ctx.moveTo(startPoint.x * width, startPoint.y * height);
-    ctx.lineTo(endPoint.x * width, endPoint.y * height);
-    ctx.stroke();
-  }
-
-  ctx.fillStyle = "#c9b099";
-  for (const point of points) {
-    ctx.beginPath();
-    ctx.arc(point.x * width, point.y * height, usePose ? 3 : 4, 0, 2 * Math.PI);
-    ctx.fill();
-  }
-}
-
-function clearCanvas() {
-  const canvas = canvasRef.value;
-  const ctx = canvas?.getContext("2d");
-  if (ctx && canvas) {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-  }
 }
 
 function extractErrorMessage(error: unknown, fallback: string) {
@@ -571,8 +406,7 @@ function createTaskId() {
 
 function buildPreviewStreamUrl(taskId: string) {
   const token = localStorage.getItem("cvms_token") || "";
-  const apiBase = (import.meta.env.VITE_API_BASE || "/api/v1").replace(/\/$/, "");
-  const baseUrl = apiBase.startsWith("http") ? apiBase : `${window.location.origin}${apiBase}`;
+  const baseUrl = resolveBackendApiBase();
   const encodedTaskId = encodeURIComponent(taskId);
   const encodedToken = encodeURIComponent(token);
   return `${baseUrl}/police-gesture/video/preview/${encodedTaskId}?token=${encodedToken}`;
@@ -602,16 +436,37 @@ function formatTime(value: string) {
 
 function normalizeMediaUrl(url: string) {
   if (!url) return "";
-  if (url.startsWith("/media/")) return url;
+  if (url.startsWith("/media/")) {
+    return `${resolveBackendOrigin()}${url}`;
+  }
   try {
     const parsed = new URL(url);
     if (parsed.pathname.startsWith("/media/")) {
-      return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+      return `${resolveBackendOrigin()}${parsed.pathname}${parsed.search}${parsed.hash}`;
     }
   } catch {
     return url;
   }
   return url;
+}
+
+function resolveBackendApiBase() {
+  const apiBase = (import.meta.env.VITE_API_BASE || "/api/v1").replace(/\/$/, "");
+  if (apiBase.startsWith("http://") || apiBase.startsWith("https://")) {
+    return apiBase;
+  }
+  return `${resolveBackendOrigin()}${apiBase}`;
+}
+
+function resolveBackendOrigin() {
+  if (typeof window === "undefined") {
+    return "";
+  }
+  const { protocol, hostname, host, port } = window.location;
+  if ((hostname === "localhost" || hostname === "127.0.0.1") && port === "5173") {
+    return `${protocol}//127.0.0.1:8000`;
+  }
+  return `${protocol}//${host}`;
 }
 
 async function startCamera() {
@@ -742,7 +597,6 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   stopCamera();
   stopVideoProgressPolling();
-  resetPreview();
 });
 </script>
 
@@ -826,34 +680,42 @@ onBeforeUnmount(() => {
 
 .preview-stage {
   display: flex;
+  align-items: center;
   justify-content: center;
+  min-height: 360px;
   padding: 10px;
+  overflow: hidden;
   border-radius: 16px;
-  background: linear-gradient(180deg, rgba(11, 16, 32, 0.58), rgba(11, 16, 32, 0.44));
+  background: linear-gradient(180deg, #f7efe5, #ecdfcf);
 }
 
-.camera-stage,
-.image-frame {
+.camera-stage {
   position: relative;
   width: 100%;
+}
+
+.police-frame {
+  width: 100%;
+  min-height: 360px;
+  margin-bottom: 0;
+  color: #5b4639;
+  background: linear-gradient(180deg, #f8f1e8, #efe3d4);
+  border: 1px solid rgba(170, 129, 95, 0.22);
+  border-radius: 16px;
+}
+
+.police-frame .small {
+  color: #9a7f6b;
 }
 
 .preview-image,
 .preview-video {
   display: block;
   width: 100%;
-  max-height: 520px;
+  max-height: min(72vh, 620px);
   object-fit: contain;
   border-radius: 10px;
-  background: #0b1020;
-}
-
-.overlay-canvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
+  background: #f4eadf;
 }
 
 .summary-row {

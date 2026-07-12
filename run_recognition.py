@@ -31,13 +31,13 @@ if PROJECT_ROOT not in sys.path:
 
 from police import config as police_cfg
 from police.features import associate_hands, classify_palm_orientation, extract_features
-from police.geometry import calc_dist, setup_local_frame
 from police.gesture_classifier import GestureStateMachine
+from police.geometry import calc_dist, setup_local_frame
 from police.models import create_hand_detector, create_pose_detector, detect_hand, detect_pose
 from police.visualization import draw_chinese_text, draw_hand_landmarks, draw_pose_landmarks, draw_wrist_marker
 
 try:
-    from ctpgr_engine import CTPGREngine
+    from ctpgr_engine import CTPGREngine, mediapipe_to_aic14
 
     _DL_AVAILABLE = True
 except ImportError as exc:
@@ -88,7 +88,6 @@ def parse_args():
     parser.add_argument("--scale", type=float, default=police_cfg.INFER_SCALE, help="推理缩放比")
     parser.add_argument("--no-hand", action="store_true", help="不使用 Hand Landmarker（仅 Pose）")
     parser.add_argument("--no-dl", action="store_true", help="禁用 CTPGREngine 深度学习模型（仅使用规则模型）")
-    parser.add_argument("--dl-skip", type=int, default=3, help="深度学习模型跳帧数")
     parser.add_argument("--rtsp-url", default="rtsp://127.0.0.1:8554/test", help="backend-api 模式下读取的 RTSP 地址")
     return parser.parse_args()
 
@@ -177,10 +176,10 @@ def run_local_model(args):
 
     dl_engine = None
     if _DL_AVAILABLE and not args.no_dl:
-        print("[LOAD] CTPGREngine 深度学习模型（pose_model.pt + lstm.pt RNN）...")
+        print("[LOAD] CTPGREngine 深度学习模型（仅 LSTM，复用 MediaPipe 关键点）...")
         try:
-            dl_engine = CTPGREngine()
-            print("[ OK ] CTPGREngine 就绪（14 关键点 + LSTM 9 分类）")
+            dl_engine = CTPGREngine(load_pose_model=False)
+            print("[ OK ] CTPGREngine 就绪（MediaPipe→AIC14 映射 + LSTM 9 分类）")
         except Exception as exc:
             import traceback
 
@@ -220,9 +219,6 @@ def run_local_model(args):
     last_feat = None
     last_hand_left = None
     last_hand_right = None
-    display_result = None
-    display_confidence = 0.0
-    result_display_timer = 0
     dl_gesture = "loading..."
     dl_confidence = 0.0
     dl_counter = 0
@@ -250,7 +246,7 @@ def run_local_model(args):
 
             if should_infer:
                 pose_result = detect_pose(pose_detector, frame)
-                hand_result = detect_hand(hand_detector, frame)
+                hand_result = detect_hand(hand_detector, frame) if hand_detector is not None else None
             else:
                 pose_result = None
                 hand_result = None
@@ -307,6 +303,58 @@ def run_local_model(args):
 
                 if world_landmarks is not None:
                     feat = extract_features(world_landmarks, landmarks, last_hand_left, last_hand_right)
+                    if last_feat is not None:
+                        left_visibility = landmarks[15].visibility if landmarks else 0.0
+                        right_visibility = landmarks[16].visibility if landmarks else 0.0
+                        left_keys = (
+                            "left_raise",
+                            "left_stretch",
+                            "left_z_diff",
+                            "left_wx",
+                            "left_wy",
+                            "left_sx",
+                            "left_sy",
+                            "left_orient",
+                            "left_pose",
+                            "left_region",
+                            "left_fwd",
+                            "left_lat",
+                            "left_dir_raw",
+                            "left_arm_angle",
+                        )
+                        right_keys = (
+                            "right_raise",
+                            "right_stretch",
+                            "right_z_diff",
+                            "right_wx",
+                            "right_wy",
+                            "right_sx",
+                            "right_sy",
+                            "right_orient",
+                            "right_pose",
+                            "right_region",
+                            "right_fwd",
+                            "right_lat",
+                            "right_dir_raw",
+                            "right_arm_angle",
+                        )
+                        if left_visibility < 0.3:
+                            for key in left_keys:
+                                if key in feat and key in last_feat:
+                                    feat[key] = last_feat[key]
+                            feat["left_visible"] = False
+                        else:
+                            feat["left_visible"] = True
+                        if right_visibility < 0.3:
+                            for key in right_keys:
+                                if key in feat and key in last_feat:
+                                    feat[key] = last_feat[key]
+                            feat["right_visible"] = False
+                        else:
+                            feat["right_visible"] = True
+                    else:
+                        feat["left_visible"] = True
+                        feat["right_visible"] = True
                     last_feat = feat
                 else:
                     feat = last_feat
@@ -332,16 +380,36 @@ def run_local_model(args):
                 right_palm_ori = classify_palm_orientation(last_hand_right, body_right_2d, body_up_2d)
 
                 if feat is not None:
-                    result = state_machine.update(
+                    state_machine.update(
                         feat,
                         left_palm_ori,
                         right_palm_ori,
                         global_frame,
                         feat.get("shoulder_width", 0.35),
                     )
-                    if result is not None:
-                        display_result, display_confidence = result
-                        result_display_timer = police_cfg.RESULT_DISPLAY_FRAMES
+
+                if dl_engine is not None:
+                    dl_counter += 1
+                    try:
+                        coord_aic = mediapipe_to_aic14(landmarks)
+                        dl_result = dl_engine.predict_from_keypoints(coord_aic)
+                        dl_gesture = dl_result["gesture"]
+                        dl_confidence = dl_result["confidence"]
+                    except Exception as exc:
+                        if not dl_error_once:
+                            print(f"\n[DL-ERROR] 推理异常: {exc}")
+                            dl_error_once = True
+                        dl_gesture = "DL error"
+                        dl_confidence = 0.0
+
+                    if dl_counter % 30 == 0:
+                        left_region = (last_feat or {}).get("left_region", "?")
+                        right_region = (last_feat or {}).get("right_region", "?")
+                        print(
+                            f"  [DL] {dl_gesture} (置信度:{dl_confidence:.0%})  "
+                            f"| 左手: {left_region}  右手: {right_region}"
+                        )
+
             elif should_infer:
                 state_machine.cancel_action(global_frame)
                 last_landmarks = None
@@ -349,27 +417,6 @@ def run_local_model(args):
                 last_feat = None
                 last_hand_left = None
                 last_hand_right = None
-
-            if dl_engine is not None and frame_counter % max(args.dl_skip, 1) == 0:
-                dl_counter += 1
-                dl_frame = cv2.resize(frame, (512, 512))
-                try:
-                    dl_result = dl_engine.predict_frame(dl_frame)
-                    dl_gesture = dl_result["gesture"]
-                    dl_confidence = dl_result["confidence"]
-                except Exception as exc:
-                    if not dl_error_once:
-                        print(f"\n[DL-ERROR] 推理异常: {exc}")
-                        dl_error_once = True
-                    dl_gesture = "DL error"
-                    dl_confidence = 0.0
-                if dl_counter % 30 == 0:
-                    left_region = (last_feat or {}).get("left_region", "?")
-                    right_region = (last_feat or {}).get("right_region", "?")
-                    print(
-                        f"  [DL] {dl_gesture} (置信度:{dl_confidence:.0%})  "
-                        f"| 左手: {left_region}  右手: {right_region}"
-                    )
 
             if not should_infer and last_landmarks is not None:
                 draw_pose_landmarks(frame, last_landmarks, height, width)
@@ -382,37 +429,8 @@ def run_local_model(args):
                 else:
                     draw_wrist_marker(frame, last_landmarks, 16, height, width, side="R")
 
-            if result_display_timer > 0:
-                result_display_timer -= 1
-            else:
-                display_result = None
-                display_confidence = 0.0
-
             if last_landmarks is None:
                 frame = draw_chinese_text(frame, "未检测到人体", (10, 110), (0, 0, 255), 36)
-            elif state_machine.state == police_cfg.STATE_ACTIVE:
-                frame = draw_chinese_text(frame, "动作识别中...", (10, 110), (0, 255, 255), 30)
-            elif state_machine.cooldown_counter > 0:
-                frame = draw_chinese_text(
-                    frame,
-                    f"冷却中 {state_machine.cooldown_counter}",
-                    (10, 110),
-                    (128, 128, 128),
-                    28,
-                )
-            elif display_result is not None:
-                frame = draw_chinese_text(frame, f"规则结果: {display_result}", (10, 110), (0, 255, 0), 34)
-                if display_confidence > 0:
-                    frame = draw_chinese_text(frame, f"置信度: {display_confidence:.0%}", (10, 150), (0, 200, 0), 22)
-            else:
-                frame = draw_chinese_text(frame, "等待动作...", (10, 110), (255, 255, 255), 30)
-
-            if last_feat is not None:
-                info_x = width - 200
-                left_region = last_feat.get("left_region", "?")
-                right_region = last_feat.get("right_region", "?")
-                frame = draw_chinese_text(frame, f"左手: {left_region}", (info_x, 15), (0, 200, 255), 20)
-                frame = draw_chinese_text(frame, f"右手: {right_region}", (info_x, 42), (200, 100, 255), 20)
 
             cv2.putText(
                 frame,
@@ -424,6 +442,13 @@ def run_local_model(args):
                 2,
             )
 
+            if last_feat is not None:
+                info_x = width - 200
+                left_region = last_feat.get("left_region", "?")
+                right_region = last_feat.get("right_region", "?")
+                frame = draw_chinese_text(frame, f"左手: {left_region}", (info_x, 15), (0, 200, 255), 20)
+                frame = draw_chinese_text(frame, f"右手: {right_region}", (info_x, 42), (200, 100, 255), 20)
+
             if dl_engine is not None:
                 panel_w, panel_h = 260, 80
                 panel_x, panel_y = 15, 15
@@ -433,13 +458,23 @@ def run_local_model(args):
                 frame = cv2.addWeighted(overlay, 0.65, frame, 0.35, 0)
                 frame = draw_chinese_text(frame, "交警手势识别", (panel_x + 10, panel_y + 5), (0, 255, 255), 22)
                 frame = draw_chinese_text(frame, dl_gesture, (panel_x + 10, panel_y + 28), (0, 215, 255), 28)
-                frame = draw_chinese_text(frame, f"置信度: {dl_confidence:.1%}", (panel_x + 10, panel_y + 60), (255, 255, 255), 18)
+                frame = draw_chinese_text(
+                    frame,
+                    f"置信度: {dl_confidence:.1%}",
+                    (panel_x + 10, panel_y + 60),
+                    (255, 255, 255),
+                    18,
+                )
 
             display_frame = cv2.resize(frame, None, fx=display_scale, fy=display_scale)
             cv2.imshow("Police Gesture Recognition", display_frame)
 
-            elapsed_frame = time.time() - frame_started_at
-            wait_ms = max(1, int(max(frame_delay - elapsed_frame, 0.0) * 1000))
+            if not isinstance(source, int):
+                elapsed_frame = time.time() - frame_started_at
+                wait_ms = max(1, int(max(frame_delay - elapsed_frame, 0.0) * 1000))
+            else:
+                wait_ms = 1
+
             if cv2.waitKey(wait_ms) & 0xFF == ord("q"):
                 print("\n用户按下 'q' 键，退出。")
                 break

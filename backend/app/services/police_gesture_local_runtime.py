@@ -23,9 +23,10 @@ from police.models import create_hand_detector, create_pose_detector, detect_han
 from police.visualization import draw_chinese_text, draw_hand_landmarks, draw_pose_landmarks, draw_wrist_marker
 
 try:
-    from ctpgr_engine import CTPGREngine
+    from ctpgr_engine import CTPGREngine, mediapipe_to_aic14
 except Exception:  # pragma: no cover - runtime import guard
     CTPGREngine = None
+    mediapipe_to_aic14 = None
 
 
 NO_VIDEO_GESTURE = "no_gesture"
@@ -81,7 +82,7 @@ class PoliceGestureVideoSession:
         self.hand_detector = None
         if os.path.exists(police_cfg.HAND_MODEL_PATH):
             self.hand_detector = create_hand_detector(police_cfg.HAND_MODEL_PATH)
-        self.dl_engine = CTPGREngine() if CTPGREngine is not None else None
+        self.dl_engine = CTPGREngine(load_pose_model=False) if CTPGREngine is not None else None
 
         self.state_machine = GestureStateMachine(verbose=False)
         self.frame_counter = 0
@@ -102,6 +103,10 @@ class PoliceGestureVideoSession:
         self.dl_warmed_up = not realtime
         self.warmup_started_at = time.time()
         self.warmup_seconds = 2.0
+        self.dl_persist_gesture = "无手势"
+        self.dl_persist_confidence = 0.0
+        self.dl_persist_counter = 0
+        self.dl_persist_max = 8
 
     def __enter__(self) -> PoliceGestureVideoSession:
         return self
@@ -152,9 +157,30 @@ class PoliceGestureVideoSession:
 
             left_shoulder = px(11)
             right_shoulder = px(12)
+            left_elbow = px(13)
+            right_elbow = px(14)
             nose = px(0)
             left_hip = px(23)
             right_hip = px(24)
+
+            cv2.putText(
+                annotated,
+                "L",
+                (int(left_shoulder[0]) - 15, int(left_shoulder[1]) - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255),
+                3,
+            )
+            cv2.putText(
+                annotated,
+                "R",
+                (int(right_shoulder[0]) + 5, int(right_shoulder[1]) - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 0, 0),
+                3,
+            )
 
             _ = calc_dist(left_shoulder, right_shoulder)
             _, body_right_2d, body_up_2d = setup_local_frame(
@@ -167,6 +193,58 @@ class PoliceGestureVideoSession:
 
             if world_landmarks is not None:
                 feat = extract_features(world_landmarks, landmarks, self.last_hand_left, self.last_hand_right)
+                if self.last_feat is not None:
+                    left_visibility = landmarks[15].visibility if landmarks else 0.0
+                    right_visibility = landmarks[16].visibility if landmarks else 0.0
+                    left_keys = (
+                        "left_raise",
+                        "left_stretch",
+                        "left_z_diff",
+                        "left_wx",
+                        "left_wy",
+                        "left_sx",
+                        "left_sy",
+                        "left_orient",
+                        "left_pose",
+                        "left_region",
+                        "left_fwd",
+                        "left_lat",
+                        "left_dir_raw",
+                        "left_arm_angle",
+                    )
+                    right_keys = (
+                        "right_raise",
+                        "right_stretch",
+                        "right_z_diff",
+                        "right_wx",
+                        "right_wy",
+                        "right_sx",
+                        "right_sy",
+                        "right_orient",
+                        "right_pose",
+                        "right_region",
+                        "right_fwd",
+                        "right_lat",
+                        "right_dir_raw",
+                        "right_arm_angle",
+                    )
+                    if left_visibility < 0.3:
+                        for key in left_keys:
+                            if key in feat and key in self.last_feat:
+                                feat[key] = self.last_feat[key]
+                        feat["left_visible"] = False
+                    else:
+                        feat["left_visible"] = True
+                    if right_visibility < 0.3:
+                        for key in right_keys:
+                            if key in feat and key in self.last_feat:
+                                feat[key] = self.last_feat[key]
+                        feat["right_visible"] = False
+                    else:
+                        feat["right_visible"] = True
+                else:
+                    feat["left_visible"] = True
+                    feat["right_visible"] = True
                 self.last_feat = feat
             else:
                 feat = self.last_feat
@@ -209,23 +287,21 @@ class PoliceGestureVideoSession:
             self.last_feat = None
             self.last_hand_left = None
             self.last_hand_right = None
+            self.dl_persist_counter = 0
 
         if self.dl_engine is not None and self.frame_counter % self.dl_skip == 0:
-            if self.realtime and not self.dl_warmed_up:
-                if (time.time() - self.warmup_started_at) >= self.warmup_seconds:
-                    self.dl_warmed_up = True
-                    self.dl_engine.reset_state()
-                    self.dl_gesture = "无手势"
-                    self.dl_confidence = 0.0
-            elif self.last_landmarks is not None:
+            if self.realtime and not self.dl_warmed_up and (time.time() - self.warmup_started_at) >= self.warmup_seconds:
+                self.dl_warmed_up = True
+                self.dl_engine.reset_state()
+                self.dl_gesture = "无手势"
+                self.dl_confidence = 0.0
+
+            if self.last_landmarks is not None and (not self.realtime or self.dl_warmed_up):
                 try:
-                    dl_frame = _crop_person(source_frame, self.last_landmarks, target_size=512)
-                except Exception:
-                    dl_frame = cv2.resize(source_frame, (512, 512))
-                try:
-                    dl_result = self.dl_engine.predict_frame(dl_frame)
-                    self.dl_gesture = str(dl_result.get("gesture", "无手势"))
-                    self.dl_confidence = float(dl_result.get("confidence", 0.0) or 0.0)
+                    coord_aic = mediapipe_to_aic14(self.last_landmarks)
+                    dl_result = self.dl_engine.predict_from_keypoints(coord_aic)
+                    raw_gesture = str(dl_result.get("gesture", "无手势"))
+                    raw_confidence = float(dl_result.get("confidence", 0.0) or 0.0)
                     self.dl_keypoints = [
                         {"x": float(item.get("x", 0.0)), "y": float(item.get("y", 0.0)), "score": 1.0}
                         for item in dl_result.get("keypoints", [])
@@ -233,9 +309,28 @@ class PoliceGestureVideoSession:
                 except Exception:
                     if not self.dl_error_once:
                         self.dl_error_once = True
-                    self.dl_gesture = "DL error"
-                    self.dl_confidence = 0.0
+                    raw_gesture = "DL error"
+                    raw_confidence = 0.0
                     self.dl_keypoints = []
+
+                if self.realtime:
+                    if raw_gesture not in {"无手势", "DL error", "预热中..."}:
+                        self.dl_persist_gesture = raw_gesture
+                        self.dl_persist_confidence = raw_confidence
+                        self.dl_persist_counter = self.dl_persist_max
+                        self.dl_gesture = raw_gesture
+                        self.dl_confidence = raw_confidence
+                    elif self.dl_persist_counter > 0:
+                        decay = self.dl_persist_counter / self.dl_persist_max
+                        self.dl_gesture = self.dl_persist_gesture
+                        self.dl_confidence = self.dl_persist_confidence * max(0.55, decay)
+                        self.dl_persist_counter -= 1
+                    else:
+                        self.dl_gesture = raw_gesture
+                        self.dl_confidence = raw_confidence
+                else:
+                    self.dl_gesture = raw_gesture
+                    self.dl_confidence = raw_confidence
 
         if not should_infer and self.last_landmarks is not None:
             draw_pose_landmarks(annotated, self.last_landmarks, height, width)
