@@ -189,11 +189,16 @@ def main():
     dl_confidence = 0.0
     if dl_engine is not None:
         try:
-            dl_frame = cv2.resize(frame, (256, 256))
-            dl_result = dl_engine.predict_frame(dl_frame)
+            dl_frame = cv2.resize(frame, (512, 512))
+            # LSTM 需要时序上下文：训练时 LABEL_DELAY=15，前15帧标签为"无手势"
+            # 单帧从 h0/c0 推理会偏向"无手势"，因此喂入同一帧 20 次预热 LSTM 隐藏状态
+            WARMUP_FRAMES = 20
+            for _ in range(WARMUP_FRAMES):
+                dl_result = dl_engine.predict_frame(dl_frame)
             dl_gesture = dl_result["gesture"]
             dl_confidence = dl_result["confidence"]
-            print(f"  [DL模型]  手势: {dl_gesture}  (置信度: {dl_confidence:.0%})")
+            print(f"  [DL模型]  手势: {dl_gesture}  (置信度: {dl_confidence:.0%})"
+                  f"  (预热{WARMUP_FRAMES}帧)")
         except Exception as e:
             print(f"  [DL-ERROR] 推理异常: {e}")
             dl_gesture = "推理失败"
