@@ -11,8 +11,8 @@
 动态手势（通过 HandGestureTracker 时序状态机）:
   - circle_ccw : 逆时针画圈 → 音量-
   - circle_cw  : 顺时针画圈 → 音量+
-  - swipe_left : 手腕向左滑动 → 上一个功能
-  - swipe_right: 手腕向右滑动 → 下一个功能
+  - swipe_left : 左手掌(palm)+右手拳(fist) → 上一个功能（双手规则）
+  - swipe_right: 右手掌(palm)+左手拳(fist) → 下一个功能（双手规则）
   - wave       : 手腕往复摆动 → 返回主页
 
 接口预留:
@@ -61,6 +61,9 @@ class GestureClassifier:
     # 动态手势稳定延迟：动作开始 N 秒后才输出结果，避免初期跳变
     DYNAMIC_SETTLE_SECONDS: float = 1.0
 
+    # 双手组合判定稳定延迟（画面位置区分左右）
+    TWO_HAND_SETTLE_SECONDS: float = 1.0
+
     def __init__(self, domain: str = "owner"):
         self.domain = domain
         self.tracker: HandGestureTracker | None = (
@@ -83,6 +86,10 @@ class GestureClassifier:
         # 动态手势稳定延迟计时
         self._dyn_active: bool = False    # 动态动作是否已激活（开始计时）
         self._dyn_start_time: float = 0.0 # 动作开始时刻（time.time()）
+
+        # 双手组合状态
+        self._two_hand_gesture: str | None = None
+        self._two_hand_start_time: float = 0.0
 
         # 运动追踪（独立于 LSTM，用于元路由器判断"手是否在运动"）
         self._motion_history: list[tuple[float, float]] = []  # (wrist_x, wrist_y)
@@ -182,11 +189,13 @@ class GestureClassifier:
     # 统一入口：静态 SVM + 动态 LSTM/Tracker + meta-router + 时序去抖
     # ----------------------------------------------------------------
 
-    def classify_frame(self, keypoints: list[dict] | None) -> tuple[str, float]:
+    def classify_frame(self, keypoints: list[dict] | None, all_hands: list[list[dict]] | None = None) -> tuple[str, float]:
         """
         统一手势分类入口，融合静态识别、动态追踪、meta-router、时序去抖。
 
         路由逻辑:
+          0. 双手 ≥ 2 → 组合判定（左手掌+右拳=swipe_left, 右手掌+左拳=swipe_right）
+                        → 1 秒稳定后输出，非目标组合返回 idle
           1. 无手 → 触发 LSTM 边界分段判定（对完整轨迹一次分类）
                  → 重置 tracker/LSTM 缓冲
                  → 手消失 ≥ REARM 帧 → 解除冷却
@@ -198,6 +207,30 @@ class GestureClassifier:
         Returns:
             (gesture_name, confidence)
         """
+        # ---- 双手组合判定（替换原 LSTM swipe，画面位置区分左右）----
+        if all_hands is not None and len(all_hands) >= 2:
+            combo = self._classify_two_hands(all_hands)
+            now = time.time()
+
+            if combo is not None:
+                combo_gesture, combo_conf = combo
+                if combo_gesture == self._two_hand_gesture and self._two_hand_start_time > 0:
+                    if now - self._two_hand_start_time >= self.TWO_HAND_SETTLE_SECONDS:
+                        self._cooldown = self.DYNAMIC_COOLDOWN_FRAMES
+                        self._stable_gesture = None
+                        self._stable_start_time = 0.0
+                        self._two_hand_gesture = None
+                        self._two_hand_start_time = 0.0
+                        return combo_gesture, round(combo_conf, 4)
+                else:
+                    self._two_hand_gesture = combo_gesture
+                    self._two_hand_start_time = now
+                return "idle", 0.0
+            else:
+                self._two_hand_gesture = None
+                self._two_hand_start_time = 0.0
+                return "idle", 0.0
+
         # ---- 无手：边界分段 + 重置 ----
         if keypoints is None:
             boundary_result = self._handle_boundary()
@@ -209,6 +242,8 @@ class GestureClassifier:
             self._stable_start_time = 0.0
             self._motion_history.clear()
             self._motion_frames = 0
+            self._two_hand_gesture = None
+            self._two_hand_start_time = 0.0
             if self._no_hand >= self.NO_HAND_REARM_FRAMES:
                 self._cooldown = 0  # 手势边界 → 解除冷却
 
@@ -222,6 +257,10 @@ class GestureClassifier:
             return "unknown", 0.0
 
         self._no_hand = 0
+
+        # 单只手时重置双手状态
+        self._two_hand_gesture = None
+        self._two_hand_start_time = 0.0
 
         # ---- 静态 SVM ----
         static_gesture, static_conf = self.classify_static(keypoints)
@@ -239,6 +278,10 @@ class GestureClassifier:
             heuristic = self.tracker.update(keypoints)
             if heuristic:
                 dynamic_gesture, dynamic_conf = heuristic, 0.85
+
+        # 屏蔽 LSTM/启发式 的 swipe 输出（已改为双手判定）
+        if dynamic_gesture in ("swipe_left", "swipe_right"):
+            dynamic_gesture, dynamic_conf = None, 0.0
 
         # ---- meta-router ----
         wave_confirmed_this_frame = False
@@ -415,6 +458,38 @@ class GestureClassifier:
             return "pointing", 0.78
 
         return "unknown", 0.40
+
+    # ----------------------------------------------------------------
+    # 双手组合判定（替换原动态 swipe）
+    # ----------------------------------------------------------------
+
+    def _classify_two_hands(self, all_hands: list[list[dict]]) -> tuple[str, float] | None:
+        """双手组合判定: 左手掌+右拳→swipe_left, 右手掌+左拳→swipe_right。
+
+        画面位置区分左右: 手腕 x 最小 → 左, x 最大 → 右。
+        注: 若使用镜像摄像头，画面左对应人的右手，需按实际情况调整。
+        """
+        if len(all_hands) < 2:
+            return None
+
+        # 取前两只手，按手腕 x 坐标排序（x 小 → 左，x 大 → 右）
+        two = all_hands[:2]
+        two.sort(key=lambda h: h[0]["x"])
+
+        left_hand = two[0]
+        right_hand = two[1]
+
+        left_gesture, _ = self.classify_static(left_hand)
+        right_gesture, _ = self.classify_static(right_hand)
+
+        # 左手掌(palm) + 右手拳(fist) → swipe_left
+        if left_gesture == "palm" and right_gesture == "fist":
+            return "swipe_left", 0.95
+        # 右手掌(palm) + 左手拳(fist) → swipe_right
+        if right_gesture == "palm" and left_gesture == "fist":
+            return "swipe_right", 0.95
+
+        return None
 
     # ----------------------------------------------------------------
     # 运动追踪（供元路由器使用）

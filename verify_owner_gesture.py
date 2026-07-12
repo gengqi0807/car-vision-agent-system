@@ -112,7 +112,7 @@ def process_frame(frame_bgr: np.ndarray, classifier: GestureClassifier):
     hands = MediaPipeHands.infer(frame_bgr)
     hand_kp = hands[0] if hands else None
 
-    gesture, conf = classifier.classify_frame(hand_kp)
+    gesture, conf = classifier.classify_frame(hand_kp, all_hands=hands)
     action = gesture_label(gesture)
     return gesture, action, conf, len(hands), hand_kp
 

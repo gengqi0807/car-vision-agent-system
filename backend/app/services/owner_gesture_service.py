@@ -262,7 +262,7 @@ class OwnerGestureService:
                 hand_kp = hands[0] if hands else None
 
                 # 统一手势分类（静态 + 动态 + 时序去抖）
-                gesture, confidence = classifier.classify_frame(hand_kp)
+                gesture, confidence = classifier.classify_frame(hand_kp, all_hands=hands)
 
                 # 转换为 keypoints
                 if hands:
