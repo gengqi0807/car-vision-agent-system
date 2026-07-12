@@ -19,7 +19,7 @@ dist/
 backend/uploads/
 backend/logs/
 
-backend/models/*.pt
+
 backend/models/*.onnx
 backend/models/*.tflite
 !backend/models/.gitkeep

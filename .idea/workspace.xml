@@ -4,7 +4,15 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="d266786f-ee78-41ea-9080-d512dbeddab5" name="更改" comment="" />
+    <list default="true" id="d266786f-ee78-41ea-9080-d512dbeddab5" name="更改" comment="解决合并冲突">
+      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/app/models_infer/gesture_classifier.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/models_infer/gesture_classifier.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/app/services/owner_gesture_service.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/services/owner_gesture_service.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/test_hand.jpg" beforeDir="false" afterPath="$PROJECT_DIR$/test_hand.jpg" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/third_party/Real-time-GesRec" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/verify_owner_gesture.py" beforeDir="false" afterPath="$PROJECT_DIR$/verify_owner_gesture.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -49,6 +57,7 @@
     "Python.police_local.executor": "Run",
     "Python.verify_owner_gesture.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
+    "git-widget-placeholder": "new__branch__from__liutianyue__A__Hagrid",
     "last_opened_file_path": "D:/car-vision-agent-system",
     "settings.editor.selected.configurable": "preferences.pluginManager"
   }
@@ -120,14 +129,50 @@
       <option name="presentableId" value="Default" />
       <updated>1783388750977</updated>
     </task>
+    <task id="LOCAL-00001" summary="解决合并冲突">
+      <option name="closed" value="true" />
+      <created>1783839612672</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1783839612672</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
+    <option name="RECENT_FILTERS">
+      <map>
+        <entry key="Branch">
+          <value>
+            <list>
+              <RecentGroup>
+                <option name="FILTER_VALUES">
+                  <option value="new_branch_from_liutianyue_A_Hagrid" />
+                </option>
+              </RecentGroup>
+            </list>
+          </value>
+        </entry>
+      </map>
+    </option>
     <option name="TAB_STATES">
       <map>
         <entry key="MAIN">
           <value>
-            <State />
+            <State>
+              <option name="FILTERS">
+                <map>
+                  <entry key="branch">
+                    <value>
+                      <list>
+                        <option value="liutianyue_A_Hagrid" />
+                      </list>
+                    </value>
+                  </entry>
+                </map>
+              </option>
+            </State>
           </value>
         </entry>
       </map>
@@ -135,5 +180,7 @@
   </component>
   <component name="VcsManagerConfiguration">
     <option name="ADD_EXTERNAL_FILES_SILENTLY" value="true" />
+    <MESSAGE value="解决合并冲突" />
+    <option name="LAST_COMMIT_MESSAGE" value="解决合并冲突" />
   </component>
 </project>

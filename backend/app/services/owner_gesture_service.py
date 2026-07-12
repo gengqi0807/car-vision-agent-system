@@ -106,6 +106,15 @@ class OwnerGestureService:
         # 告警回调（预留）
         self._alert_callbacks: list = []
 
+        # --- 手势结果锁定机制 ---
+        # 手在屏幕内时，一旦识别出有效手势就锁定，手消失后才允许更新
+        self._result_locked = False           # 当前是否已锁定结果
+        self._hand_present_prev = False       # 上一帧手是否在屏幕内
+        self._locked_gesture: str | None = None
+        self._locked_action: str | None = None
+        self._locked_confidence: float = 0.0
+        self._last_fired_action: str | None = None   # 上次已触发回调的动作，避免重复触发
+
     # ----------------------------------------------------------------
     # 单例获取
     # ----------------------------------------------------------------
@@ -260,9 +269,53 @@ class OwnerGestureService:
                 # MediaPipe Hands 推理
                 hands = MediaPipeHands.infer(frame_bgr)
                 hand_kp = hands[0] if hands else None
+                hand_present = hands is not None and len(hands) > 0
+
+                # ---- 手势结果锁定逻辑 ----
+                # 手从无到有 → 解锁，开始新一轮检测
+                if hand_present and not self._hand_present_prev:
+                    self._result_locked = False
+                    self._locked_gesture = None
+                    self._locked_action = None
+                    self._locked_confidence = 0.0
+                    self._last_fired_action = None
+
+                # 手消失 → 解锁，重置状态
+                if not hand_present:
+                    self._result_locked = False
+                    self._locked_gesture = None
+                    self._locked_action = None
+                    self._locked_confidence = 0.0
+                    self._last_fired_action = None
 
                 # 统一手势分类（静态 + 动态 + 时序去抖）
-                gesture, confidence = classifier.classify_frame(hand_kp, all_hands=hands)
+                gesture, confidence = classifier.classify_frame(hand_kp)
+
+                # --- 确定最终输出的手势 ---
+                if hand_present:
+                    if not self._result_locked:
+                        # 尚未锁定：检查是否识别出有效手势，是则锁定
+                        if gesture != "unknown" and gesture != "idle" and confidence > 0.0:
+                            self._result_locked = True
+                            self._locked_gesture = gesture
+                            self._locked_action = gesture_to_action(gesture)
+                            self._locked_confidence = round(confidence, 4)
+
+                        output_gesture = gesture
+                        output_action = gesture_to_action(gesture)
+                        output_confidence = round(confidence, 4)
+                    else:
+                        # 已锁定：保持锁定结果不变
+                        output_gesture = self._locked_gesture or gesture
+                        output_action = self._locked_action or "idle"
+                        output_confidence = self._locked_confidence
+                else:
+                    output_gesture = gesture
+                    output_action = gesture_to_action(gesture)
+                    output_confidence = round(confidence, 4)
+
+                # 更新帧间状态
+                self._hand_present_prev = hand_present
 
                 # 转换为 keypoints
                 if hands:
@@ -273,9 +326,9 @@ class OwnerGestureService:
                     keypoints = []
 
                 result = OwnerGestureResult(
-                    gesture=gesture,
-                    action=gesture_to_action(gesture),
-                    confidence=round(confidence, 4),
+                    gesture=output_gesture,
+                    action=output_action,
+                    confidence=output_confidence,
                     keypoints=keypoints,
                     hand_count=len(hands),
                     updated_at=datetime.now(timezone.utc),
@@ -287,8 +340,9 @@ class OwnerGestureService:
 
                 self.result_history.append(result)
 
-                # 触发控制回调（预留）
-                if result.action != "idle":
+                # 触发控制回调（仅在首次锁定时触发，避免重复）
+                if result.action != "idle" and result.action != self._last_fired_action:
+                    self._last_fired_action = result.action
                     for cb in self._control_callbacks:
                         try:
                             cb(result.action)
