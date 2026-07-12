@@ -1,12 +1,10 @@
 """
 recognize_camera.py — 摄像头实时交警手势识别
 
-使用规则模型（MediaPipe Pose + Hand + 状态机）+ 深度学习模型（CTPGREngine）
-实时识别摄像头画面中的交警手势。
-
-- 规则模型：左上角展示（含状态机状态 + 双手区域 + 识别结果）
-- DL 模型：左下角展示（手势名 + 置信度）
-- 整体逻辑与视频识别（run_recognition.py）保持一致，区分仅在于摄像头实时输入
+管线完全对标 run_recognition.py（视频识别），唯一区别是输入源为摄像头。
+  - MediaPipe Pose + Hand 骨架检测与绘制
+  - CTPGREngine（PyTorch LSTM）深度学习模型唯一判定手势
+  - 预热期显示倒计时提示，预热完毕后开始正常识别
 
 Usage:
     python recognize_camera.py
@@ -26,7 +24,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# ---- 导入 police 包（MediaPipe 骨架 + 状态机手势分类） ----
+# ---- 导入 police 包（MediaPipe 骨架 + 可视化） ----
 from police import config as police_cfg
 from police.models import (
     create_pose_detector, create_hand_detector,
@@ -50,9 +48,7 @@ except ImportError as e:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="摄像头实时交警手势识别"
-    )
+    parser = argparse.ArgumentParser(description="摄像头实时交警手势识别")
     parser.add_argument(
         "--source", "-s", default=None,
         help="输入源：本地视频路径、RTSP 地址或摄像头索引；未提供时使用 --camera"
@@ -70,6 +66,10 @@ def parse_args():
         "--hand-model",
         default=police_cfg.HAND_MODEL_PATH,
         help=f"MediaPipe Hand 模型路径（默认: {police_cfg.HAND_MODEL_PATH}）"
+    )
+    parser.add_argument(
+        "--no-mirror", action="store_true",
+        help="禁用摄像头镜像"
     )
     parser.add_argument(
         "--skip", type=int, default=police_cfg.SKIP_FRAMES,
@@ -102,10 +102,107 @@ def parse_args():
     return parser.parse_args()
 
 
+# ---- DL 模型 14 关键点骨架绘制（对标 aic_bones） ----
+# 0-based 索引（AIChallenger: 1~14 → 0~13）
+_DL_BONES = [
+    (0, 1),   # 右大臂 (shoulder→elbow)
+    (1, 2),   # 右小臂 (elbow→wrist)
+    (3, 4),   # 左大臂
+    (4, 5),   # 左小臂
+    (13, 0),  # 右肩 (neck→shoulder)
+    (13, 3),  # 左肩
+    (0, 6),   # 右侧躯干 (shoulder→hip)
+    (3, 9),   # 左侧躯干
+    (6, 7),   # 右大腿 (hip→knee)
+    (7, 8),   # 右小腿 (knee→ankle)
+    (9, 10),  # 左大腿
+    (10, 11), # 左小腿
+    (12, 13), # 头 (head→neck)
+]
+
+# 下半身骨骼索引（6-11），用于检测是否拍到全身
+_LOWER_BODY_BONES = {6, 7, 8, 9, 10, 11}
+
+def _crop_person(frame, landmarks, target_size=512, padding_ratio=0.25):
+    """根据 MediaPipe 33 关键点裁剪出人体区域并 resize 到 target_size×target_size"""
+    h, w = frame.shape[:2]
+    xs, ys = [], []
+    for lm in landmarks:
+        xs.append(int(lm.x * w))
+        ys.append(int(lm.y * h))
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
+
+    # 加 padding
+    bw, bh = x2 - x1, y2 - y1
+    pad_w, pad_h = int(bw * padding_ratio), int(bh * padding_ratio)
+    x1 = max(0, x1 - pad_w)
+    x2 = min(w, x2 + pad_w)
+    y1 = max(0, y1 - pad_h)
+    y2 = min(h, y2 + pad_h)
+
+    # 保持正方形（用较长边）
+    box_w, box_h = x2 - x1, y2 - y1
+    side = max(box_w, box_h)
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    half = side // 2
+    x1 = max(0, cx - half)
+    x2 = min(w, cx + half)
+    y1 = max(0, cy - half)
+    y2 = min(h, cy + half)
+
+    # 再次确保是正方形
+    crop_w, crop_h = x2 - x1, y2 - y1
+    side = min(crop_w, crop_h)
+    crop = frame[y1:y1 + side, x1:x1 + side]
+    crop = cv2.resize(crop, (target_size, target_size))
+    return crop
+
+def _draw_dl_skeleton(frame, kps):
+    """在 frame 上绘制 DL 模型的 14 个关键点 + 骨骼连线"""
+    h, w = frame.shape[:2]
+    pts = []
+    for kp in kps:
+        px = int(kp["x"] * w)
+        py = int(kp["y"] * h)
+        pts.append((px, py))
+
+    # 检测下半身是否在画面内（髋/膝/踝关键点 6-11）
+    lower_pts = pts[6:12]  # right hip, right knee, right ankle, left hip, left knee, left ankle
+    lower_y = [p[1] for p in lower_pts]
+    lower_x = [p[0] for p in lower_pts]
+    # 如果大部分下半身点位 y > 0.9h（接近底部）或 y < 0.1h（在顶部误检），说明没拍到腿
+    bottom_frac = sum(1 for y in lower_y if y > h * 0.9) / len(lower_y)
+    if bottom_frac > 0.5:
+        cv2.putText(frame, "WARN: Lower body not visible!", (int(w * 0.02), int(h * 0.92)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+        cv2.putText(frame, "Stand back so full body is in frame", (int(w * 0.02), int(h * 0.96)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1)
+
+    for bi, (i, j) in enumerate(_DL_BONES):
+        if i >= len(pts) or j >= len(pts):
+            continue
+        pi, pj = pts[i], pts[j]
+        # 下半身用红色（警告），上半身用绿色
+        color = (0, 0, 255) if bi in _LOWER_BODY_BONES else (0, 255, 0)
+        cv2.line(frame, pi, pj, color, 2)
+
+    # 关键点：上半身蓝绿色，下半身橙色
+    for idx, (px, py) in enumerate(pts):
+        is_lower = any(idx in [b1, b2] for b1, b2 in [
+            (6, 7), (7, 8), (9, 10), (10, 11)
+        ])
+        color = (0, 165, 255) if is_lower else (255, 200, 0)
+        cv2.circle(frame, (px, py), 5, color, -1)
+        cv2.circle(frame, (px, py), 6, (0, 0, 0), 1)
+
+
 def main():
     args = parse_args()
 
     # 应用命令行覆盖
+    if args.no_mirror:
+        police_cfg.CAMERA_MIRRORED = False
     police_cfg.SKIP_FRAMES = args.skip
     police_cfg.INFER_SCALE = args.scale
 
@@ -114,6 +211,7 @@ def main():
     # ================================================================
     if not os.path.exists(args.pose_model):
         print(f"[ERROR] Pose 模型不存在 -> {args.pose_model}")
+        print("  请确认 backend/pose_landmarker_lite.task 文件存在")
         return
 
     print(f"[LOAD] Pose 模型: {args.pose_model}")
@@ -142,6 +240,7 @@ def main():
             import traceback
             print(f"[WARN] CTPGREngine 初始化失败: {e}")
             traceback.print_exc()
+            print("[WARN] 将仅使用规则模型，DL 模型不可用")
             dl_engine = None
     else:
         print(f"[INFO] 深度学习模型未启用")
@@ -171,9 +270,9 @@ def main():
     print("       按 'q' 键退出\n")
 
     # ================================================================
-    # 4. 初始化状态机 + 状态变量
+    # 4. 初始化状态（完全对标 run_recognition.py）
     # ================================================================
-    state_machine = GestureStateMachine()
+    state_machine = GestureStateMachine(verbose=False)
     frame_counter = 0
     global_frame = 0
     fps = 0
@@ -188,19 +287,28 @@ def main():
     left_palm_ori = '?'
     right_palm_ori = '?'
 
-    # 识别结果显示计时器
+    # 规则状态机结果，作为无 DL 时的兜底显示
     display_result = None
     display_confidence = 0.0
     result_display_timer = 0
-    last_logged_result = None
-
     # 深度学习模型状态
-    dl_gesture = "loading..."
+    dl_gesture = "预热中..."
     dl_confidence = 0.0
     dl_counter = 0
     dl_error_once = False
 
-    DISPLAY_SCALE = 0.7
+    # ---- 预热提示（对标 run_recognition.py：LSTM 从 h0/c0 零状态启动） ----
+    # ★ 预热期间 SKIP 所有 DL 推理，LSTM 保持零状态，不做预喂帧。
+    #    倒计时消失后 LSTM 才从零开始吃真实手势帧——和视频版行为完全一致。
+    dl_warmed_up = False
+    warmup_start_time = time.time()   # 预热提示开始时间
+    WARMUP_SECONDS = 2.0              # 提示持续时间（秒）
+
+    # 显示缩放
+    DISPLAY_SCALE = 1.5
+
+    print("[INFO] 预热 2 秒（期间不推理），请保持站立...")
+    print("       倒计时消失后即可开始做手势\n")
 
     # ---- 主循环 ----
     while True:
@@ -211,6 +319,10 @@ def main():
             print("\n摄像头读取失败，退出。")
             break
 
+        # 摄像头镜像（默认开启）
+        if police_cfg.CAMERA_MIRRORED:
+            frame = cv2.flip(frame, 1)
+
         frame_counter += 1
         should_infer = (frame_counter % police_cfg.SKIP_FRAMES == 0)
 
@@ -218,18 +330,18 @@ def main():
         now = time.time()
         elapsed = now - last_time
         if elapsed > 0:
-            fps = 30 if elapsed <= 0 else int(1.0 / elapsed)
+            fps = int(1.0 / elapsed)
         last_time = now
 
         global_frame += 1
         h, w = frame.shape[:2]
 
         # ============================================================
-        # 5. AI 推理（跳帧执行）
+        # 5. AI 推理（跳帧执行）—— 对标 run_recognition.py
         # ============================================================
         if should_infer:
             pose_result = detect_pose(pose_detector, frame)
-            hand_result = detect_hand(hand_detector, frame)
+            hand_result = detect_hand(hand_detector, frame) if hand_detector is not None else None
         else:
             pose_result = None
             hand_result = None
@@ -245,7 +357,7 @@ def main():
             else:
                 world_landmarks = last_world_landmarks
 
-            # ---- 绘制 Pose 骨架 ----
+            # ---- 绘制 Pose 骨架（33 个关键点 + 连线） ----
             draw_pose_landmarks(frame, landmarks, h, w)
 
             # ---- 提取像素关键点 ----
@@ -253,9 +365,7 @@ def main():
                 lm = landmarks[idx]
                 return (lm.x * w, lm.y * h)
 
-            left_wrist    = px(15); right_wrist    = px(16)
             left_shoulder = px(11); right_shoulder = px(12)
-            left_elbow    = px(13); right_elbow    = px(14)
             nose          = px(0)
             left_hip      = px(23); right_hip      = px(24)
 
@@ -265,10 +375,10 @@ def main():
             cv2.putText(frame, "R", (int(right_shoulder[0]) + 5, int(right_shoulder[1]) - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 3)
 
-            shoulder_width = calc_dist(left_shoulder, right_shoulder)
+            _ = calc_dist(left_shoulder, right_shoulder)
 
             # ---- 局部坐标系（用于手掌朝向） ----
-            sm, body_right_2d, body_up_2d = setup_local_frame(
+            _, body_right_2d, body_up_2d = setup_local_frame(
                 left_shoulder, right_shoulder, nose, left_hip, right_hip
             )
 
@@ -339,7 +449,7 @@ def main():
             left_palm_ori  = classify_palm_orientation(last_hand_left, body_right_2d, body_up_2d)
             right_palm_ori = classify_palm_orientation(last_hand_right, body_right_2d, body_up_2d)
 
-            # ---- 状态机更新 ----
+            # ---- 状态机更新（作为 DL 不可用时的兜底识别） ----
             if feat is not None:
                 result = state_machine.update(
                     feat, left_palm_ori, right_palm_ori,
@@ -348,12 +458,6 @@ def main():
                 if result is not None:
                     display_result, display_confidence = result
                     result_display_timer = police_cfg.RESULT_DISPLAY_FRAMES
-                    if display_result != last_logged_result:
-                        print(
-                            f"[RULE] frame={global_frame} gesture={display_result} "
-                            f"confidence={display_confidence:.0%}"
-                        )
-                        last_logged_result = display_result
 
         elif should_infer:
             # 未检测到人体
@@ -364,23 +468,67 @@ def main():
             last_hand_left = None
             last_hand_right = None
 
-        # ---- 深度学习模型推理 ----
-        if dl_engine is not None and should_infer and frame_counter % args.dl_skip == 0:
-            dl_counter += 1
-            dl_h, dl_w = 256, 256
-            dl_frame = cv2.resize(frame, (dl_w, dl_h))
-            try:
-                dl_result = dl_engine.predict_frame(dl_frame)
-                dl_gesture = dl_result["gesture"]
-                dl_confidence = dl_result["confidence"]
-                if dl_gesture != "无手势":
-                    print(f"[DL] frame={global_frame} gesture={dl_gesture} confidence={dl_confidence:.0%}")
-            except Exception as e:
-                if not dl_error_once:
-                    print(f"\n[DL-ERROR] 推理异常: {e}")
-                    dl_error_once = True
-                dl_gesture = "DL error"
-                dl_confidence = 0.0
+        # ---- 深度学习模型推理（CTPGREngine: pose_model.pt + lstm.pt RNN） ----
+        # 完全对标 run_recognition.py：LSTM 从 h0/c0 零状态启动，直接吃真实帧。
+        # ★ 关键修复：预热期间 SKIP predict_frame，不往 LSTM 灌"站立不动"的帧。
+        #    否则 2 秒 × 10 帧/秒 = 20 帧站立特征会锁死 LSTM 隐藏状态在 class 0。
+        #    预热结束后 LSTM 从零状态接触手势帧，和视频版行为完全一致。
+        if dl_engine is not None and frame_counter % args.dl_skip == 0:
+            # ★ 关键优化：用 MediaPipe 骨架裁剪人体区域后再送入 DL 模型
+            #    避免站太远时人影太小导致关键点检测失效
+            if last_landmarks is not None:
+                dl_frame = _crop_person(frame, last_landmarks, target_size=512)
+            else:
+                dl_frame = cv2.resize(frame, (512, 512))
+
+            # ---- 预热：计时到 2 秒后标记 ready，期间不推理 ----
+            if not dl_warmed_up:
+                if (time.time() - warmup_start_time) >= WARMUP_SECONDS:
+                    dl_warmed_up = True
+                    # 预热结束，重置 LSTM 状态——确保从零开始，不受预热帧污染
+                    dl_engine.reset_state()
+                    print(f"\n[DL-OK] 预热完成，LSTM 状态已重置为 h0/c0，开始实时识别")
+                    print("        现在可以开始做手势了！\n")
+                # 预热期间：不推理也不 continue，让显示代码正常执行
+
+            # ---- 仅预热完成后才推理 ----
+            if dl_warmed_up:
+                dl_counter += 1
+
+                try:
+                    dl_result = dl_engine.predict_frame(dl_frame)
+                    dl_gesture = dl_result["gesture"]
+                    dl_confidence = dl_result["confidence"]
+                    raw_logits = dl_result.get("raw_logits", [])
+                    dl_kps = dl_result.get("keypoints", [])
+                except Exception as e:
+                    if not dl_error_once:
+                        print(f"\n[DL-ERROR] 推理异常: {e}")
+                        dl_error_once = True
+                    dl_gesture = "DL error"
+                    dl_confidence = 0.0
+                    raw_logits = []
+                    dl_kps = []
+
+                # 每 15 次推理打印诊断：校准后手势 + 原始偏差值
+                if dl_counter % 15 == 0 and raw_logits:
+                    left_r = (last_feat or {}).get("left_region", "?")
+                    right_r = (last_feat or {}).get("right_region", "?")
+                    # 从原始 logits 计算 class-0 偏差（校准前）
+                    logits = np.array(raw_logits)
+                    non0_logit = max(logits[1:]) if len(logits) > 1 else -999
+                    bias0 = logits[0] - non0_logit
+                    # 校准标记：如果原始 class-0 异常偏高
+                    calibrated = "🔧已校准" if bias0 > 2.0 else " 正常"
+                    print(f"  [DL] → {dl_gesture} ({dl_confidence:.0%})  "
+                          f"| 原始偏差: {bias0:+.1f}  {calibrated}")
+                    print(f"       手动区域: 左手={left_r}  右手={right_r}")
+
+        if result_display_timer > 0:
+            result_display_timer -= 1
+        else:
+            display_result = None
+            display_confidence = 0.0
 
         # ---- 非推理帧：绘制缓存骨架（防止闪烁） ----
         if not should_infer and last_landmarks is not None:
@@ -395,127 +543,86 @@ def main():
                 draw_wrist_marker(frame, last_landmarks, 16, h, w, side='R')
 
         # ============================================================
-        # 6. 画面文字叠加
+        # 6. 画面文字叠加（对标 run_recognition.py）
         # ============================================================
-        # 结果展示计时器
-        if result_display_timer > 0:
-            result_display_timer -= 1
-        else:
-            display_result = None
-            display_confidence = 0.0
 
-        # ---- 顶部标题栏 ----
-        title_bar_h = 36
-        cv2.rectangle(frame, (0, 0), (w, title_bar_h), (30, 30, 30), -1)
-        cv2.putText(frame, "Camera Gesture Recognition",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 2)
+        # ---- 预热提示（画面中央文字，2 秒后自动消失） ----
+        if dl_engine is not None and not dl_warmed_up:
+            remaining = WARMUP_SECONDS - (time.time() - warmup_start_time)
+            if remaining > 0:
+                # 半透明遮罩
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+                frame = cv2.addWeighted(overlay, 0.25, frame, 0.75, 0)
 
-        # ---- 左上角：规则模型结果 ----
-        rule_x, rule_y = 10, title_bar_h + 12
-        box_w, box_h = 280, 120
+                cv2.putText(frame, f"WARMING UP... {remaining:.0f}s",
+                            (w // 2 - 160, h // 2 - 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 255), 4)
+                frame = draw_chinese_text(frame, "请保持站立，倒计时结束后开始识别",
+                                          (w // 2 - 190, h // 2 + 5),
+                                          (0, 255, 255), 26)
+                frame = draw_chinese_text(frame, "LSTM 将从零状态启动，直接识别手势",
+                                          (w // 2 - 190, h // 2 + 42),
+                                          (200, 200, 200), 22)
 
-        # 半透明背景
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (rule_x, rule_y), (rule_x + box_w, rule_y + box_h),
-                      (40, 40, 40), -1)
-        frame = cv2.addWeighted(overlay, 0.55, frame, 0.45, 0)
-
-        # 标题
-        cv2.putText(frame, "Rule Model", (rule_x + 10, rule_y + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-
-        line_y = rule_y + 40
-
-        # 状态
+        # ---- 未检测到人体 ----
         if last_landmarks is None:
-            status_text = "No person"
-            status_color = (0, 0, 255)
-        elif state_machine.state == police_cfg.STATE_ACTIVE:
-            status_text = "识别中..."
-            status_color = (0, 255, 255)
-        elif state_machine.cooldown_counter > 0:
-            status_text = f"冷却 {state_machine.cooldown_counter}"
-            status_color = (128, 128, 128)
-        elif display_result is not None:
-            status_text = display_result
-            status_color = (0, 255, 0)
-        else:
-            status_text = "等待动作"
-            status_color = (255, 255, 255)
+            frame = draw_chinese_text(frame, "未检测到人体",
+                                      (10, 110), (0, 0, 255), 36)
 
-        frame = draw_chinese_text(frame, status_text,
-                                  (rule_x + 10, line_y), status_color, 22)
-        line_y += 24
-
-        # 置信度（规则模型）
-        if display_result is not None and display_confidence > 0:
-            cv2.putText(frame, f"{display_confidence:.0%}",
-                        (rule_x + 10, line_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 0), 2)
-        else:
-            cv2.putText(frame, "---",
-                        (rule_x + 10, line_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (128, 128, 128), 2)
-        line_y += 22
-
-        # 双手区域
+        # ---- 右上角：双手高度区域 ----
         if last_feat is not None:
-            left_region  = last_feat.get("left_region", "?")
+            rxx = w - 200
+            left_region = last_feat.get("left_region", "?")
             right_region = last_feat.get("right_region", "?")
-            left_raise   = last_feat.get("left_raise", 0.0)
-            right_raise  = last_feat.get("right_raise", 0.0)
-        else:
-            left_region = right_region = "?"
-            left_raise = right_raise = 0.0
+            frame = draw_chinese_text(frame, f"左手: {left_region}",
+                                      (rxx, 15), (0, 200, 255), 20)
+            frame = draw_chinese_text(frame, f"右手: {right_region}",
+                                      (rxx, 42), (200, 100, 255), 20)
 
-        cv2.putText(frame, f"L: {left_region}  ({left_raise:+.2f})",
-                    (rule_x + 10, line_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 2)
-        line_y += 20
-        cv2.putText(frame, f"R: {right_region} ({right_raise:+.2f})",
-                    (rule_x + 10, line_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 100, 255), 2)
-
-        # ---- 左下角：深度学习模型结果 ----
+        # ---- 左上角：深度学习模型结果（唯一识别依据） ----
         if dl_engine is not None:
-            dl_x, dl_y = 10, h - 85
-            dl_box_w, dl_box_h = 280, 72
+            panel_w, panel_h = 260, 80
+            panel_x, panel_y = 15, 15
 
             overlay = frame.copy()
-            cv2.rectangle(overlay, (dl_x, dl_y), (dl_x + dl_box_w, dl_y + dl_box_h),
-                          (25, 25, 50), -1)
-            frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+            cv2.rectangle(overlay, (panel_x, panel_y),
+                          (panel_x + panel_w, panel_y + panel_h), (20, 20, 50), -1)
+            cv2.rectangle(overlay, (panel_x, panel_y),
+                          (panel_x + panel_w, panel_y + panel_h), (0, 200, 255), 2)
+            frame = cv2.addWeighted(overlay, 0.65, frame, 0.35, 0)
 
-            cv2.putText(frame, "DL Model", (dl_x + 10, dl_y + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
+            frame = draw_chinese_text(frame, "交警手势识别",
+                                      (panel_x + 10, panel_y + 5),
+                                      (0, 255, 255), 22)
             frame = draw_chinese_text(frame, dl_gesture,
-                                      (dl_x + 10, dl_y + 40), (255, 200, 0), 22)
-            cv2.putText(frame, f"{dl_confidence:.0%}",
-                        (dl_x + 10, dl_y + 62),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 160, 80), 2)
-        else:
-            dl_x, dl_y = 10, h - 60
-            cv2.putText(frame, "DL: N/A", (dl_x + 10, dl_y + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 2)
+                                      (panel_x + 10, panel_y + 28),
+                                      (0, 215, 255), 28)
+            frame = draw_chinese_text(frame, f"置信度: {dl_confidence:.1%}",
+                                      (panel_x + 10, panel_y + 60),
+                                      (255, 255, 255), 18)
+        elif display_result is not None:
+            panel_w, panel_h = 260, 80
+            panel_x, panel_y = 15, 15
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (panel_x, panel_y),
+                          (panel_x + panel_w, panel_y + panel_h), (20, 50, 30), -1)
+            cv2.rectangle(overlay, (panel_x, panel_y),
+                          (panel_x + panel_w, panel_y + panel_h), (80, 255, 170), 2)
+            frame = cv2.addWeighted(overlay, 0.65, frame, 0.35, 0)
+            frame = draw_chinese_text(frame, "规则识别结果",
+                                      (panel_x + 10, panel_y + 5),
+                                      (255, 255, 255), 22)
+            frame = draw_chinese_text(frame, display_result,
+                                      (panel_x + 10, panel_y + 28),
+                                      (95, 255, 180), 28)
+            frame = draw_chinese_text(frame, f"置信度: {display_confidence:.1%}",
+                                      (panel_x + 10, panel_y + 60),
+                                      (255, 255, 255), 18)
 
-        # ---- 右上角：信息 ----
-        info_x = w - 210
+        # ---- 底部：FPS 和帧号 ----
         cv2.putText(frame, f"FPS: {fps}  Frame: {global_frame}",
-                    (info_x, title_bar_h + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 2)
-        cv2.putText(frame, f"State: {state_machine.state_name}",
-                    (info_x, title_bar_h + 44),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 2)
-        cv2.putText(frame, f"Cam: {args.camera}",
-                    (info_x, title_bar_h + 64),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 2)
-
-        # ---- 动作开始文字提示 ----
-        if last_feat is not None and state_machine.state == police_cfg.STATE_ACTIVE:
-            fc = state_machine.action_data.get("frame_count", 0) if state_machine.action_data else 0
-            if fc == 1:
-                frame = draw_chinese_text(frame, "动作开始！",
-                                          (10, title_bar_h + 140), (0, 255, 0), 28)
+                    (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
         # ---- 显示 ----
         if not args.no_display:
@@ -531,7 +638,7 @@ def main():
             break
 
     # ================================================================
-    # 7. 清理资源
+    # 7. 清理
     # ================================================================
     cap.release()
     if not args.no_display:

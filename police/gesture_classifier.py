@@ -164,7 +164,8 @@ def reset_action_data(shoulder_width: float,
         "shoulder_width": sw,
     }
 
-    print(f"  [active_arm] = {active_arm}")
+    if data.get("_verbose", True):
+        print(f"  [active_arm] = {active_arm}")
     return data
 
 
@@ -344,7 +345,7 @@ def _update_action_data(action_data: dict, feat: dict,
 # 8 手势分类决策树
 # ============================================================
 
-def classify_action(action_data: dict) -> tuple[str, float]:
+def classify_action(action_data: dict, verbose: bool = True) -> tuple[str, float]:
     """
     基于双手区域的严格判定，不依赖摆动检测/手掌朝向/稳定度。
 
@@ -377,9 +378,10 @@ def classify_action(action_data: dict) -> tuple[str, float]:
     fc = action_data.get("frame_count", 0)
 
     # 调试
-    region_str = lambda lst: ",".join(r[0].upper() for r in lst) if lst else "?"
-    print(f"  [classify] frames={fc}  L={L_Region}({region_str(left_regions)})  R={R_Region}({region_str(right_regions)})")
-    print(f"  [classify] L_always_hip={L_always_hip}  R_always_hip={R_always_hip}")
+    if verbose:
+        region_str = lambda lst: ",".join(r[0].upper() for r in lst) if lst else "?"
+        print(f"  [classify] frames={fc}  L={L_Region}({region_str(left_regions)})  R={R_Region}({region_str(right_regions)})")
+        print(f"  [classify] L_always_hip={L_always_hip}  R_always_hip={R_always_hip}")
 
     # ================================================================
     # 1. 停止信号
@@ -388,7 +390,8 @@ def classify_action(action_data: dict) -> tuple[str, float]:
     # ================================================================
     if ((L_Region == "head" and stayed(left_regions, "head") and R_always_hip)
             or (R_Region == "head" and stayed(right_regions, "head") and L_always_hip)):
-        print("  ✅ 命中 → 停止信号")
+        if verbose:
+            print("  ✅ 命中 → 停止信号")
         return ("停止信号", 0.85)
 
     # ================================================================
@@ -405,7 +408,8 @@ def classify_action(action_data: dict) -> tuple[str, float]:
                       and not stayed(right_regions, "waist")
                       and L_Region in ("shoulder", "hip"))
     if straight_left or straight_right:
-        print("  ✅ 命中 → 直行信号")
+        if verbose:
+            print("  ✅ 命中 → 直行信号")
         return ("直行信号", 0.85)
 
     # ================================================================
@@ -414,7 +418,8 @@ def classify_action(action_data: dict) -> tuple[str, float]:
     # ================================================================
     if (L_Region == "waist" and stayed(left_regions, "waist")
             and R_Region == "shoulder" and stayed(right_regions, "shoulder")):
-        print("  ✅ 命中 → 左转弯信号")
+        if verbose:
+            print("  ✅ 命中 → 左转弯信号")
         return ("左转弯信号", 0.85)
 
     # ================================================================
@@ -424,7 +429,8 @@ def classify_action(action_data: dict) -> tuple[str, float]:
     # ================================================================
     if (L_Region in ("waist", "shoulder") and stayed(left_regions, "waist")
             and R_always_hip):
-        print("  ✅ 命中 → 左转弯待转信号")
+        if verbose:
+            print("  ✅ 命中 → 左转弯待转信号")
         return ("左转弯待转信号", 0.85)
 
     # ================================================================
@@ -434,7 +440,8 @@ def classify_action(action_data: dict) -> tuple[str, float]:
     # ================================================================
     if (L_Region == "shoulder" and stayed(left_regions, "shoulder")
             and R_Region in ("waist", "shoulder") and stayed(right_regions, "waist")):
-        print("  ✅ 命中 → 右转弯信号")
+        if verbose:
+            print("  ✅ 命中 → 右转弯信号")
         return ("右转弯信号", 0.85)
 
     # ================================================================
@@ -444,7 +451,8 @@ def classify_action(action_data: dict) -> tuple[str, float]:
     # ================================================================
     if (L_always_hip
             and R_Region == "waist" and stayed(right_regions, "waist")):
-        print("  ✅ 命中 → 变道信号/减速慢行 (区域条件一致)")
+        if verbose:
+            print("  ✅ 命中 → 变道信号/减速慢行 (区域条件一致)")
         return ("变道信号", 0.80)
 
     # ================================================================
@@ -453,11 +461,13 @@ def classify_action(action_data: dict) -> tuple[str, float]:
     # ================================================================
     if (L_Region == "head" and stayed(left_regions, "head")
             and stayed(right_regions, "waist")):
-        print("  ✅ 命中 → 示意车辆靠边停车信号")
+        if verbose:
+            print("  ✅ 命中 → 示意车辆靠边停车信号")
         return ("示意车辆靠边停车信号", 0.85)
 
     # --- 无匹配 ---
-    print("  ⚠ 未命中任何手势")
+    if verbose:
+        print("  ⚠ 未命中任何手势")
     return ("其他手势", 0.0)
 
 
@@ -483,8 +493,13 @@ class GestureStateMachine:
                 print(result)
     """
 
-    def __init__(self):
-        """初始化状态机（IDLE 状态）。"""
+    def __init__(self, verbose: bool = True):
+        """初始化状态机（IDLE 状态）。
+
+        Args:
+            verbose: 是否在终端输出调试信息（默认开启）
+        """
+        self._verbose = verbose
         self._state = config.STATE_IDLE
         self._action_data = None
         self._last_result = None
@@ -591,12 +606,14 @@ class GestureStateMachine:
                 self._action_data = reset_action_data(
                     shoulder_width, feat, left_palm_ori, right_palm_ori
                 )
+                self._action_data["_verbose"] = self._verbose
 
-                print(f"\n▶ [帧 {global_frame}] 动作开始！"
-                      f"  L_Raise={feat['left_raise']:.2f} R_Raise={feat['right_raise']:.2f}"
-                      f"  L_Angle={feat['left_arm_angle']:.0f}° R_Angle={feat['right_arm_angle']:.0f}°"
-                      f"  L_Region={left_region_cur} R_Region={right_region_cur}"
-                      f"  L_Z={feat['left_z_diff']:.2f} R_Z={feat['right_z_diff']:.2f}")
+                if self._verbose:
+                    print(f"\n▶ [帧 {global_frame}] 动作开始！"
+                          f"  L_Raise={feat['left_raise']:.2f} R_Raise={feat['right_raise']:.2f}"
+                          f"  L_Angle={feat['left_arm_angle']:.0f}° R_Angle={feat['right_arm_angle']:.0f}°"
+                          f"  L_Region={left_region_cur} R_Region={right_region_cur}"
+                          f"  L_Z={feat['left_z_diff']:.2f} R_Z={feat['right_z_diff']:.2f}")
 
                 return None  # 动作刚开始，尚无判定结果
 
@@ -614,10 +631,11 @@ class GestureStateMachine:
             fc = ad["frame_count"]
 
             # 调试：打印 hip_hold_count
-            print(f"  [debug] hip_hold_count={ad.get('hip_hold_count', 0)}/{config.HOLD_FRAMES}"
-                  f"  active_arm={ad.get('active_arm', '?')}"
-                  f"  L={feat['left_region']}  R={feat['right_region']}",
-                  end="\r")
+            if self._verbose:
+                print(f"  [debug] hip_hold_count={ad.get('hip_hold_count', 0)}/{config.HOLD_FRAMES}"
+                      f"  active_arm={ad.get('active_arm', '?')}"
+                      f"  L={feat['left_region']}  R={feat['right_region']}",
+                      end="\r")
 
             # ---- 退出判定 ----
             end_reason = None
@@ -627,18 +645,21 @@ class GestureStateMachine:
                 end_reason = "⏰ 超时强制结束"
 
             if end_reason:
-                print(f"\n◀ [帧 {global_frame}] 动作结束！（{end_reason}）"
-                      f"  frames={fc}"
-                      f"  hip_hold_count={ad.get('hip_hold_count', 0)}"
-                      f"  L_Z_min={ad['min_left_z_diff']:.2f}"
-                      f"  R_Z_min={ad['min_right_z_diff']:.2f}")
+                if self._verbose:
+                    print(f"\n◀ [帧 {global_frame}] 动作结束！（{end_reason}）"
+                          f"  frames={fc}"
+                          f"  hip_hold_count={ad.get('hip_hold_count', 0)}"
+                          f"  L_Z_min={ad['min_left_z_diff']:.2f}"
+                          f"  R_Z_min={ad['min_right_z_diff']:.2f}")
 
                 if fc < config.MIN_ACTION_FRAMES:
-                    print(f"   ⚠ 误触过滤（仅 {fc} 帧，需 >= {config.MIN_ACTION_FRAMES}）\n")
+                    if self._verbose:
+                        print(f"   ⚠ 误触过滤（仅 {fc} 帧，需 >= {config.MIN_ACTION_FRAMES}）\n")
                     result, confidence = ("误触过滤", 0.0)
                 else:
-                    result, confidence = classify_action(ad)
-                    print(f"   判定结果: {result}  (置信度: {confidence:.0%})\n")
+                    result, confidence = classify_action(ad, verbose=self._verbose)
+                    if self._verbose:
+                        print(f"   判定结果: {result}  (置信度: {confidence:.0%})\n")
 
                 self._last_result = result
                 self._last_confidence = confidence
@@ -661,7 +682,8 @@ class GestureStateMachine:
             global_frame: 全局帧号（仅用于日志）
         """
         if self._state == config.STATE_ACTIVE:
-            print(f"⚠️ [帧 {global_frame}] 动作中断（未检测到人体）")
+            if self._verbose:
+                print(f"⚠️ [帧 {global_frame}] 动作中断（未检测到人体）")
             self._state = config.STATE_IDLE
             self._action_data = None
             self._cooldown_counter = config.COOLDOWN_FRAMES

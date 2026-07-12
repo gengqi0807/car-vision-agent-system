@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections import deque
+from dataclasses import dataclass
 import logging
 import subprocess
 import sys
@@ -36,6 +37,7 @@ from app.services.police_gesture_local_runtime import (
     NO_POSE_GESTURE,
     NO_VIDEO_GESTURE,
     PoliceGestureLocalRuntime,
+    PoliceGestureVideoSession,
     VIDEO_GESTURE_MAP,
 )
 from app.services.alert_service import AlertService
@@ -82,6 +84,14 @@ VIDEO_GESTURE_TEXT: dict[str, str] = {
 }
 
 
+@dataclass
+class _CameraRuntimeState:
+    session: PoliceGestureVideoSession
+    last_persisted_gesture: str | None = None
+    last_persisted_at: float = 0.0
+
+
+
 class PoliceGestureService:
     """Police (traffic) gesture service with image and video recognition."""
 
@@ -99,6 +109,8 @@ class PoliceGestureService:
         self._media_root = (self._backend_dir / settings.plate_upload_dir).resolve()
         self._upload_root = (self._media_root / "police").resolve()
         self._runtime = PoliceGestureLocalRuntime()
+        self._camera_session_lock = threading.Lock()
+        self._camera_sessions: dict[tuple[int, str], _CameraRuntimeState] = {}
 
     @property
     def legacy_pose(self) -> MediaPipePose:
@@ -117,6 +129,8 @@ class PoliceGestureService:
         image_bytes: bytes,
         filename: str,
         user_id: int | None,
+        session_id: str | None = None,
+        input_mode: str = "image",
     ) -> GestureFrameResult:
         nparr = np.frombuffer(image_bytes, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -129,6 +143,14 @@ class PoliceGestureService:
             raise ValueError(f"无法解析图像文件“{filename}”")
 
         logger.info("Processing police-pose frame '%s' (%dx%d)", filename, frame.shape[1], frame.shape[0])
+        if input_mode == "camera":
+            return self._process_camera_frame(
+                frame=frame,
+                filename=filename,
+                user_id=user_id,
+                session_id=session_id,
+            )
+
         visual_result = self._runtime.recognize_image(frame)
         gesture_label, cls_conf, num_poses = self._recognize_image_with_legacy_model(frame)
         keypoints = [Keypoint(x=kp["x"], y=kp["y"], score=kp.get("score", 1.0)) for kp in visual_result.keypoints]
@@ -191,6 +213,43 @@ class PoliceGestureService:
             keypoints=keypoints,
             annotated_image=annotated_image,
             updated_at=datetime.utcnow(),
+        )
+
+    def _process_camera_frame(
+        self,
+        *,
+        frame: np.ndarray,
+        filename: str,
+        user_id: int | None,
+        session_id: str | None,
+    ) -> GestureFrameResult:
+        active_session_id = session_id or "police-camera"
+        runtime_state = self._camera_runtime_state(user_id=user_id or 0, session_id=active_session_id)
+        visual_result = runtime_state.session.process_frame(frame)
+        gesture_label = visual_result.gesture
+        cls_conf = round(float(visual_result.confidence or 0.0), 4)
+        keypoints = [Keypoint(x=kp["x"], y=kp["y"], score=kp.get("score", 1.0)) for kp in visual_result.keypoints]
+        updated_at = datetime.utcnow()
+        annotated_image = self._encode_camera_frame_to_data_url(visual_result.annotated_frame)
+
+        if self._should_persist_camera_record(runtime_state, gesture=gesture_label, confidence=cls_conf):
+            self._save_record(
+                gesture_label,
+                cls_conf,
+                filename,
+                keypoints_payload=[{"x": kp.x, "y": kp.y, "score": kp.score} for kp in keypoints],
+                user_id=user_id,
+                session_id=active_session_id,
+            )
+            runtime_state.last_persisted_gesture = gesture_label
+            runtime_state.last_persisted_at = time.monotonic()
+
+        return GestureFrameResult(
+            gesture=gesture_label,
+            confidence=cls_conf,
+            keypoints=keypoints,
+            annotated_image=annotated_image,
+            updated_at=updated_at,
         )
 
     def process_video_bytes(
@@ -488,6 +547,31 @@ class PoliceGestureService:
             for record in records
         ]
 
+    def _camera_runtime_state(self, *, user_id: int, session_id: str) -> _CameraRuntimeState:
+        key = (user_id, session_id)
+        with self._camera_session_lock:
+            state = self._camera_sessions.get(key)
+            if state is None:
+                state = _CameraRuntimeState(session=self._runtime.create_camera_session())
+                self._camera_sessions[key] = state
+            return state
+
+    def _should_persist_camera_record(
+        self,
+        runtime_state: _CameraRuntimeState,
+        *,
+        gesture: str,
+        confidence: float,
+    ) -> bool:
+        if gesture in {NO_VIDEO_GESTURE, NO_POSE_GESTURE, "", "unknown"}:
+            return False
+        if confidence < max(settings.alert_low_confidence_threshold, 0.72):
+            return False
+        now = time.monotonic()
+        if runtime_state.last_persisted_gesture != gesture:
+            return True
+        return now - runtime_state.last_persisted_at >= 1.5
+
     def get_video_progress(self, task_id: str) -> PoliceGestureVideoProgress:
         with self._progress_lock:
             progress = self._video_progress.get(task_id)
@@ -717,6 +801,14 @@ class PoliceGestureService:
         encoded = base64.b64encode(buffer.tobytes()).decode("ascii")
         return f"data:image/jpeg;base64,{encoded}"
 
+    def _encode_camera_frame_to_data_url(self, frame: np.ndarray) -> str | None:
+        preview = self._resize_frame_to_limit(frame, 960)
+        ok, buffer = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 74])
+        if not ok:
+            return None
+        encoded = base64.b64encode(buffer.tobytes()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+
     def _recognize_image_with_legacy_model(self, frame: np.ndarray) -> tuple[str, float, int]:
         legacy_result = self.legacy_pose.infer(frame)
         raw_kps = legacy_result["keypoints"]
@@ -764,8 +856,6 @@ class PoliceGestureService:
             if queue is None:
                 queue = deque(maxlen=max(settings.police_video_preview_buffer_max_frames, 1))
                 self._video_preview_frames[task_id] = queue
-            else:
-                queue.clear()
             queue.append(encoded)
             self._preview_condition.notify_all()
 

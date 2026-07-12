@@ -47,11 +47,19 @@ def _get_current_user_from_query_token(token: str | None) -> User:
 )
 async def current_police_gesture(
     file: UploadFile = File(...),
+    session_id: str | None = Form(default=None),
+    input_mode: str = Form(default="image"),
     current_user: User = Depends(get_current_user),
 ) -> GestureFrameResult:
     image_bytes = await file.read()
     try:
-        return await service.process_frame(image_bytes, file.filename or "upload.jpg", current_user.id)
+        return await service.process_frame(
+            image_bytes,
+            file.filename or "upload.jpg",
+            current_user.id,
+            session_id=session_id,
+            input_mode=input_mode,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
