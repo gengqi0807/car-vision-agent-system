@@ -17,7 +17,6 @@ import sys
 import time
 import argparse
 import cv2
-import numpy as np
 
 # ---- 确保项目根目录在 sys.path 中 ----
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +39,7 @@ from police.visualization import (
 
 # ---- 导入 CTPGREngine（PyTorch pose_model.pt + lstm.pt RNN 深度学习模型） ----
 try:
-    from ctpgr_engine import CTPGREngine
+    from ctpgr_engine import CTPGREngine, mediapipe_to_aic14
     _DL_AVAILABLE = True
 except ImportError as e:
     print(f"[WARN] CTPGREngine 导入失败: {e}，将仅使用规则模型")
@@ -83,106 +82,8 @@ def parse_args():
         "--no-dl", action="store_true",
         help="禁用深度学习模型（仅规则）"
     )
-    parser.add_argument(
-        "--dl-skip", type=int, default=3,
-        help="深度学习模型跳帧数（默认: 3，性能优化）"
-    )
     return parser.parse_args()
 
-
-# ---- DL 模型 14 关键点骨架绘制（对标 aic_bones） ----
-# 0-based 索引（AIChallenger: 1~14 → 0~13）
-_DL_BONES = [
-    (0, 1),   # 右大臂 (shoulder→elbow)
-    (1, 2),   # 右小臂 (elbow→wrist)
-    (3, 4),   # 左大臂
-    (4, 5),   # 左小臂
-    (13, 0),  # 右肩 (neck→shoulder)
-    (13, 3),  # 左肩
-    (0, 6),   # 右侧躯干 (shoulder→hip)
-    (3, 9),   # 左侧躯干
-    (6, 7),   # 右大腿 (hip→knee)
-    (7, 8),   # 右小腿 (knee→ankle)
-    (9, 10),  # 左大腿
-    (10, 11), # 左小腿
-    (12, 13), # 头 (head→neck)
-]
-
-# 下半身骨骼索引（6-11），用于检测是否拍到全身
-_LOWER_BODY_BONES = {6, 7, 8, 9, 10, 11}
-
-def _crop_person(frame, landmarks, target_size=512, padding_ratio=0.25):
-    """根据 MediaPipe 33 关键点裁剪出人体区域并 resize 到 target_size×target_size"""
-    h, w = frame.shape[:2]
-    xs, ys = [], []
-    for lm in landmarks:
-        xs.append(int(lm.x * w))
-        ys.append(int(lm.y * h))
-    x1, x2 = min(xs), max(xs)
-    y1, y2 = min(ys), max(ys)
-
-    # 加 padding
-    bw, bh = x2 - x1, y2 - y1
-    pad_w, pad_h = int(bw * padding_ratio), int(bh * padding_ratio)
-    x1 = max(0, x1 - pad_w)
-    x2 = min(w, x2 + pad_w)
-    y1 = max(0, y1 - pad_h)
-    y2 = min(h, y2 + pad_h)
-
-    # 保持正方形（用较长边）
-    box_w, box_h = x2 - x1, y2 - y1
-    side = max(box_w, box_h)
-    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-    half = side // 2
-    x1 = max(0, cx - half)
-    x2 = min(w, cx + half)
-    y1 = max(0, cy - half)
-    y2 = min(h, cy + half)
-
-    # 再次确保是正方形
-    crop_w, crop_h = x2 - x1, y2 - y1
-    side = min(crop_w, crop_h)
-    crop = frame[y1:y1 + side, x1:x1 + side]
-    crop = cv2.resize(crop, (target_size, target_size))
-    return crop
-
-def _draw_dl_skeleton(frame, kps):
-    """在 frame 上绘制 DL 模型的 14 个关键点 + 骨骼连线"""
-    h, w = frame.shape[:2]
-    pts = []
-    for kp in kps:
-        px = int(kp["x"] * w)
-        py = int(kp["y"] * h)
-        pts.append((px, py))
-
-    # 检测下半身是否在画面内（髋/膝/踝关键点 6-11）
-    lower_pts = pts[6:12]  # right hip, right knee, right ankle, left hip, left knee, left ankle
-    lower_y = [p[1] for p in lower_pts]
-    lower_x = [p[0] for p in lower_pts]
-    # 如果大部分下半身点位 y > 0.9h（接近底部）或 y < 0.1h（在顶部误检），说明没拍到腿
-    bottom_frac = sum(1 for y in lower_y if y > h * 0.9) / len(lower_y)
-    if bottom_frac > 0.5:
-        cv2.putText(frame, "WARN: Lower body not visible!", (int(w * 0.02), int(h * 0.92)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-        cv2.putText(frame, "Stand back so full body is in frame", (int(w * 0.02), int(h * 0.96)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1)
-
-    for bi, (i, j) in enumerate(_DL_BONES):
-        if i >= len(pts) or j >= len(pts):
-            continue
-        pi, pj = pts[i], pts[j]
-        # 下半身用红色（警告），上半身用绿色
-        color = (0, 0, 255) if bi in _LOWER_BODY_BONES else (0, 255, 0)
-        cv2.line(frame, pi, pj, color, 2)
-
-    # 关键点：上半身蓝绿色，下半身橙色
-    for idx, (px, py) in enumerate(pts):
-        is_lower = any(idx in [b1, b2] for b1, b2 in [
-            (6, 7), (7, 8), (9, 10), (10, 11)
-        ])
-        color = (0, 165, 255) if is_lower else (255, 200, 0)
-        cv2.circle(frame, (px, py), 5, color, -1)
-        cv2.circle(frame, (px, py), 6, (0, 0, 0), 1)
 
 
 def main():
@@ -220,10 +121,10 @@ def main():
     # ================================================================
     dl_engine = None
     if _DL_AVAILABLE and not args.no_dl:
-        print("[LOAD] CTPGREngine 深度学习模型（pose_model.pt + lstm.pt RNN）...")
+        print("[LOAD] CTPGREngine 深度学习模型（仅 LSTM，复用 MediaPipe 关键点）...")
         try:
-            dl_engine = CTPGREngine()
-            print("[ OK ] CTPGREngine 就绪（14 关键点 + LSTM 9 分类）")
+            dl_engine = CTPGREngine(load_pose_model=False)
+            print("[ OK ] CTPGREngine 就绪（MediaPipe→AIC14 映射 + LSTM 9 分类）")
         except Exception as e:
             import traceback
             print(f"[WARN] CTPGREngine 初始化失败: {e}")
@@ -275,6 +176,14 @@ def main():
     dl_confidence = 0.0
     dl_counter = 0
     dl_error_once = False
+
+    # ---- 显示级帧持久化（摄像头关键点抖动导致置信度在 0.70 门槛附近振荡） ----
+    #   保持已确认的手势显示，直到连续 N 个推理帧都为"无手势"才真正切换。
+    #   SKIP_FRAMES=2 → 每秒约 15 次推理 → PERSIST=8 ≈ 0.5 秒容错窗口。
+    dl_persist_gesture = "无手势"
+    dl_persist_confidence = 0.0
+    dl_persist_counter = 0
+    PERSIST_MAX = 8
 
     # ---- 预热提示（对标 run_recognition.py：LSTM 从 h0/c0 零状态启动） ----
     # ★ 预热期间 SKIP 所有 DL 推理，LSTM 保持零状态，不做预喂帧。
@@ -437,6 +346,57 @@ def main():
                     global_frame, feat.get("shoulder_width", 0.35)
                 )
 
+            # ---- 深度学习模型推理（复用 MediaPipe 关键点，无需 VGG+PAFs） ----
+            if dl_engine is not None:
+                # 预热检查
+                if not dl_warmed_up:
+                    if (time.time() - warmup_start_time) >= WARMUP_SECONDS:
+                        dl_warmed_up = True
+                        dl_engine.reset_state()
+                        print(f"\n[DL-OK] 预热完成，LSTM 状态已重置为 h0/c0，开始实时识别")
+                        print("        现在可以开始做手势了！\n")
+
+                # 仅预热完成后才推理
+                if dl_warmed_up:
+                    dl_counter += 1
+                    try:
+                        coord_aic = mediapipe_to_aic14(landmarks)
+                        dl_result = dl_engine.predict_from_keypoints(coord_aic)
+                        raw_gesture = dl_result["gesture"]
+                        raw_confidence = dl_result["confidence"]
+                    except Exception as e:
+                        if not dl_error_once:
+                            print(f"\n[DL-ERROR] 推理异常: {e}")
+                            dl_error_once = True
+                        raw_gesture = "DL error"
+                        raw_confidence = 0.0
+
+                    # ---- 帧持久化：防止置信度在 0.70 门槛附近抖动导致闪烁 ----
+                    if raw_gesture not in ("无手势", "DL error", "预热中..."):
+                        # 有效手势 → 更新持久化缓存（同手势续命，新手势切换）
+                        dl_persist_gesture = raw_gesture
+                        dl_persist_confidence = raw_confidence
+                        dl_persist_counter = PERSIST_MAX
+                        dl_gesture = raw_gesture
+                        dl_confidence = raw_confidence
+                    elif dl_persist_counter > 0:
+                        # "无手势"但还在持久窗口内 → 保持上一手势，置信度衰减
+                        dl_gesture = dl_persist_gesture
+                        decay = dl_persist_counter / PERSIST_MAX
+                        dl_confidence = dl_persist_confidence * max(0.55, decay)
+                        dl_persist_counter -= 1
+                    else:
+                        # 持久化窗口耗尽 → 真正显示"无手势"
+                        dl_gesture = raw_gesture
+                        dl_confidence = raw_confidence
+
+                    if dl_counter % 30 == 0:
+                        left_r = (last_feat or {}).get("left_region", "?")
+                        right_r = (last_feat or {}).get("right_region", "?")
+                        persist_mark = "*" if raw_gesture == "无手势" and dl_persist_counter > 0 else ""
+                        print(f"  [DL] {dl_gesture}{persist_mark} (置信度:{dl_confidence:.0%})  "
+                              f"| 左手: {left_r}  右手: {right_r}")
+
         elif should_infer:
             # 未检测到人体
             state_machine.cancel_action(global_frame)
@@ -445,66 +405,7 @@ def main():
             last_feat = None
             last_hand_left = None
             last_hand_right = None
-
-        # ---- 深度学习模型推理（CTPGREngine: pose_model.pt + lstm.pt RNN） ----
-        # 完全对标 run_recognition.py：LSTM 从 h0/c0 零状态启动，直接吃真实帧。
-        # ★ 关键修复：预热期间 SKIP predict_frame，不往 LSTM 灌"站立不动"的帧。
-        #    否则 2 秒 × 10 帧/秒 = 20 帧站立特征会锁死 LSTM 隐藏状态在 class 0。
-        #    预热结束后 LSTM 从零状态接触手势帧，和视频版行为完全一致。
-        if dl_engine is not None and frame_counter % args.dl_skip == 0:
-            # ★ 关键优化：用 MediaPipe 骨架裁剪人体区域后再送入 DL 模型
-            #    避免站太远时人影太小导致关键点检测失效
-            if last_landmarks is not None:
-                dl_frame = _crop_person(frame, last_landmarks, target_size=512)
-            else:
-                dl_frame = cv2.resize(frame, (512, 512))
-
-            # ---- 预热：计时到 2 秒后标记 ready，期间不推理 ----
-            if not dl_warmed_up:
-                if (time.time() - warmup_start_time) >= WARMUP_SECONDS:
-                    dl_warmed_up = True
-                    # 预热结束，重置 LSTM 状态——确保从零开始，不受预热帧污染
-                    dl_engine.reset_state()
-                    print(f"\n[DL-OK] 预热完成，LSTM 状态已重置为 h0/c0，开始实时识别")
-                    print("        现在可以开始做手势了！\n")
-                # 预热期间：不推理也不 continue，让显示代码正常执行
-
-            # ---- 仅预热完成后才推理 ----
-            if dl_warmed_up:
-                dl_counter += 1
-
-                try:
-                    dl_result = dl_engine.predict_frame(dl_frame)
-                    dl_gesture = dl_result["gesture"]
-                    dl_confidence = dl_result["confidence"]
-                    raw_logits = dl_result.get("raw_logits", [])
-                    dl_kps = dl_result.get("keypoints", [])
-                except Exception as e:
-                    if not dl_error_once:
-                        print(f"\n[DL-ERROR] 推理异常: {e}")
-                        dl_error_once = True
-                    dl_gesture = "DL error"
-                    dl_confidence = 0.0
-                    raw_logits = []
-                    dl_kps = []
-
-                # 每 15 次推理打印诊断：校准后手势 + 原始偏差值
-                if dl_counter % 15 == 0 and raw_logits:
-                    left_r = (last_feat or {}).get("left_region", "?")
-                    right_r = (last_feat or {}).get("right_region", "?")
-                    # 从原始 logits 计算 class-0 偏差（校准前）
-                    logits = np.array(raw_logits)
-                    non0_logit = max(logits[1:]) if len(logits) > 1 else -999
-                    bias0 = logits[0] - non0_logit
-                    # 校准标记：如果原始 class-0 异常偏高
-                    calibrated = "🔧已校准" if bias0 > 2.0 else " 正常"
-                    print(f"  [DL] → {dl_gesture} ({dl_confidence:.0%})  "
-                          f"| 原始偏差: {bias0:+.1f}  {calibrated}")
-                    print(f"       手动区域: 左手={left_r}  右手={right_r}")
-
-                # ---- 绘制 DL 模型的 14 个关键点到画面上（诊断用） ----
-                if dl_kps:
-                    _draw_dl_skeleton(frame, dl_kps)
+            dl_persist_counter = 0   # 人体丢失 → 立即清空持久化
 
         # ---- 非推理帧：绘制缓存骨架（防止闪烁） ----
         if not should_infer and last_landmarks is not None:

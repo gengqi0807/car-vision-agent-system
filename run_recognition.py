@@ -39,7 +39,7 @@ from police.visualization import (
 
 # ---- 导入 CTPGREngine（PyTorch pose_model.pt + lstm.pt RNN 深度学习模型） ----
 try:
-    from ctpgr_engine import CTPGREngine
+    from ctpgr_engine import CTPGREngine, mediapipe_to_aic14
     _DL_AVAILABLE = True
 except ImportError as e:
     print(f"[WARN] CTPGREngine 导入失败: {e}，将仅使用规则模型")
@@ -86,10 +86,6 @@ def parse_args():
         "--no-dl", action="store_true",
         help="禁用 CTPGREngine 深度学习模型（仅使用规则模型）"
     )
-    parser.add_argument(
-        "--dl-skip", type=int, default=3,
-        help="深度学习模型跳帧数（默认: 3，性能优化）"
-    )
     return parser.parse_args()
 
 
@@ -128,10 +124,10 @@ def main():
     # ================================================================
     dl_engine = None
     if _DL_AVAILABLE and not args.no_dl:
-        print("[LOAD] CTPGREngine 深度学习模型（pose_model.pt + lstm.pt RNN）...")
+        print("[LOAD] CTPGREngine 深度学习模型（仅 LSTM，复用 MediaPipe 关键点）...")
         try:
-            dl_engine = CTPGREngine()
-            print("[ OK ] CTPGREngine 就绪（14 关键点 + LSTM 9 分类）")
+            dl_engine = CTPGREngine(load_pose_model=False)
+            print("[ OK ] CTPGREngine 就绪（MediaPipe→AIC14 映射 + LSTM 9 分类）")
         except Exception as e:
             import traceback
             print(f"[WARN] CTPGREngine 初始化失败: {e}")
@@ -335,6 +331,26 @@ def main():
                     global_frame, feat.get("shoulder_width", 0.35)
                 )
 
+            # ---- 深度学习模型推理（复用 MediaPipe 关键点，无需 VGG+PAFs） ----
+            if dl_engine is not None:
+                dl_counter += 1
+                try:
+                    coord_aic = mediapipe_to_aic14(landmarks)
+                    dl_result = dl_engine.predict_from_keypoints(coord_aic)
+                    dl_gesture = dl_result["gesture"]
+                    dl_confidence = dl_result["confidence"]
+                except Exception as e:
+                    if not dl_error_once:
+                        print(f"\n[DL-ERROR] 推理异常: {e}")
+                        dl_error_once = True
+                    dl_gesture = "DL error"
+                    dl_confidence = 0.0
+                if dl_counter % 30 == 0:
+                    left_r = (last_feat or {}).get("left_region", "?")
+                    right_r = (last_feat or {}).get("right_region", "?")
+                    print(f"  [DL] {dl_gesture} (置信度:{dl_confidence:.0%})  "
+                          f"| 左手: {left_r}  右手: {right_r}")
+
         elif should_infer:
             # 未检测到人体
             state_machine.cancel_action(global_frame)
@@ -343,27 +359,6 @@ def main():
             last_feat = None
             last_hand_left = None
             last_hand_right = None
-
-        # ---- 深度学习模型推理（CTPGREngine: pose_model.pt + lstm.pt RNN） ----
-        if dl_engine is not None and frame_counter % args.dl_skip == 0:
-            dl_counter += 1
-            dl_h, dl_w = 512, 512  # 与训练时 RESIZE_SIZE 一致
-            dl_frame = cv2.resize(frame, (dl_w, dl_h))
-            try:
-                dl_result = dl_engine.predict_frame(dl_frame)
-                dl_gesture = dl_result["gesture"]
-                dl_confidence = dl_result["confidence"]
-            except Exception as e:
-                if not dl_error_once:
-                    print(f"\n[DL-ERROR] 推理异常: {e}")
-                    dl_error_once = True
-                dl_gesture = "DL error"
-                dl_confidence = 0.0
-            if dl_counter % 30 == 0:
-                left_r = (last_feat or {}).get("left_region", "?")
-                right_r = (last_feat or {}).get("right_region", "?")
-                print(f"  [DL] {dl_gesture} (置信度:{dl_confidence:.0%})  "
-                      f"| 左手: {left_r}  右手: {right_r}")
 
         # ---- 非推理帧：绘制缓存骨架（防止闪烁） ----
         if not should_infer and last_landmarks is not None:
@@ -431,11 +426,18 @@ def main():
         display_frame = cv2.resize(frame, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE)
         cv2.imshow("Police Gesture Recognition", display_frame)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # ---- 帧率控制（按视频原始 FPS 播放，消除卡顿） ----
+        if not isinstance(source, int):
+            # 视频文件：每帧处理完后补齐到 frame_delay
+            elapsed_frame = time.time() - t0
+            wait_ms = max(1, int((frame_delay - elapsed_frame) * 1000))
+        else:
+            # 摄像头：固定 1ms 等待，让操作系统调度
+            wait_ms = 1
+
+        if cv2.waitKey(wait_ms) & 0xFF == ord('q'):
             print("\n用户按下 'q' 键，退出。")
             break
-
-        # ---- 原速播放（不做帧率限制，推理多快播放多快） ----
 
     # ================================================================
     # 6. 清理资源
