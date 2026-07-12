@@ -22,6 +22,7 @@
 import math
 import os
 import logging
+import time
 
 import numpy as np
 
@@ -42,7 +43,8 @@ class GestureClassifier:
     # ----------------------------------------------------------------
     DYNAMIC_COOLDOWN_FRAMES: int = 18  # 动态触发后抑制静态的帧数 (~0.6s @30fps)
     NO_HAND_REARM_FRAMES: int = 3      # 手消失多少帧算「手势边界」，重新武装
-    STATIC_STABLE_FRAMES: int = 3      # 静态手势需连续稳定几帧才输出
+    STATIC_STABLE_FRAMES: int = 3      # 静态手势需连续稳定几帧才输出（已废弃，改用 SETTLE 时间）
+    STATIC_SETTLE_SECONDS: float = 1.0 # 静态手势需持续同一手势达 N 秒才输出
 
     # Meta-router: 动态 LSTM 置信度需比静态高多少才切换为动态输出
     DYNAMIC_CONF_MARGIN: float = 0.05
@@ -55,6 +57,9 @@ class GestureClassifier:
 
     # wave（主页）需连续确认的帧数，防误触发
     WAVE_STABLE_FRAMES: int = 5
+
+    # 动态手势稳定延迟：动作开始 N 秒后才输出结果，避免初期跳变
+    DYNAMIC_SETTLE_SECONDS: float = 1.0
 
     def __init__(self, domain: str = "owner"):
         self.domain = domain
@@ -72,8 +77,12 @@ class GestureClassifier:
         self._cooldown: int = 0
         self._no_hand: int = 0
         self._stable_gesture: str | None = None
-        self._stable_count: int = 0
+        self._stable_start_time: float = 0.0  # 静态手势首次出现的时刻（time.time()）
         self._wave_count: int = 0            # wave 连续确认计数
+
+        # 动态手势稳定延迟计时
+        self._dyn_active: bool = False    # 动态动作是否已激活（开始计时）
+        self._dyn_start_time: float = 0.0 # 动作开始时刻（time.time()）
 
         # 运动追踪（独立于 LSTM，用于元路由器判断"手是否在运动"）
         self._motion_history: list[tuple[float, float]] = []  # (wrist_x, wrist_y)
@@ -194,9 +203,10 @@ class GestureClassifier:
             boundary_result = self._handle_boundary()
             if self.tracker:
                 self.tracker.reset()
+            self._dyn_active = False  # 手消失，重置稳定计时
             self._no_hand += 1
             self._stable_gesture = None
-            self._stable_count = 0
+            self._stable_start_time = 0.0
             self._motion_history.clear()
             self._motion_frames = 0
             if self._no_hand >= self.NO_HAND_REARM_FRAMES:
@@ -234,6 +244,18 @@ class GestureClassifier:
         wave_confirmed_this_frame = False
 
         if dynamic_gesture and dynamic_gesture != "unknown":
+            # ---- 2 秒稳定延迟：动作刚开始轨迹不完整、结果跳变，先静默 ----
+            now = time.time()
+            if not self._dyn_active:
+                self._dyn_active = True
+                self._dyn_start_time = now
+            if now - self._dyn_start_time < self.DYNAMIC_SETTLE_SECONDS:
+                # 未满 2 秒 → 抑制跳变结果，返回 idle
+                self._stable_gesture = None
+                self._stable_start_time = 0.0
+                self._wave_count = 0
+                return "idle", 0.0
+
             # 运动能量（独立于 LSTM，基于手腕轨迹方差）
             motion_energy = self._update_motion(keypoints)
 
@@ -273,7 +295,7 @@ class GestureClassifier:
                     if self._wave_count >= self.WAVE_STABLE_FRAMES:
                         self._cooldown = self.DYNAMIC_COOLDOWN_FRAMES
                         self._stable_gesture = None
-                        self._stable_count = 0
+                        self._stable_start_time = 0.0
                         self._wave_count = 0
                         return dynamic_gesture, round(dynamic_conf, 4)
                     return "idle", 0.0
@@ -281,9 +303,18 @@ class GestureClassifier:
                 # 其他动态手势直接触发
                 self._cooldown = self.DYNAMIC_COOLDOWN_FRAMES
                 self._stable_gesture = None
-                self._stable_count = 0
+                self._stable_start_time = 0.0
                 self._wave_count = 0
                 return dynamic_gesture, round(dynamic_conf, 4)
+
+            # 动态手势激活中但未触发 → 抑制静态，返回 idle
+            self._stable_gesture = None
+            self._stable_start_time = 0.0
+            return "idle", 0.0
+
+        # 无有效动态手势 → 重置稳定计时，下次运动重新计 2 秒
+        if dynamic_gesture is None or dynamic_gesture == "unknown":
+            self._dyn_active = False
 
         # 本帧未确认 wave → 重置连续计数（中断则从头来）
         if not wave_confirmed_this_frame:
@@ -293,17 +324,18 @@ class GestureClassifier:
         if self._cooldown > 0:
             self._cooldown -= 1
             self._stable_gesture = None
-            self._stable_count = 0
+            self._stable_start_time = 0.0
             return "idle", 0.0
 
-        # ---- 静态稳定投票 ----
-        if static_gesture == self._stable_gesture:
-            self._stable_count += 1
+        # ---- 静态稳定投票（时间基准：持续 N 秒同一手势才输出） ----
+        now = time.time()
+        if static_gesture == self._stable_gesture and self._stable_start_time > 0:
+            pass  # 手势不变，计时继续
         else:
             self._stable_gesture = static_gesture
-            self._stable_count = 1
+            self._stable_start_time = now
 
-        if self._stable_count >= self.STATIC_STABLE_FRAMES:
+        if self._stable_start_time > 0 and now - self._stable_start_time >= self.STATIC_SETTLE_SECONDS:
             return static_gesture, round(static_conf, 4)
 
         return "idle", 0.0

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Optional
 
@@ -152,6 +153,10 @@ class DynamicLSTMClassifier:
 
     # EMA 平滑系数
     EMA_ALPHA: float = 0.3
+
+    # 画圈手势方向后处理：几何累计转角判定顺/逆时针
+    CIRCLE_CLASSES = ("circle_ccw", "circle_cw")
+    TURN_SIGN_THRESHOLD: float = 1.5  # 累计转角 rad，约 1/4 圈以上才判定方向
 
     def __init__(self):
         self._model: BiLSTMGesture | None = None
@@ -299,8 +304,105 @@ class DynamicLSTMClassifier:
         self._last_prediction = ("unknown", 0.0)
 
     # ----------------------------------------------------------------
-    # 边界分段 — 最终判定（手消失/静止后触发）
+    # 画圈方向后处理 — 几何累计转角覆写 LSTM 方向
     # ----------------------------------------------------------------
+
+    def _compute_trajectory_turn_sign(
+        self, sequence: np.ndarray, window: int | None = None
+    ) -> tuple[float, int]:
+        """用食指尖轨迹累积转角判断顺/逆时针。
+
+        原理：逐帧计算相邻位移向量的有向转角（叉积符号），累加得到净转角。
+        屏幕坐标系 y 轴向下，cross > 0 表示顺时针，取负号归一化为逆时针正向。
+
+        Args:
+            sequence: (T, 67) 轨迹特征数组
+            window: 若指定，只取最近 window 帧
+
+        Returns:
+            (total_angle_rad, sign): sign = +1 表示逆时针(ccw), -1 表示顺时针(cw)
+        """
+        if sequence.shape[0] == 0:
+            return 0.0, 0
+        if window is not None and sequence.shape[0] > window:
+            sequence = sequence[-window:]
+
+        # 食指尖坐标: 索引 65(x), 66(y)；若指尖静止则回退手腕 63,64
+        xs = sequence[:, 65].astype(np.float64)
+        ys = sequence[:, 66].astype(np.float64)
+        if float(np.var(xs)) + float(np.var(ys)) < 1e-5:
+            xs = sequence[:, 63].astype(np.float64)
+            ys = sequence[:, 64].astype(np.float64)
+        if len(xs) < 8:
+            return 0.0, 0
+
+        # 3 点移动平均去噪
+        kernel = np.ones(3) / 3.0
+        xs = np.convolve(xs, kernel, mode="valid")
+        ys = np.convolve(ys, kernel, mode="valid")
+
+        total = 0.0
+        valid = 0
+        n = len(xs)
+        for i in range(1, n - 1):
+            v1x, v1y = xs[i] - xs[i - 1], ys[i] - ys[i - 1]
+            v2x, v2y = xs[i + 1] - xs[i], ys[i + 1] - ys[i]
+            m1 = math.hypot(v1x, v1y)
+            m2 = math.hypot(v2x, v2y)
+            if m1 < 0.0015 or m2 < 0.0015:
+                continue
+            cos_a = max(-1.0, min(1.0, (v1x * v2x + v1y * v2y) / (m1 * m2)))
+            angle = math.acos(cos_a)
+            cross = v1x * v2y - v1y * v2x  # 屏幕坐标: cross>0 顺时针
+            if cross > 0:
+                angle = -angle
+            total += angle
+            valid += 1
+
+        if valid < 6:
+            return 0.0, 0
+
+        # sign: +1 逆时针(ccw) / -1 顺时针(cw)。total>0 表示逆时针
+        return total, (1 if total > 0 else -1)
+
+    def _refine_circle_direction(
+        self,
+        prediction: str,
+        confidence: float,
+        probs: np.ndarray,
+        sequence: np.ndarray | None = None,
+    ) -> tuple[str, float]:
+        """对画圈类手势用几何方向覆写 LSTM 方向。
+
+        - 非 circle 类 → 原样返回
+        - 累计转角不足 TURN_SIGN_THRESHOLD → 信任 LSTM
+        - 几何方向与 LSTM 一致 → 原样返回
+        - 几何方向与 LSTM 相反 → 以几何方向覆写，置信度取 circle 家族联合概率
+        """
+        if prediction not in self.CIRCLE_CLASSES:
+            return prediction, confidence
+        if sequence is None:
+            sequence = self.get_trajectory()
+
+        total_angle, sign = self._compute_trajectory_turn_sign(
+            sequence, self.WINDOW_FRAMES
+        )
+        if abs(total_angle) < self.TURN_SIGN_THRESHOLD:
+            return prediction, confidence  # 几何不可信，信任 LSTM
+
+        geo = "circle_ccw" if sign > 0 else "circle_cw"
+        if geo == prediction:
+            return prediction, confidence  # 方向一致
+
+        # 方向相反：用几何方向覆写，置信度取 circle 家族联合概率
+        circle_prob = float(
+            sum(
+                probs[i]
+                for i, name in enumerate(self._label_names)
+                if name in self.CIRCLE_CLASSES
+            )
+        )
+        return geo, max(confidence, circle_prob)
 
     def classify_sequence(self, sequence: np.ndarray) -> tuple[str, float]:
         """
@@ -324,7 +426,8 @@ class DynamicLSTMClassifier:
         confidence = float(probs[idx])
         if confidence < self.CONFIDENCE_THRESHOLD:
             return "unknown", confidence
-        return self._label_names[idx], confidence
+        prediction = self._label_names[idx]
+        return self._refine_circle_direction(prediction, confidence, probs, sequence)
 
     # ----------------------------------------------------------------
     # 滑动窗口打分 — 实时预览模式（取最近 K 帧）
@@ -364,7 +467,11 @@ class DynamicLSTMClassifier:
         if confidence < self.CONFIDENCE_THRESHOLD:
             self._last_prediction = ("unknown", confidence)
         else:
-            self._last_prediction = (self._label_names[idx], confidence)
+            prediction = self._label_names[idx]
+            prediction, confidence = self._refine_circle_direction(
+                prediction, confidence, self._ema_probs, window
+            )
+            self._last_prediction = (prediction, confidence)
 
         return self._last_prediction
 

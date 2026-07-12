@@ -4,12 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="d266786f-ee78-41ea-9080-d512dbeddab5" name="更改" comment="">
-      <change afterPath="$PROJECT_DIR$/$count" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/test.avi" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/verify_owner_gesture.py" beforeDir="false" afterPath="$PROJECT_DIR$/verify_owner_gesture.py" afterDir="false" />
-    </list>
+    <list default="true" id="d266786f-ee78-41ea-9080-d512dbeddab5" name="更改" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -54,7 +49,6 @@
     "Python.police_local.executor": "Run",
     "Python.verify_owner_gesture.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
-    "git-widget-placeholder": "liutianyue__A__Hagrid",
     "last_opened_file_path": "D:/car-vision-agent-system",
     "settings.editor.selected.configurable": "preferences.pluginManager"
   }
