@@ -7,6 +7,7 @@ __pycache__/
 .venv311/
 venv/
 env/
+venv-vision/
 .idea/
 
 node_modules/
@@ -30,6 +31,8 @@ backend/models/*.tflite
 *.sqlite3
 local.db
 owner_gesture_dataset_
+test.mp4
+test0.mp4
 
 .DS_Store
 Thumbs.db

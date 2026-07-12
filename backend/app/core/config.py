@@ -149,6 +149,19 @@ class Settings(BaseSettings):
     min_hand_detection_confidence: float = Field(default=0.5)
     min_hand_presence_confidence: float = Field(default=0.5)
     min_hand_tracking_confidence: float = Field(default=0.5)
+    police_video_process_every_n_frames: int = Field(default=16)
+    police_video_target_inference_fps: float = Field(default=1.0)
+    police_video_inference_side: int = Field(default=320)
+    police_video_output_max_side: int = Field(default=1280)
+    police_video_preview_max_side: int = Field(default=960)
+    police_video_progress_log_interval_frames: int = Field(default=30)
+    police_video_preview_jpeg_quality: int = Field(default=88)
+    police_video_preview_max_fps: float = Field(default=10.0)
+    police_video_preview_stream_fps: float = Field(default=24.0)
+    police_video_preview_initial_buffer_frames: int = Field(default=1)
+    police_video_preview_buffer_max_frames: int = Field(default=4)
+    police_video_reader_queue_max_frames: int = Field(default=48)
+    police_video_processor_batch_size: int = Field(default=8)
 
     @property
     def sqlalchemy_database_url(self) -> str:
