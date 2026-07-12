@@ -483,16 +483,25 @@ class PlateService:
             time.monotonic() - started_at,
         )
 
-        self._transcode_video_for_web(temp_output_path, output_path)
+        final_output_path = self._transcode_video_for_web(temp_output_path, output_path)
         try:
             temp_output_path.unlink(missing_ok=True)
         except Exception:
             logger.warning("Failed to remove temporary processed video: %s", temp_output_path)
 
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        self._record_monitor_success_sync(
+            user_id=user_id,
+            filename=filename,
+            elapsed_ms=elapsed_ms,
+            trace_id=uuid4().hex,
+            detections=detections,
+        )
+
         duration_seconds = round(processed_frame_count / fps, 2) if fps > 0 else None
         return PlateVideoRecognitionResponse(
             source_filename=filename,
-            processed_video_url=self.public_media_url_for(output_path),
+            processed_video_url=self.public_media_url_for(final_output_path),
             detections=detections,
             unread_samples=[self.public_media_url_for(item.file_path) for item in unread_samples],
             processed_frame_count=processed_frame_count,
@@ -608,6 +617,7 @@ class PlateService:
             return False
         probe_interval = max(state.recognition_interval, 12)
         return state.frame_index - state.last_probe_frame >= probe_interval
+
     def _prepare_video_paths(self, filename: str) -> tuple[Path, Path]:
         suffix = Path(filename).suffix.lower() or ".mp4"
         source_dir = self.get_upload_root() / "videos" / "source"
@@ -624,7 +634,7 @@ class PlateService:
         debug_dir.mkdir(parents=True, exist_ok=True)
         return debug_dir
 
-    def _transcode_video_for_web(self, source_path: Path, output_path: Path) -> None:
+    def _transcode_video_for_web(self, source_path: Path, output_path: Path) -> Path:
         logger.info("Starting processed video transcode: %s -> %s", source_path.name, output_path.name)
         command = [
             settings.plate_push_ffmpeg_bin,
@@ -644,15 +654,28 @@ class PlateService:
         try:
             result = subprocess.run(command, capture_output=True, check=False)
         except FileNotFoundError as exc:
-            raise InferenceConfigurationError(
-                f"ffmpeg was not found. Cannot transcode the processed video. Current value: {settings.plate_push_ffmpeg_bin!r}."
-            ) from exc
+            logger.warning(
+                "ffmpeg was not found for processed plate video output. Falling back to the raw mp4 file. "
+                "Current value: %r",
+                settings.plate_push_ffmpeg_bin,
+            )
+            logger.debug("ffmpeg lookup failure details", exc_info=exc)
+            return self._fallback_to_raw_video_output(source_path, output_path)
 
         if result.returncode != 0:
             stderr_text = result.stderr.decode("utf-8", errors="ignore").strip() if result.stderr else ""
-            raise InferenceConfigurationError(
-                f"Processed video transcode failed. {stderr_text or 'Please verify ffmpeg can run normally.'}"
+            logger.warning(
+                "Processed plate video transcode failed. Falling back to the raw mp4 file. Details: %s",
+                stderr_text or "Please verify ffmpeg can run normally.",
             )
+            return self._fallback_to_raw_video_output(source_path, output_path)
+
+        return output_path
+
+    def _fallback_to_raw_video_output(self, source_path: Path, output_path: Path) -> Path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.replace(output_path)
+        return output_path
 
     def _collect_unread_video_samples(
         self,
@@ -2138,6 +2161,28 @@ class PlateService:
                 )
         except Exception as exc:
             logger.warning("Failed to persist plate monitor success event for %s: %s", filename, exc)
+
+    def _record_monitor_success_sync(
+        self,
+        *,
+        user_id: int | None,
+        filename: str,
+        elapsed_ms: int,
+        trace_id: str,
+        detections: list[PlateDetection],
+    ) -> None:
+        try:
+            asyncio.run(
+                self._record_monitor_success(
+                    user_id=user_id,
+                    filename=filename,
+                    elapsed_ms=elapsed_ms,
+                    trace_id=trace_id,
+                    detections=detections,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Failed to dispatch synchronous plate monitor success for %s: %s", filename, exc)
 
     def _record_operation(self, user_id: int | None, operation_type: str, response_status: str) -> None:
         if user_id is None:

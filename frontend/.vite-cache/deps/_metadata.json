@@ -7,25 +7,25 @@
     "axios": {
       "src": "../../node_modules/axios/index.js",
       "file": "axios.js",
-      "fileHash": "c505c59b",
+      "fileHash": "101b73ed",
       "needsInterop": false
     },
     "pinia": {
       "src": "../../node_modules/pinia/dist/pinia.mjs",
       "file": "pinia.js",
-      "fileHash": "496d4938",
+      "fileHash": "3d99c5ec",
       "needsInterop": false
     },
     "vue": {
       "src": "../../node_modules/vue/dist/vue.runtime.esm-bundler.js",
       "file": "vue.js",
-      "fileHash": "d18d07f0",
+      "fileHash": "12be7fab",
       "needsInterop": false
     },
     "vue-router": {
       "src": "../../node_modules/vue-router/dist/vue-router.mjs",
       "file": "vue-router.js",
-      "fileHash": "1eacacef",
+      "fileHash": "a0414984",
       "needsInterop": false
     }
   },

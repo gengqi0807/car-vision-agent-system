@@ -208,6 +208,7 @@
 </template>
 
 <script setup lang="ts">
+import axios from "axios";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import {
@@ -688,11 +689,25 @@ async function stopStream() {
 }
 
 function extractErrorMessage(error: unknown, fallback: string) {
-  if (typeof error === "object" && error && "response" in error) {
-    const response = (error as { response?: { data?: { detail?: string } } }).response;
-    if (response?.data?.detail) {
-      return response.data.detail;
+  if (axios.isAxiosError(error)) {
+    if (!error.response) {
+      return "无法连接到后端。请确认前端是通过 http://127.0.0.1:5173 或 http://localhost:5173 打开的，且后端运行在 http://127.0.0.1:8000。";
     }
+
+    if (error.response.status === 401) {
+      return "登录状态已失效，请重新登录后再试。";
+    }
+
+    if (error.response.status === 404) {
+      return "车牌识别接口未找到。请确认前端请求基址是 /api/v1，并且前端通过 Vite 开发地址打开。";
+    }
+
+    const detail = error.response.data?.detail;
+    if (typeof detail === "string" && detail.trim()) {
+      return detail;
+    }
+
+    return `请求失败（HTTP ${error.response.status}），请查看后端日志。`;
   }
   return fallback;
 }

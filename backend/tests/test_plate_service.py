@@ -1,10 +1,13 @@
+import asyncio
 from dataclasses import dataclass
+from subprocess import CompletedProcess
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
 from app.core.database import Base
+from app.models.monitor_log import MonitorLog
 from app.services import plate_service as plate_service_module
 from app.services.plate_service import PlateService
 
@@ -135,3 +138,69 @@ def test_recognize_image_bytes_prefers_open_traffic_flow_crop_ocr(monkeypatch):
     assert result.detections[0].plate_color == "\u84dd\u724c"
     assert result.detections[0].bbox == [30, 40, 140, 44]
     assert result.detections[0].confidence > 0.9
+
+
+def test_transcode_video_for_web_falls_back_when_ffmpeg_missing(tmp_path, monkeypatch):
+    service = PlateService()
+    source_path = tmp_path / "input.raw.mp4"
+    output_path = tmp_path / "output.mp4"
+    source_bytes = b"raw-mp4-bytes"
+    source_path.write_bytes(source_bytes)
+
+    def raise_missing_ffmpeg(*_args, **_kwargs):
+        raise FileNotFoundError("ffmpeg not found")
+
+    monkeypatch.setattr(plate_service_module.subprocess, "run", raise_missing_ffmpeg)
+
+    final_path = service._transcode_video_for_web(source_path, output_path)
+
+    assert final_path == output_path
+    assert output_path.read_bytes() == source_bytes
+    assert not source_path.exists()
+
+
+def test_transcode_video_for_web_falls_back_when_ffmpeg_fails(tmp_path, monkeypatch):
+    service = PlateService()
+    source_path = tmp_path / "input.raw.mp4"
+    output_path = tmp_path / "output.mp4"
+    source_bytes = b"raw-mp4-bytes"
+    source_path.write_bytes(source_bytes)
+
+    monkeypatch.setattr(
+        plate_service_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: CompletedProcess(args=["ffmpeg"], returncode=1, stderr=b"broken ffmpeg"),
+    )
+
+    final_path = service._transcode_video_for_web(source_path, output_path)
+
+    assert final_path == output_path
+    assert output_path.read_bytes() == source_bytes
+    assert not source_path.exists()
+
+
+def test_record_monitor_success_persists_no_detection_event_for_empty_video_result(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'plate_monitor.db'}", future=True)
+    testing_session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(plate_service_module, "SessionLocal", testing_session)
+
+    service = PlateService()
+
+    asyncio.run(
+        service._record_monitor_success(
+            user_id=1,
+            filename="empty-video.mp4",
+            elapsed_ms=1234,
+            trace_id="trace-empty-video",
+            detections=[],
+        )
+    )
+
+    with testing_session() as session:
+        logs = session.query(MonitorLog).all()
+
+    assert len(logs) == 1
+    assert logs[0].event_type == "plate_recognition_no_detection"
+    assert logs[0].level == "warning"
+    assert logs[0].status == "no_detection"

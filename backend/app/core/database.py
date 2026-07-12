@@ -178,6 +178,8 @@ def _ensure_alert_table_compatibility() -> None:
 
     if "owner_gesture_records" in table_names:
         _ensure_owner_gesture_record_columns(inspector)
+    if "police_gesture_records" in table_names:
+        _ensure_police_gesture_record_columns(inspector)
 
 
 def _ensure_alert_logs_columns(inspector) -> None:
@@ -378,6 +380,84 @@ def _ensure_owner_gesture_record_columns(inspector) -> None:
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
+
+
+def _ensure_police_gesture_record_columns(inspector) -> None:
+    column_map = {column["name"]: column for column in inspector.get_columns("police_gesture_records")}
+    columns = set(column_map)
+    statements: list[str] = []
+
+    if "user_id" in columns and not column_map["user_id"].get("nullable", True):
+        statements.append("ALTER TABLE police_gesture_records MODIFY COLUMN user_id INT NULL")
+    if "session_id" in columns and not column_map["session_id"].get("nullable", True):
+        statements.append("ALTER TABLE police_gesture_records MODIFY COLUMN session_id VARCHAR(64) NULL")
+    if "gesture" not in columns:
+        statements.append("ALTER TABLE police_gesture_records ADD COLUMN gesture VARCHAR(64) NULL")
+    if "confidence" not in columns:
+        statements.append("ALTER TABLE police_gesture_records ADD COLUMN confidence FLOAT NULL DEFAULT 0")
+    if "keypoints" not in columns:
+        statements.append("ALTER TABLE police_gesture_records ADD COLUMN keypoints JSON NULL")
+    if "processing_time_ms" not in columns:
+        statements.append("ALTER TABLE police_gesture_records ADD COLUMN processing_time_ms INT NULL")
+    if "created_at" not in columns:
+        statements.append(
+            "ALTER TABLE police_gesture_records "
+            "ADD COLUMN created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP"
+        )
+    if "updated_at" not in columns:
+        statements.append(
+            "ALTER TABLE police_gesture_records "
+            "ADD COLUMN updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP"
+        )
+    if "source_path" not in columns:
+        statements.append("ALTER TABLE police_gesture_records ADD COLUMN source_path VARCHAR(255) NULL")
+
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+        if "user_id" in columns and not column_map["user_id"].get("nullable", True):
+            connection.execute(
+                text(
+                    "UPDATE police_gesture_records "
+                    "SET user_id = 0 "
+                    "WHERE user_id IS NULL"
+                )
+            )
+        if "session_id" in columns and not column_map["session_id"].get("nullable", True):
+            connection.execute(
+                text(
+                    "UPDATE police_gesture_records "
+                    "SET session_id = 'police' "
+                    "WHERE session_id IS NULL OR session_id = ''"
+                )
+            )
+        if "gesture" not in columns:
+            connection.execute(
+                text(
+                    "UPDATE police_gesture_records "
+                    "SET gesture = 'unknown' "
+                    "WHERE gesture IS NULL OR gesture = ''"
+                )
+            )
+        if "confidence" not in columns:
+            connection.execute(
+                text(
+                    "UPDATE police_gesture_records "
+                    "SET confidence = 0 "
+                    "WHERE confidence IS NULL"
+                )
+            )
+        if "updated_at" not in columns and "created_at" in columns:
+            connection.execute(
+                text(
+                    "UPDATE police_gesture_records "
+                    "SET updated_at = created_at "
+                    "WHERE updated_at IS NULL"
+                )
+            )
 
 
 def init_database() -> None:

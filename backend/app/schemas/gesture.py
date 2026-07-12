@@ -40,6 +40,43 @@ class GestureFrameResult(BaseModel):
 class GestureHistoryItem(BaseModel):
     gesture: str
     confidence: float
+    source_path: str | None = None
+    updated_at: datetime
+
+
+class PoliceGestureVideoResult(BaseModel):
+    source_filename: str
+    gesture: str
+    confidence: float
+    keypoints: list[Keypoint]
+    task_id: str | None = None
+    processed_video_url: str
+    processed_frame_count: int
+    duration_seconds: float | None = None
+    updated_at: datetime
+
+
+class PoliceGestureVideoEvent(BaseModel):
+    gesture: str
+    confidence: float
+    frame_index: int
+    timestamp_seconds: float | None = None
+    message: str = ""
+    updated_at: datetime
+
+
+class PoliceGestureVideoProgress(BaseModel):
+    task_id: str
+    source_filename: str = ""
+    status: str
+    progress: float = 0.0
+    message: str = ""
+    processed_frame_count: int = 0
+    total_frames: int | None = None
+    gesture: str | None = None
+    confidence: float | None = None
+    annotated_frame: str | None = None
+    events: list[PoliceGestureVideoEvent] = Field(default_factory=list)
     updated_at: datetime
 
 

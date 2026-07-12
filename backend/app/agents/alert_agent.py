@@ -19,6 +19,10 @@ class AlertAgent:
         "plate_recognition_failure",
         "plate_recognition_timeout",
     }
+    _police_image_warning_event_types = {
+        "police_gesture_decode_error",
+        "police_gesture_image_failure",
+    }
     _owner_low_confidence_event_types = {"owner_gesture_low_confidence"}
     _ignored_streak_event_types = {"behavior_event"}
 
@@ -85,6 +89,31 @@ class AlertAgent:
                 "root_cause": "车牌识别在监控时间窗口内连续出现告警，说明当前识别链路存在持续性异常。",
                 "impact_scope": "影响车牌识别结果展示、上传识别流程以及后续告警联动。",
                 "suggested_action": "请检查摄像头画面质量、识别模型运行状态和设备负载，并结合最近样本排查未检出、失败或超时原因。",
+                "analysis": {
+                    "consecutive_warning_count": streak,
+                    "threshold": settings.alert_consecutive_failures_threshold,
+                    "observed_status": status,
+                    "observed_at": log_entry.created_at.isoformat(),
+                    "details": details,
+                },
+            }
+
+        if event_type in self._police_image_warning_event_types:
+            streak = self._count_consecutive_matching_logs(
+                log_entry=log_entry,
+                matcher=self._is_police_image_warning_log,
+                breaker=self._is_police_image_streak_breaker,
+            )
+            if streak > settings.alert_consecutive_failures_threshold:
+                return None
+
+            level = "critical" if streak == settings.alert_consecutive_failures_threshold else "warning"
+            return {
+                "title": "连续交警手势图片识别失败" if level == "critical" else log_entry.title,
+                "level": level,
+                "root_cause": "交警手势图片识别在监控时间窗口内连续失败，说明当前图片识别链路存在持续性异常。",
+                "impact_scope": "影响交警手势图片识别结果展示、监控日志记录以及后续告警联动。",
+                "suggested_action": "请检查上传图片是否可读、姿态模型与分类器运行状态，以及最近失败样本与后端异常日志。",
                 "analysis": {
                     "consecutive_warning_count": streak,
                     "threshold": settings.alert_consecutive_failures_threshold,
@@ -212,6 +241,14 @@ class AlertAgent:
         if record.event_type in self._ignored_streak_event_types:
             return False
         return record.event_type == "plate_recognition_success"
+
+    def _is_police_image_warning_log(self, record: MonitorLog) -> bool:
+        return record.event_type in self._police_image_warning_event_types
+
+    def _is_police_image_streak_breaker(self, record: MonitorLog) -> bool:
+        if record.event_type in self._ignored_streak_event_types:
+            return False
+        return record.event_type == "police_gesture_success"
 
     def _is_owner_low_confidence_log(self, record: MonitorLog) -> bool:
         return record.event_type in self._owner_low_confidence_event_types

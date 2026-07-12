@@ -189,6 +189,80 @@ class AlertAgentTestCase(unittest.TestCase):
         self.assertIsNone(self.agent._decide(log_entry=success, details={}))
         self.assertEqual(self.agent._decide(log_entry=recovered_warning, details={})["level"], "warning")
 
+    def test_police_image_failure_streak_emits_one_critical_on_third_hit(self) -> None:
+        first = self._create_monitor_log(
+            source="police-gesture",
+            event_type="police_gesture_decode_error",
+            level="warning",
+            status="failed",
+            created_at=self.base_time,
+        )
+        self.assertEqual(self.agent._decide(log_entry=first, details={})["level"], "warning")
+
+        self._create_monitor_log(
+            source="police-gesture",
+            event_type="behavior_event",
+            level="info",
+            status="recorded",
+            created_at=self.base_time + timedelta(milliseconds=200),
+        )
+
+        second = self._create_monitor_log(
+            source="police-gesture",
+            event_type="police_gesture_image_failure",
+            level="warning",
+            status="failed",
+            created_at=self.base_time + timedelta(seconds=1),
+        )
+        self.assertEqual(self.agent._decide(log_entry=second, details={})["level"], "warning")
+
+        self._create_monitor_log(
+            source="police-gesture",
+            event_type="behavior_event",
+            level="info",
+            status="recorded",
+            created_at=self.base_time + timedelta(seconds=1, milliseconds=200),
+        )
+
+        third = self._create_monitor_log(
+            source="police-gesture",
+            event_type="police_gesture_image_failure",
+            level="warning",
+            status="failed",
+            created_at=self.base_time + timedelta(seconds=2),
+        )
+        third_decision = self.agent._decide(log_entry=third, details={})
+        self.assertEqual(third_decision["level"], "critical")
+        self.assertEqual(third_decision["title"], "连续交警手势图片识别失败")
+
+        fourth = self._create_monitor_log(
+            source="police-gesture",
+            event_type="police_gesture_image_failure",
+            level="warning",
+            status="failed",
+            created_at=self.base_time + timedelta(seconds=3),
+        )
+        self.assertIsNone(self.agent._decide(log_entry=fourth, details={}))
+
+        success = self._create_monitor_log(
+            source="police-gesture",
+            event_type="police_gesture_success",
+            level="info",
+            status="processed",
+            confidence=0.93,
+            created_at=self.base_time + timedelta(seconds=4),
+        )
+        recovered_warning = self._create_monitor_log(
+            source="police-gesture",
+            event_type="police_gesture_image_failure",
+            level="warning",
+            status="failed",
+            created_at=self.base_time + timedelta(seconds=5),
+        )
+
+        self.assertIsNone(self.agent._decide(log_entry=success, details={}))
+        self.assertEqual(self.agent._decide(log_entry=recovered_warning, details={})["level"], "warning")
+
     def _create_monitor_log(
         self,
         *,
