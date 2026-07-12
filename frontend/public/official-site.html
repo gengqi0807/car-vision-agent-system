@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>智能车载视觉感知与交互系统</title>
+    <meta
+      name="description"
+      content="智能车载视觉感知与交互系统官网介绍页，包含项目概述、核心功能、应用场景、技术方案与项目团队信息。"
+    />
+    <style>
+      :root {
+        --bg: #f3efe7;
+        --surface: rgba(255, 255, 255, 0.86);
+        --surface-strong: #fffdf8;
+        --line: rgba(100, 76, 52, 0.12);
+        --text: #2f261d;
+        --text-soft: #66584a;
+        --muted: #8f7f6d;
+        --accent: #b76e3c;
+        --accent-deep: #8b4d21;
+        --green: #5d8765;
+        --shadow: 0 22px 60px rgba(67, 45, 24, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+      }
+
+      body {
+        font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(236, 216, 188, 0.8), transparent 32%),
+          radial-gradient(circle at right 20%, rgba(195, 220, 204, 0.68), transparent 24%),
+          linear-gradient(180deg, #f7f1e8 0%, #f3efe7 44%, #efe9df 100%);
+      }
+
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+
+      .shell {
+        width: min(1180px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 28px 0 56px;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 16px 22px;
+        background: rgba(255, 253, 248, 0.78);
+        border: 1px solid rgba(100, 76, 52, 0.1);
+        border-radius: 20px;
+        backdrop-filter: blur(12px);
+        box-shadow: 0 12px 28px rgba(67, 45, 24, 0.06);
+      }
+
+      .brand {
+        display: grid;
+        gap: 4px;
+      }
+
+      .brand strong {
+        font-size: 20px;
+        letter-spacing: 0.03em;
+      }
+
+      .brand span {
+        font-size: 12px;
+        color: var(--muted);
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+      }
+
+      .nav {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 18px;
+        font-size: 14px;
+        color: var(--text-soft);
+      }
+
+      .nav a:hover {
+        color: var(--accent-deep);
+      }
+
+      .hero {
+        position: relative;
+        overflow: hidden;
+        display: grid;
+        grid-template-columns: 1.2fr 0.8fr;
+        gap: 28px;
+        margin-top: 22px;
+        padding: 42px;
+        background:
+          linear-gradient(135deg, rgba(255, 250, 243, 0.96), rgba(249, 239, 228, 0.92)),
+          var(--surface-strong);
+        border: 1px solid rgba(100, 76, 52, 0.08);
+        border-radius: 32px;
+        box-shadow: var(--shadow);
+      }
+
+      .hero::after {
+        content: "";
+        position: absolute;
+        right: -80px;
+        top: -70px;
+        width: 280px;
+        height: 280px;
+        background: radial-gradient(circle, rgba(183, 110, 60, 0.2), transparent 68%);
+        pointer-events: none;
+      }
+
+      .hero-copy {
+        position: relative;
+        z-index: 1;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 14px;
+        font-size: 12px;
+        color: var(--accent-deep);
+        background: rgba(183, 110, 60, 0.12);
+        border-radius: 999px;
+        letter-spacing: 0.06em;
+      }
+
+      h1 {
+        margin: 20px 0 14px;
+        font-size: clamp(40px, 5vw, 64px);
+        line-height: 1.02;
+        letter-spacing: -0.04em;
+      }
+
+      .lead {
+        max-width: 720px;
+        margin: 0;
+        font-size: 17px;
+        line-height: 1.9;
+        color: var(--text-soft);
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+        margin-top: 28px;
+      }
+
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 150px;
+        padding: 13px 20px;
+        border-radius: 999px;
+        font-weight: 600;
+        transition: 0.2s ease;
+      }
+
+      .btn.primary {
+        color: #fff;
+        background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+        box-shadow: 0 14px 28px rgba(139, 77, 33, 0.24);
+      }
+
+      .btn.secondary {
+        color: var(--text);
+        background: rgba(255, 255, 255, 0.72);
+        border: 1px solid rgba(100, 76, 52, 0.12);
+      }
+
+      .btn:hover {
+        transform: translateY(-1px);
+      }
+
+      .hero-aside {
+        position: relative;
+        z-index: 1;
+        display: grid;
+        gap: 14px;
+        align-content: start;
+      }
+
+      .mini-card,
+      .panel,
+      .info-card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        backdrop-filter: blur(10px);
+      }
+
+      .mini-card {
+        padding: 18px 20px;
+      }
+
+      .mini-card strong {
+        display: block;
+        margin-top: 8px;
+        font-size: 26px;
+      }
+
+      .mini-card span {
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .badge-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+
+      .badge {
+        padding: 8px 12px;
+        font-size: 12px;
+        color: var(--text-soft);
+        background: rgba(255, 255, 255, 0.78);
+        border: 1px solid rgba(100, 76, 52, 0.1);
+        border-radius: 999px;
+      }
+
+      .section {
+        margin-top: 22px;
+      }
+
+      .section-grid {
+        display: grid;
+        grid-template-columns: 0.95fr 1.05fr;
+        gap: 22px;
+      }
+
+      .panel {
+        padding: 28px;
+        box-shadow: 0 14px 30px rgba(67, 45, 24, 0.05);
+      }
+
+      .panel h2 {
+        margin: 0 0 10px;
+        font-size: 28px;
+      }
+
+      .panel p,
+      .panel li {
+        font-size: 15px;
+        line-height: 1.8;
+        color: var(--text-soft);
+      }
+
+      .panel ul {
+        margin: 10px 0 0;
+        padding-left: 18px;
+      }
+
+      .feature-grid,
+      .scene-grid,
+      .info-grid {
+        display: grid;
+        gap: 16px;
+      }
+
+      .feature-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .scene-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .info-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .feature-card,
+      .scene-card,
+      .info-card {
+        padding: 22px;
+      }
+
+      .feature-card {
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(250, 245, 238, 0.88));
+      }
+
+      .feature-card strong,
+      .scene-card strong,
+      .info-card strong {
+        display: block;
+        margin-bottom: 8px;
+        font-size: 17px;
+      }
+
+      .feature-card p,
+      .scene-card p,
+      .info-card p {
+        margin: 0;
+        font-size: 14px;
+        line-height: 1.8;
+        color: var(--text-soft);
+      }
+
+      .feature-index {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 34px;
+        height: 34px;
+        margin-bottom: 14px;
+        color: var(--accent-deep);
+        font-weight: 700;
+        background: rgba(183, 110, 60, 0.12);
+        border-radius: 50%;
+      }
+
+      .scene-card {
+        background: linear-gradient(180deg, rgba(242, 248, 244, 0.9), rgba(255, 255, 255, 0.88));
+      }
+
+      .headline-row {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 18px;
+        margin-bottom: 16px;
+      }
+
+      .headline-row p {
+        max-width: 480px;
+        margin: 0;
+      }
+
+      .notice {
+        padding: 18px 20px;
+        margin-top: 18px;
+        color: #49684f;
+        background: rgba(93, 135, 101, 0.12);
+        border: 1px solid rgba(93, 135, 101, 0.2);
+        border-radius: 18px;
+      }
+
+      .audit-list {
+        display: grid;
+        gap: 12px;
+        margin-top: 12px;
+      }
+
+      .audit-item {
+        padding: 16px 18px;
+        background: rgba(255, 255, 255, 0.72);
+        border: 1px solid rgba(100, 76, 52, 0.1);
+        border-radius: 16px;
+      }
+
+      .audit-item strong {
+        display: block;
+        margin-bottom: 6px;
+        font-size: 15px;
+      }
+
+      .footer {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 16px;
+        margin-top: 22px;
+        padding: 24px 8px 4px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .footer a {
+        color: var(--accent-deep);
+      }
+
+      @media (max-width: 980px) {
+        .hero,
+        .section-grid,
+        .scene-grid,
+        .feature-grid,
+        .info-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .hero {
+          padding: 32px 24px;
+        }
+      }
+
+      @media (max-width: 720px) {
+        .shell {
+          width: min(100vw - 20px, 1180px);
+          padding-top: 16px;
+        }
+
+        .topbar,
+        .panel,
+        .mini-card,
+        .feature-card,
+        .scene-card,
+        .info-card {
+          border-radius: 20px;
+        }
+
+        h1 {
+          font-size: 38px;
+        }
+
+        .topbar {
+          padding: 16px;
+        }
+
+        .nav {
+          justify-content: flex-start;
+        }
+
+        .headline-row {
+          display: block;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <strong>智能车载视觉感知与交互系统</strong>
+          <span>Car Vision Agent System</span>
+        </div>
+        <nav class="nav">
+          <a href="#overview">项目概述</a>
+          <a href="#features">核心功能</a>
+          <a href="#scenes">应用场景</a>
+          <a href="#team">项目团队</a>
+          <a href="./">演示入口</a>
+        </nav>
+      </header>
+
+      <section class="hero">
+        <div class="hero-copy">
+          <div class="eyebrow">课程实践项目 · 教学演示平台 · 视觉智能交互</div>
+          <h1>让车辆感知、识别、响应，形成一套可演示的视觉交互闭环。</h1>
+          <p class="lead">
+            本项目面向课程设计与小学期实践，围绕车牌识别、交警手势识别、车主手势控车与系统告警监测，
+            构建了一套可部署、可演示、可扩展的车载视觉感知与交互平台。系统以 Web 管理端承载展示与操作，
+            支持身份认证、结果查看、历史记录与项目演示说明。
+          </p>
+          <div class="actions">
+            <a class="btn primary" href="./">进入系统演示</a>
+            <a class="btn secondary" href="#team">查看项目资料</a>
+          </div>
+        </div>
+
+        <aside class="hero-aside">
+          <div class="mini-card">
+            <span>项目定位</span>
+            <strong>教学演示型官网</strong>
+          </div>
+          <div class="mini-card">
+            <span>建设目标</span>
+            <strong>展示项目能力与功能闭环</strong>
+          </div>
+          <div class="mini-card">
+            <span>使用范围</span>
+            <strong>课程实践 / 竞赛预演 / 校内展示</strong>
+          </div>
+          <div class="badge-row">
+            <span class="badge">车牌识别</span>
+            <span class="badge">手势识别</span>
+            <span class="badge">微信扫码登录预留</span>
+            <span class="badge">安全审计</span>
+          </div>
+        </aside>
+      </section>
+
+      <section class="section section-grid" id="overview">
+        <article class="panel">
+          <h2>项目概述</h2>
+          <p>
+            智能车载视觉感知与交互系统以“识别 + 决策 + 展示”为主线，整合车牌识别、驾驶员或车主指令理解、
+            异常行为监测与告警面板展示，适合作为课程项目官网、系统说明页以及功能展示入口。
+          </p>
+          <ul>
+            <li>项目用途：课程实践、教学展示、系统原型验证。</li>
+            <li>项目性质：非商业化教学项目，当前页面用于展示项目背景与功能能力。</li>
+            <li>访问说明：公开访客可浏览介绍页；系统管理功能需要登录后使用。</li>
+          </ul>
+          <div class="notice">
+            本站当前内容可直接作为“官网介绍页”提交审核，部署后只需将学校、学院、指导教师和联系信息替换为真实内容。
+          </div>
+        </article>
+
+        <article class="panel">
+          <h2>系统特点</h2>
+          <div class="feature-grid">
+            <div class="feature-card">
+              <span class="feature-index">01</span>
+              <strong>多模块统一展示</strong>
+              <p>将识别、控制、告警与用户认证整合为同一套前后端系统，便于集中演示与验收。</p>
+            </div>
+            <div class="feature-card">
+              <span class="feature-index">02</span>
+              <strong>具备可扩展认证能力</strong>
+              <p>支持账号密码、邮箱验证码、手机验证码，并为微信扫码登录预留了真实接入结构。</p>
+            </div>
+            <div class="feature-card">
+              <span class="feature-index">03</span>
+              <strong>强调教学可解释性</strong>
+              <p>页面布局清晰展示各项功能目标、输入输出与监测结果，适合课堂答辩和项目说明。</p>
+            </div>
+            <div class="feature-card">
+              <span class="feature-index">04</span>
+              <strong>兼顾隐私与安全</strong>
+              <p>对邮箱、手机号等敏感数据采取加密与散列处理，并保留基础审计与告警监测能力。</p>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="section" id="features">
+        <article class="panel">
+          <div class="headline-row">
+            <div>
+              <h2>核心功能模块</h2>
+              <p>围绕“识别、交互、监控、认证”四类能力组织页面结构，便于官网审核与项目介绍。</p>
+            </div>
+          </div>
+          <div class="feature-grid">
+            <div class="feature-card">
+              <strong>车牌识别</strong>
+              <p>支持车牌图像上传与识别结果展示，记录识别时间、置信度与历史记录。</p>
+            </div>
+            <div class="feature-card">
+              <strong>交警手势识别</strong>
+              <p>可用于演示交通指挥手势识别流程，便于说明视觉模型对规则场景的理解能力。</p>
+            </div>
+            <div class="feature-card">
+              <strong>车主手势控车</strong>
+              <p>展示以视觉手势作为交互指令的设计思路，用于模拟车内或近车场景的交互控制。</p>
+            </div>
+            <div class="feature-card">
+              <strong>告警监控与审计</strong>
+              <p>对用户操作、模型状态和系统异常进行汇总展示，形成可解释的监测看板。</p>
+            </div>
+            <div class="feature-card">
+              <strong>用户登录与资料管理</strong>
+              <p>支持多种登录方式以及用户资料维护，形成完整的使用闭环。</p>
+            </div>
+            <div class="feature-card">
+              <strong>开放扩展结构</strong>
+              <p>接口与前端已预留后续对接真实短信、真实微信扫码与更多模型能力的扩展空间。</p>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="section" id="scenes">
+        <article class="panel">
+          <div class="headline-row">
+            <div>
+              <h2>应用场景</h2>
+              <p>该项目以校园实践和教学展示为主，但其能力结构也贴近实际智慧交通与智能座舱原型场景。</p>
+            </div>
+          </div>
+          <div class="scene-grid">
+            <div class="scene-card">
+              <strong>课程答辩展示</strong>
+              <p>作为课程设计或小学期项目官网，向评审说明项目目标、模块划分、实现路径与最终成果。</p>
+            </div>
+            <div class="scene-card">
+              <strong>智慧交通原型</strong>
+              <p>面向交通识别、通行辅助、指挥理解等方向，演示视觉感知在规则化道路场景中的应用潜力。</p>
+            </div>
+            <div class="scene-card">
+              <strong>智能座舱交互</strong>
+              <p>通过手势识别与行为理解展示非接触式交互思路，可进一步延伸到车内人机交互设计。</p>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="section section-grid" id="team">
+        <article class="panel">
+          <h2>项目团队信息</h2>
+          <div class="info-grid">
+            <div class="info-card">
+              <strong>项目名称</strong>
+              <p>智能车载视觉感知与交互系统</p>
+            </div>
+            <div class="info-card">
+              <strong>项目类型</strong>
+              <p>小学期 / 课程实践 / 教学演示项目</p>
+            </div>
+            <div class="info-card">
+              <strong>所属单位</strong>
+              <p>请替换为你的学校、学院、实验室或课程组名称</p>
+            </div>
+            <div class="info-card">
+              <strong>项目负责人</strong>
+              <p>请替换为你的姓名或指导教师姓名</p>
+            </div>
+            <div class="info-card">
+              <strong>联系邮箱</strong>
+              <p>请替换为可用于审核联络的真实邮箱</p>
+            </div>
+            <div class="info-card">
+              <strong>项目官网说明</strong>
+              <p>本页为项目官网介绍页，用于展示项目用途、功能模块、团队信息与访问说明。</p>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <h2>提交审核建议</h2>
+          <div class="audit-list">
+            <div class="audit-item">
+              <strong>1. 先替换真实主体信息</strong>
+              <span>将学校、学院、课程名称、负责人、联系方式替换为真实信息，避免显得过于模板化。</span>
+            </div>
+            <div class="audit-item">
+              <strong>2. 准备一个稳定可访问域名</strong>
+              <span>建议部署到学校服务器、Vercel、Netlify 或 GitHub Pages，并保证外部可访问。</span>
+            </div>
+            <div class="audit-item">
+              <strong>3. 保持页面内容与项目一致</strong>
+              <span>官网介绍页应与系统功能、答辩材料和项目说明文档保持统一，突出教学演示用途。</span>
+            </div>
+            <div class="audit-item">
+              <strong>4. 登录页与官网页分离</strong>
+              <span>审核材料中可将本页作为官网，系统主功能页作为受限访问区域，结构更清晰。</span>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <footer class="footer">
+        <span>© 智能车载视觉感知与交互系统 · 教学演示站点</span>
+        <span>
+          可直接访问此页进行审核预览，也可返回
+          <a href="./">系统演示入口</a>
+        </span>
+      </footer>
+    </div>
+  </body>
+</html>
