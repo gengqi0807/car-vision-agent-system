@@ -124,9 +124,9 @@ class PoliceGestureService:
             await self._capture_error(
                 filename=filename,
                 event_type="police_gesture_decode_error",
-                summary="Cannot decode image bytes.",
+                summary="无法解析图像字节数据。",
             )
-            raise ValueError(f"Cannot decode image '{filename}'")
+            raise ValueError(f"无法解析图像文件“{filename}”")
 
         logger.info("Processing police-pose frame '%s' (%dx%d)", filename, frame.shape[1], frame.shape[0])
         visual_result = self._runtime.recognize_image(frame)
@@ -153,7 +153,7 @@ class PoliceGestureService:
             with SessionLocal() as session:
                 AlertService(session).record_behavior_once(
                     source="police-gesture",
-                    title="Police gesture not recognized",
+                    title="交警手势未识别",
                     summary=self._build_unrecognized_behavior_summary(
                         filename=filename,
                         gesture=gesture_label,
@@ -168,10 +168,10 @@ class PoliceGestureService:
                     if cls_conf >= settings.alert_low_confidence_threshold
                     else "police_gesture_low_confidence"
                 ),
-                title="Police gesture frame processed",
+                title="交警手势帧处理完成",
                 summary=(
-                    f"{filename} processed: gesture={gesture_label}, "
-                    f"confidence={cls_conf:.2f}, poses={num_poses}."
+                    f"{filename} 已处理完成：手势={self._gesture_label(gesture_label)}，"
+                    f"置信度={cls_conf:.2f}，姿态数={num_poses}。"
                 ),
                 confidence=cls_conf,
                 details={
@@ -907,9 +907,23 @@ class PoliceGestureService:
         num_detections: int,
     ) -> str:
         return (
-            f"{filename} did not produce a recognized police gesture. "
-            f"gesture={gesture}, poses={num_detections}."
+            f"{filename} 未识别出有效的交警手势。"
+            f"手势={self._gesture_label(gesture)}，姿态数={num_detections}。"
         )
+
+    def _gesture_label(self, gesture: str) -> str:
+        labels = {
+            "stop": "停止",
+            "go_straight": "直行",
+            "turn_left": "左转",
+            "turn_right": "右转",
+            "slow_down": "减速",
+            "pull_over": "靠边停车",
+            "lane_change": "变道",
+            "unknown": "未知",
+            NO_POSE_GESTURE: NO_POSE_GESTURE,
+        }
+        return labels.get(gesture, gesture)
 
     async def _capture_monitor_log(
         self,
@@ -948,7 +962,7 @@ class PoliceGestureService:
                 category="police_gesture",
                 source="police-gesture",
                 event_type=event_type,
-                title="Police gesture frame processing failed",
+                title="交警手势帧处理失败",
                 summary=f"{filename}: {summary}",
                 level="warning",
                 status="failed",

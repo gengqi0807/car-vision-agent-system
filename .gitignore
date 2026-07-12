@@ -3,8 +3,10 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.agents/
 .venv/
 .venv311/
+.venv311.broken-*/
 venv/
 env/
 venv-vision/
@@ -17,14 +19,24 @@ dist/
 .env
 .env.local
 .env.*.local
+backend/.env
+frontend/.env.development
+frontend/.env.production
+frontend/.env.*
 
 backend/uploads/
 backend/logs/
 backend/runtime/
+backend/*.log
 backend/models/*.task
+backend/models/*.joblib
 backend/models/*.pt
 backend/models/*.onnx
 backend/models/*.tflite
+backend/weights/*.pt
+backend/weights/*.onnx
+backend/*.task
+backend/*.pt
 !backend/models/.gitkeep
 
 *.db
@@ -33,6 +45,17 @@ local.db
 owner_gesture_dataset_
 test.mp4
 test0.mp4
+
+auto.key
+auto.crt
+*.pem
+*.pfx
+*.jks
+
+/test*.mp4
+/tmp_test_video.mp4
+/sample_processed_frame.jpg
+/test*.jpg
 
 .DS_Store
 Thumbs.db

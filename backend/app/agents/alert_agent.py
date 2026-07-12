@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Callable
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -13,6 +14,14 @@ from app.services.alert_service import AlertService
 
 
 class AlertAgent:
+    _plate_warning_event_types = {
+        "plate_recognition_no_detection",
+        "plate_recognition_failure",
+        "plate_recognition_timeout",
+    }
+    _owner_low_confidence_event_types = {"owner_gesture_low_confidence"}
+    _ignored_streak_event_types = {"behavior_event"}
+
     def __init__(self, db: Session) -> None:
         self.db = db
         self.llm_client = LLMClient()
@@ -28,7 +37,7 @@ class AlertAgent:
                 "created_at": log_entry.created_at.isoformat(),
                 "event_type": log_entry.event_type,
                 "level": decision["level"],
-                "title": log_entry.title,
+                "title": decision.get("title", log_entry.title),
                 "summary": log_entry.summary,
                 "impact_scope": decision["impact_scope"],
                 "root_cause": decision["root_cause"],
@@ -42,7 +51,7 @@ class AlertAgent:
                 level=decision["level"],
                 source=log_entry.source,
                 event_type=log_entry.event_type,
-                title=log_entry.title,
+                title=decision.get("title", log_entry.title),
                 summary=summary_payload["summary"],
                 impact_scope=summary_payload["impact_scope"],
                 root_cause=summary_payload["root_cause"],
@@ -60,20 +69,25 @@ class AlertAgent:
         status = (log_entry.status or "").lower()
         confidence = log_entry.confidence
 
-        if event_type in {"plate_recognition_failure", "plate_recognition_timeout"}:
-            consecutive_failures = self._count_recent_logs(
-                source=log_entry.source,
-                event_types=["plate_recognition_failure", "plate_recognition_timeout"],
-                statuses=["failed", "timeout"],
+        if event_type in self._plate_warning_event_types:
+            streak = self._count_consecutive_matching_logs(
+                log_entry=log_entry,
+                matcher=self._is_plate_warning_log,
+                breaker=self._is_plate_streak_breaker,
             )
-            level = "critical" if consecutive_failures >= settings.alert_consecutive_failures_threshold else "warning"
+            if streak > settings.alert_consecutive_failures_threshold:
+                return None
+
+            level = "critical" if streak == settings.alert_consecutive_failures_threshold else "warning"
             return {
+                "title": "车牌识别多次未命中结果" if level == "critical" else log_entry.title,
                 "level": level,
-                "root_cause": "车牌识别连续失败，或多次触发超时阈值。",
-                "impact_scope": "影响车牌识别上传、监控页面展示以及下游告警查看流程。",
-                "suggested_action": "检查模型运行状态、图像质量和 CPU 负载，必要时使用更清晰的画面重新测试。",
+                "root_cause": "车牌识别在监控时间窗口内连续出现告警，说明当前识别链路存在持续性异常。",
+                "impact_scope": "影响车牌识别结果展示、上传识别流程以及后续告警联动。",
+                "suggested_action": "请检查摄像头画面质量、识别模型运行状态和设备负载，并结合最近样本排查未检出、失败或超时原因。",
                 "analysis": {
-                    "consecutive_failures": consecutive_failures,
+                    "consecutive_warning_count": streak,
+                    "threshold": settings.alert_consecutive_failures_threshold,
                     "observed_status": status,
                     "observed_at": log_entry.created_at.isoformat(),
                     "details": details,
@@ -91,7 +105,7 @@ class AlertAgent:
                 "level": level,
                 "root_cause": "受保护接口检测到重复的未授权访问尝试。",
                 "impact_scope": "影响需要登录鉴权的接口以及账户安全控制链路。",
-                "suggested_action": "核验客户端令牌、排查来源 IP，并考虑限流或拦截异常来源。",
+                "suggested_action": "请核验客户端令牌、排查来源 IP，并考虑限流或拦截异常来源。",
                 "analysis": {
                     "recent_attempts": recent_attempts,
                     "observed_at": log_entry.created_at.isoformat(),
@@ -99,18 +113,26 @@ class AlertAgent:
                 },
             }
 
-        if event_type in {"owner_gesture_low_confidence", "police_gesture_low_confidence"}:
-            low_confidence_count = self._count_low_confidence_logs(log_entry.source)
-            level = "critical" if low_confidence_count >= settings.alert_low_confidence_window_size else "warning"
+        if event_type in self._owner_low_confidence_event_types:
+            streak = self._count_consecutive_matching_logs(
+                log_entry=log_entry,
+                matcher=self._is_owner_low_confidence_log,
+                breaker=self._is_owner_streak_breaker,
+            )
+            if streak > settings.alert_low_confidence_window_size:
+                return None
+
+            level = "critical" if streak == settings.alert_low_confidence_window_size else "warning"
             return {
                 "level": level,
-                "root_cause": "识别置信度在一段时间内持续低于系统设定阈值。",
-                "impact_scope": "影响当前摄像头画面对应的手势交互识别准确率。",
-                "suggested_action": "检查光照、取景范围，并确认模型文件是否已正确加载。",
+                "root_cause": "手势控车识别连续多次低于置信度阈值，说明当前交互环境或模型状态存在持续波动。",
+                "impact_scope": "影响车主手势控车的识别准确率与交互稳定性。",
+                "suggested_action": "请检查光照、取景范围、手势姿态以及模型加载状态，必要时重新校验摄像头位置。",
                 "analysis": {
-                    "low_confidence_count": low_confidence_count,
-                    "threshold": settings.alert_low_confidence_threshold,
+                    "low_confidence_streak": streak,
+                    "threshold": settings.alert_low_confidence_window_size,
                     "observed_confidence": confidence,
+                    "confidence_threshold": settings.alert_low_confidence_threshold,
                     "observed_at": log_entry.created_at.isoformat(),
                     "details": details,
                 },
@@ -120,9 +142,9 @@ class AlertAgent:
             level = "critical" if event_type == "llm_token_exceeded" else "warning"
             return {
                 "level": level,
-                "root_cause": "用于生成告警摘要的 LLM 依赖出现超时或 Token 额度耗尽。",
+                "root_cause": "用于生成告警摘要的 LLM 依赖出现超时或 Token 配额耗尽。",
                 "impact_scope": "影响自然语言告警摘要生成以及后续告警增强分析。",
-                "suggested_action": "检查 API 配额、超时设置以及 LLM 服务的回退逻辑。",
+                "suggested_action": "请检查 API 配额、超时配置以及 LLM 服务的回退逻辑。",
                 "analysis": {
                     "observed_at": log_entry.created_at.isoformat(),
                     "details": details,
@@ -134,7 +156,7 @@ class AlertAgent:
                 "level": "warning" if log_entry.level == "info" else log_entry.level,
                 "root_cause": "监控智能体检测到异常运行信号。",
                 "impact_scope": "当前功能模块可能出现服务降级。",
-                "suggested_action": "检查该来源对应的监控日志与事件回放上下文。",
+                "suggested_action": "请检查该来源对应的监控日志与事件回放上下文。",
                 "analysis": {
                     "observed_at": log_entry.created_at.isoformat(),
                     "details": details,
@@ -157,16 +179,44 @@ class AlertAgent:
             or 0
         )
 
-    def _count_low_confidence_logs(self, source: str) -> int:
+    def _count_consecutive_matching_logs(
+        self,
+        *,
+        log_entry: MonitorLog,
+        matcher: Callable[[MonitorLog], bool],
+        breaker: Callable[[MonitorLog], bool],
+    ) -> int:
         since = datetime.utcnow() - timedelta(minutes=settings.alert_replay_window_minutes)
-        return int(
-            self.db.scalar(
-                select(func.count(MonitorLog.id)).where(
-                    MonitorLog.source == source,
-                    MonitorLog.created_at >= since,
-                    MonitorLog.confidence.is_not(None),
-                    MonitorLog.confidence < settings.alert_low_confidence_threshold,
-                )
+        recent_logs = self.db.scalars(
+            select(MonitorLog)
+            .where(
+                MonitorLog.source == log_entry.source,
+                MonitorLog.created_at >= since,
             )
-            or 0
-        )
+            .order_by(MonitorLog.id.desc())
+        ).all()
+
+        streak = 0
+        for record in recent_logs:
+            if matcher(record):
+                streak += 1
+                continue
+            if breaker(record):
+                break
+        return streak
+
+    def _is_plate_warning_log(self, record: MonitorLog) -> bool:
+        return record.event_type in self._plate_warning_event_types
+
+    def _is_plate_streak_breaker(self, record: MonitorLog) -> bool:
+        if record.event_type in self._ignored_streak_event_types:
+            return False
+        return record.event_type == "plate_recognition_success"
+
+    def _is_owner_low_confidence_log(self, record: MonitorLog) -> bool:
+        return record.event_type in self._owner_low_confidence_event_types
+
+    def _is_owner_streak_breaker(self, record: MonitorLog) -> bool:
+        if record.event_type in self._ignored_streak_event_types:
+            return False
+        return record.event_type == "owner_gesture_success"
