@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app import models  # noqa: F401
 from app.api.router import api_router
@@ -11,6 +13,8 @@ from app.core.logger import configure_logging, get_logger
 
 configure_logging()
 logger = get_logger(__name__)
+media_root = (Path(__file__).resolve().parents[1] / settings.plate_upload_dir).resolve()
+media_root.mkdir(parents=True, exist_ok=True)
 
 
 @asynccontextmanager
@@ -52,6 +56,7 @@ app.add_middleware(
 )
 
 app.include_router(api_router, prefix=settings.api_v1_prefix)
+app.mount("/media", StaticFiles(directory=str(media_root)), name="media")
 
 
 @app.get("/", tags=["system"])

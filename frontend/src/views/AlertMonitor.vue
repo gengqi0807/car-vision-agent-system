@@ -82,11 +82,11 @@
             <span class="dot" :class="item.level"></span>
             <div class="body">
               <span class="tag" :class="item.level">{{ getAlertLevelLabel(item.level) }}</span>
-              <div class="title">{{ item.title }}</div>
-              <div class="desc clamp-2">{{ item.summary }}</div>
+              <div class="title">{{ localizeLogTitle(item.title) }}</div>
+              <div class="desc clamp-2">{{ localizeLogSummary(item.summary) }}</div>
               <div class="desc">
                 {{ getSourceLabel(item.source) }}
-                <template v-if="item.event_type"> · {{ item.event_type }}</template>
+                <template v-if="item.event_type"> · {{ localizeEventType(item.event_type) }}</template>
               </div>
             </div>
             <span class="time">{{ formatClock(item.created_at) }}</span>
@@ -198,7 +198,7 @@
         <template v-else>
           <div class="result-item">
             <span>异常类型</span>
-            <span class="val">{{ selectedReplay.alert.event_type || "未知" }}</span>
+            <span class="val">{{ localizeEventType(selectedReplay.alert.event_type) || "未知" }}</span>
           </div>
           <div class="result-item">
             <span>影响范围</span>
@@ -235,8 +235,8 @@
           <div v-for="log in selectedReplay.related_logs.slice(0, 6)" :key="log.id" class="history-row record">
             <span>{{ formatDateTime(log.created_at) }}</span>
             <span>{{ getSourceLabel(log.source) }}</span>
-            <span>{{ log.status || "-" }}</span>
-            <span>{{ log.title }}</span>
+            <span>{{ localizeStatus(log.status) || "-" }}</span>
+            <span>{{ localizeLogTitle(log.title) }}</span>
           </div>
           <div class="support-label">推送记录</div>
           <div class="support-info">
@@ -292,10 +292,10 @@
           <div v-for="log in monitorState.items" :key="log.id" class="behavior-log-item">
             <div class="behavior-log-main">
               <span class="behavior-source">{{ getSourceLabel(log.source) }}</span>
-              <div class="title">{{ log.title }}</div>
-              <div class="desc clamp-2">{{ log.summary }}</div>
+              <div class="title">{{ localizeLogTitle(log.title) }}</div>
+              <div class="desc clamp-2">{{ localizeLogSummary(log.summary) }}</div>
               <div class="desc">
-                {{ log.event_type }} · {{ log.status || "无状态" }}
+                {{ localizeEventType(log.event_type) }} · {{ localizeStatus(log.status) || "无状态" }}
                 <template v-if="typeof log.confidence === 'number'"> · 置信度 {{ log.confidence.toFixed(2) }}</template>
               </div>
             </div>
@@ -370,8 +370,8 @@
           <div v-for="record in operationState.items" :key="record.id" class="behavior-log-item">
             <div class="behavior-log-main">
               <span class="behavior-source">用户 {{ record.user_id }}</span>
-              <div class="title">{{ record.operation_type }}</div>
-              <div class="desc">状态：{{ record.response_status || "未知" }}</div>
+              <div class="title">{{ localizeOperationType(record.operation_type) }}</div>
+              <div class="desc">状态：{{ localizeStatus(record.response_status) || "未知" }}</div>
             </div>
             <span class="time">{{ formatDateTime(record.created_at) }}</span>
           </div>
@@ -445,8 +445,8 @@
         <div v-for="log in behaviorState.items" :key="log.id" class="behavior-log-item">
           <div class="behavior-log-main">
             <span class="behavior-source">{{ getSourceLabel(log.source) }}</span>
-            <div class="title">{{ log.title }}</div>
-            <div class="desc clamp-2">{{ log.summary }}</div>
+            <div class="title">{{ localizeLogTitle(log.title) }}</div>
+            <div class="desc clamp-2">{{ localizeLogSummary(log.summary) }}</div>
           </div>
           <span class="time">{{ formatDateTime(log.created_at) }}</span>
         </div>
@@ -507,7 +507,14 @@ import {
   type OperationLogRecord,
   type PagedResult
 } from "../api/alert";
-import { formatDateTime } from "../utils/format";
+import {
+  localizeEventType,
+  localizeLogSummary,
+  localizeLogTitle,
+  localizeOperationType,
+  localizeStatus
+} from "../utils/alertText";
+import { formatClock, formatDateTime } from "../utils/format";
 
 interface PagedState<T> {
   items: T[];
@@ -735,14 +742,6 @@ function joinMetricPairs(items: MetricPoint[] | undefined) {
     return "暂无";
   }
   return items.map((item) => `${item.label}: ${item.value}`).join("；");
-}
-
-function formatClock(value: string) {
-  return new Date(value).toLocaleTimeString("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false
-  });
 }
 
 function polarToCartesian(centerX: number, centerY: number, radius: number, angleInDegrees: number) {

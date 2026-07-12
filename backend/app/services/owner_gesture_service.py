@@ -87,6 +87,33 @@ COMMAND_DISPLAY_MAP: dict[str, str] = {
     "ReturnHome": "RETURN HOME",
 }
 
+GESTURE_LOG_LABEL_MAP: dict[str, str] = {
+    "open_palm": "张开手掌",
+    "fist": "握拳",
+    "point": "指向",
+    "index_circle": "画圈",
+    "swipe_left": "向左挥动",
+    "swipe_right": "向右挥动",
+    "thumbs_up": "竖起大拇指",
+    "thumbs_down": "倒拇指",
+    "wave": "挥手",
+    "idle": "待机",
+    "unknown": "未知",
+    "鏈娴嬪埌鎵嬮儴": "未检测到手部",
+}
+
+COMMAND_LOG_LABEL_MAP: dict[str, str] = {
+    "WakeSystem": "唤醒系统",
+    "ConfirmAction": "确认操作",
+    "AdjustVolume": "调节音量",
+    "SwitchPrevFeature": "切换上一个功能",
+    "SwitchNextFeature": "切换下一个功能",
+    "AnswerCall": "接听电话",
+    "HangUpCall": "挂断电话",
+    "ReturnHome": "返回主页",
+    "None": "无",
+}
+
 
 @dataclass
 class RuntimeGestureRecord:
@@ -101,6 +128,7 @@ class RuntimeGestureRecord:
 class RuntimeGestureSession:
     panel_state: ControlPanelState
     recent_records: list[RuntimeGestureRecord] = field(default_factory=list)
+    inactivity_started_at: datetime | None = None
 
 
 class OwnerGestureService:
@@ -113,6 +141,7 @@ class OwnerGestureService:
     _max_annotated_edge = 420
     _hold_frame_count = 2
     _trigger_cooldown = timedelta(seconds=2)
+    _idle_behavior_interval = timedelta(seconds=30)
     _default_panel_state = {
         "system_awake": False,
         "volume": 32,
@@ -293,6 +322,12 @@ class OwnerGestureService:
                 control_command=control_command if triggered else None,
                 updated_at=updated_at,
             )
+            idle_behavior_due = self._consume_idle_behavior_interval(
+                runtime_session,
+                gesture=gesture_label,
+                control_command=control_command if triggered else None,
+                observed_at=updated_at,
+            )
             runtime_session.recent_records.append(
                 RuntimeGestureRecord(
                     gesture=gesture_label,
@@ -304,7 +339,11 @@ class OwnerGestureService:
             )
             if len(runtime_session.recent_records) > 12:
                 runtime_session.recent_records = runtime_session.recent_records[-12:]
-            if triggered or self._should_persist_camera_record(previous_record=previous_record, gesture=gesture_label):
+            if (
+                triggered
+                or idle_behavior_due
+                or self._should_persist_camera_record(previous_record=previous_record, gesture=gesture_label)
+            ):
                 self._persist_gesture_record(
                     db,
                     user_id=user_id,
@@ -317,6 +356,7 @@ class OwnerGestureService:
                     raw_kps=raw_kps,
                     previous_record=previous_record,
                     num_hands=num_hands,
+                    idle_behavior_due=idle_behavior_due,
                 )
         else:
             self._persist_gesture_record(
@@ -331,6 +371,7 @@ class OwnerGestureService:
                 raw_kps=raw_kps,
                 previous_record=previous_record,
                 num_hands=num_hands,
+                idle_behavior_due=False,
             )
             panel_state = self._build_panel_state(db, user_id=user_id, session_id=active_session_id)
             await self._capture_monitor_log(
@@ -750,6 +791,31 @@ class OwnerGestureService:
             return True
         return previous_record.gesture != gesture
 
+    def _consume_idle_behavior_interval(
+        self,
+        session: RuntimeGestureSession,
+        *,
+        gesture: str,
+        control_command: str | None,
+        observed_at: datetime,
+    ) -> bool:
+        if control_command or not self._is_idle_behavior_gesture(gesture):
+            session.inactivity_started_at = None
+            return False
+
+        if session.inactivity_started_at is None:
+            session.inactivity_started_at = observed_at
+            return False
+
+        if observed_at - session.inactivity_started_at < self._idle_behavior_interval:
+            return False
+
+        session.inactivity_started_at = observed_at
+        return True
+
+    def _is_idle_behavior_gesture(self, gesture: str) -> bool:
+        return gesture in {"idle", "unknown", "未检测到手部", "point"}
+
     def _persist_gesture_record(
         self,
         db: Session,
@@ -764,6 +830,7 @@ class OwnerGestureService:
         raw_kps: list[dict],
         previous_record: RuntimeGestureRecord | OwnerGestureRecord | None,
         num_hands: int,
+        idle_behavior_due: bool,
     ) -> None:
         record_keypoints = [Keypoint(x=kp["x"], y=kp["y"], score=kp.get("z", 0.0)) for kp in raw_kps]
         record = OwnerGestureRecord(
@@ -789,19 +856,24 @@ class OwnerGestureService:
             )
         db.commit()
         db.refresh(record)
-        if self._should_record_behavior(
+        if idle_behavior_due or self._should_record_behavior(
             previous_record=previous_record,
             gesture=gesture,
             triggered=triggered,
         ):
             AlertService(db).record_behavior(
                 source="owner-gesture",
-                title="手势控车识别完成" if triggered else "手势控车识别更新",
+                title=(
+                    "手势控车识别完成"
+                    if triggered
+                    else "手势控车识别长时无动作" if idle_behavior_due else "手势控车识别更新"
+                ),
                 summary=self._build_behavior_summary(
                     gesture=gesture,
                     control_command=control_command,
                     triggered=triggered,
                     processing_time_ms=processing_time_ms,
+                    idle_behavior_due=idle_behavior_due,
                 ),
             )
 
@@ -1267,12 +1339,57 @@ class OwnerGestureService:
         triggered: bool,
         processing_time_ms: int,
     ) -> str:
+        gesture_label = GESTURE_LOG_LABEL_MAP.get(gesture, gesture)
+        command_label = COMMAND_LOG_LABEL_MAP.get(control_command or "None", control_command or "无")
         if triggered and control_command:
             return (
-                f"识别到手势 {gesture}，已触发控车指令 {control_command}，"
+                f"识别到手势 {gesture_label}，已触发控车指令 {command_label}，"
                 f"处理耗时 {processing_time_ms} ms。"
             )
-        return f"识别到手势 {gesture}，未触发控车指令，处理耗时 {processing_time_ms} ms。"
+        return f"识别到手势 {gesture_label}，未触发控车指令，处理耗时 {processing_time_ms} ms。"
+
+    def _build_behavior_summary(
+        self,
+        *,
+        gesture: str,
+        control_command: str | None,
+        triggered: bool,
+        processing_time_ms: int,
+    ) -> str:
+        gesture_label = GESTURE_LOG_LABEL_MAP.get(gesture, gesture)
+        command_label = COMMAND_LOG_LABEL_MAP.get(control_command or "None", control_command or "无")
+        if triggered and control_command:
+            return (
+                f"识别到手势 {gesture_label}，已触发控车指令 {command_label}，"
+                f"处理耗时 {processing_time_ms} ms。"
+            )
+        return (
+            f"长时间未识别到有效控车动作，当前手势结果为 {gesture_label}，"
+            f"未触发控车指令，处理耗时 {processing_time_ms} ms。"
+        )
+
+    def _build_behavior_summary(
+        self,
+        *,
+        gesture: str,
+        control_command: str | None,
+        triggered: bool,
+        processing_time_ms: int,
+        idle_behavior_due: bool,
+    ) -> str:
+        gesture_label = GESTURE_LOG_LABEL_MAP.get(gesture, gesture)
+        command_label = COMMAND_LOG_LABEL_MAP.get(control_command or "None", control_command or "无")
+        if triggered and control_command:
+            return (
+                f"识别到手势 {gesture_label}，已触发控车指令 {command_label}，"
+                f"处理耗时 {processing_time_ms} ms。"
+            )
+        if idle_behavior_due:
+            return (
+                f"长时间未识别到有效控车动作，当前手势结果为 {gesture_label}，"
+                f"未触发控车指令，处理耗时 {processing_time_ms} ms。"
+            )
+        return f"识别到手势 {gesture_label}，暂未触发控车指令，处理耗时 {processing_time_ms} ms。"
 
     async def _capture_monitor_log(
         self,
