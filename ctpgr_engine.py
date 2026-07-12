@@ -93,7 +93,19 @@ class CTPGREngine:
 
         # class_out 形状: (1, num_classes=9)，取 softmax 得到概率
         logits = class_out[0].cpu().numpy()  # (9,)
-        probs = np.exp(logits) / np.sum(np.exp(logits))  # softmax
+
+        # ---- class-0 偏差校准 ----
+        # 训练数据不平衡导致 linear bias 对 class-0 产生 +5~+13 的 logit 偏差。
+        # 自适应修正：当 class-0 logit 远高于其他类时，将其拉回到合理范围。
+        raw_logits = logits.copy()  # 保留原始 logits 供诊断
+        non0_max = np.max(logits[1:])  # 最高非0类 logit
+        if logits[0] > non0_max + 2.0:
+            # class-0 偏高 → 拉回到"略高于最高非0类"（保留无手势优先但不再碾压）
+            logits[0] = non0_max + 1.0
+
+        # stable softmax
+        logits_s = logits - np.max(logits)
+        probs = np.exp(logits_s) / np.sum(np.exp(logits_s))
         gesture_id = int(np.argmax(probs))
         confidence = float(probs[gesture_id])
 
@@ -111,4 +123,5 @@ class CTPGREngine:
             "gesture": gesture_name,
             "confidence": confidence,
             "keypoints": keypoints,
+            "raw_logits": raw_logits.tolist(),  # (9,) 校准前原始 logits，供诊断
         }
