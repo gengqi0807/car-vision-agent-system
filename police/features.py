@@ -110,10 +110,20 @@ def extract_features(world_landmarks,
     left_pose  = get_arm_pose(lw3, ls3, body_forward, body_left)
     right_pose = get_arm_pose(rw3, rs3, body_forward, body_left)
 
-    # ---- 身体关键点 Y 坐标 ----
+    # ---- 身体关键点 Y 坐标及人体中心 ----
     hip_y      = (world_landmarks[23].y + world_landmarks[24].y) / 2.0
     shoulder_y = (world_landmarks[11].y + world_landmarks[12].y) / 2.0
     head_y     = world_landmarks[0].y
+    # 人体髋部中心（世界坐标 X/Z，用于位移检测）
+    body_cx = (world_landmarks[23].x + world_landmarks[24].x) / 2.0
+    body_cz = (world_landmarks[23].z + world_landmarks[24].z) / 2.0
+    # ---- 下半身关键点世界坐标（用于全身移动检测） ----
+    left_knee_xz  = (world_landmarks[25].x, world_landmarks[25].z)
+    right_knee_xz = (world_landmarks[26].x, world_landmarks[26].z)
+    left_ankle_xz  = (world_landmarks[27].x, world_landmarks[27].z)
+    right_ankle_xz = (world_landmarks[28].x, world_landmarks[28].z)
+    left_hip_xz  = (world_landmarks[23].x, world_landmarks[23].z)
+    right_hip_xz = (world_landmarks[24].x, world_landmarks[24].z)
 
     # ---- 手部区域（基于 Pose 手腕世界坐标 + 指尖偏移） ----
     # 注意：Hand Landmarker 的 hand_landmarks 是归一化图像坐标(0-1)，
@@ -175,6 +185,16 @@ def extract_features(world_landmarks,
         "shoulder_y": shoulder_y,
         "hip_y":      hip_y,
         "head_y":     head_y,
+        # 人体髋部中心世界坐标（用于行走检测）
+        "body_cx": body_cx,
+        "body_cz": body_cz,
+        # 下半身关键点世界坐标 XZ（用于全身移动检测）
+        "left_knee_xz":   left_knee_xz,
+        "right_knee_xz":  right_knee_xz,
+        "left_ankle_xz":  left_ankle_xz,
+        "right_ankle_xz": right_ankle_xz,
+        "left_hip_xz":   left_hip_xz,
+        "right_hip_xz":  right_hip_xz,
         # 肩宽
         "shoulder_width": shoulder_width,
     }

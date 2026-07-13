@@ -177,6 +177,12 @@ def main():
     dl_counter = 0
     dl_error_once = False
 
+    # 动作中识别结果锁定（需连续N帧相同手势才锁定，过滤初期抖动）
+    locked_gesture = None
+    lock_candidate = None   # 当前连续追踪的手势名称
+    lock_cons_count = 0     # 连续计数
+    was_active = False
+
     # ---- 显示级帧持久化（摄像头关键点抖动导致置信度在 0.70 门槛附近振荡） ----
     #   保持已确认的手势显示，直到连续 N 个推理帧都为"无手势"才真正切换。
     #   SKIP_FRAMES=2 → 每秒约 15 次推理 → PERSIST=8 ≈ 0.5 秒容错窗口。
@@ -457,10 +463,21 @@ def main():
             frame = draw_chinese_text(frame, f"右手: {right_region}",
                                       (rxx, 42), (200, 100, 255), 20)
 
-        # ---- 左上角：深度学习模型结果（唯一识别依据） ----
+        # ---- 左上角：动作状态标识 + 深度学习模型结果（唯一识别依据） ----
         if dl_engine is not None:
+            # --- 动作状态条（在识别面板上方） ---
+            state_text = state_machine.display_text
+            state_colors = {
+                "无动作": (0, 0, 255),
+                "动作停止": (0, 165, 255),
+                "动作中": (0, 255, 0),
+            }
+            state_color = state_colors.get(state_text, (255, 255, 255))
+            frame = draw_chinese_text(frame, f"[{state_text}]",
+                                      (15, 10), state_color, 24)
+
             panel_w, panel_h = 260, 80
-            panel_x, panel_y = 15, 15
+            panel_x, panel_y = 15, 50
 
             overlay = frame.copy()
             cv2.rectangle(overlay, (panel_x, panel_y),
@@ -472,10 +489,55 @@ def main():
             frame = draw_chinese_text(frame, "交警手势识别",
                                       (panel_x + 10, panel_y + 5),
                                       (0, 255, 255), 22)
-            frame = draw_chinese_text(frame, dl_gesture,
+
+            # 动作中 → 连续N帧相同手势才锁定显示；否则 → 显示"无动作"
+            if state_text == "动作中":
+                if not was_active:
+                    locked_gesture = None
+                    lock_candidate = None
+                    lock_cons_count = 0
+
+                # 两阶段锁定：5帧出早期结果，持续追踪到7帧，期间预测变化则更新
+                # ★ 规则校验：DL预测右转/靠边停车但左手hip → 拒绝（DL噪声）
+                dl_valid = not (
+                    dl_gesture in ("右转弯", "右转弯信号", "靠边停车", "靠边停车信号")
+                    and last_feat and last_feat.get("left_region") == "hip"
+                )
+                # ★ 停止信号：右手必须是hip，排除右手在waist/shoulder的DL噪声
+                if dl_valid and dl_gesture in ("停止", "停止信号") and last_feat:
+                    if last_feat.get("right_region") != "hip":
+                        dl_valid = False
+                if dl_valid and dl_gesture not in ("无动作", "无手势", "DL error", "预热中..."):
+                    if dl_gesture == lock_candidate:
+                        lock_cons_count += 1
+                    else:
+                        lock_candidate = dl_gesture
+                        lock_cons_count = 1
+                        locked_gesture = None  # 预测变化，清除早期锁定
+
+                    # 5帧 → 给出早期结果
+                    if lock_cons_count >= police_cfg.LOCK_EARLY_SHOW:
+                        locked_gesture = lock_candidate
+
+                show_gesture = locked_gesture if locked_gesture else "识别中..."
+                show_conf   = f"置信度: {dl_confidence:.1%}" if locked_gesture else "置信度: —"
+            else:
+                # 动作结束：当前候选未满7帧也强制输出（动作结束前至少给一个结果）
+                if was_active and locked_gesture is None and lock_candidate is not None:
+                    show_gesture = lock_candidate
+                    show_conf   = f"置信度: {dl_confidence:.1%}"
+                else:
+                    show_gesture = "无动作"
+                    show_conf    = "置信度: —"
+                locked_gesture = None
+                lock_candidate = None
+                lock_cons_count = 0
+            was_active = (state_text == "动作中")
+
+            frame = draw_chinese_text(frame, show_gesture,
                                       (panel_x + 10, panel_y + 28),
                                       (0, 215, 255), 28)
-            frame = draw_chinese_text(frame, f"置信度: {dl_confidence:.1%}",
+            frame = draw_chinese_text(frame, show_conf,
                                       (panel_x + 10, panel_y + 60),
                                       (255, 255, 255), 18)
 
