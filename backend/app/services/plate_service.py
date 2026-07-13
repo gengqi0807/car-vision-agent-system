@@ -876,25 +876,46 @@ class PlateService:
             )
             return None, active_detections, [], active_detections
 
-        working_frame = self._resize_frame_to_limit(
-            source_frame,
-            self._resolve_video_recognition_max_side(source_frame, state),
-        )
-        state.working_width = working_frame.shape[1]
-        state.working_height = working_frame.shape[0]
         should_update_tracks = (
             state.frame_index == 1
             or not state.tracks
             or any(track.misses > 0 for track in state.tracks)
             or state.frame_index - state.last_tracking_frame >= self._video_track_update_interval(use_fast_large_plate_mode)
         )
+        should_rerecognize = self._should_rerecognize_video(state)
+        should_probe_tracks = self._should_probe_new_video_tracks(state)
+        should_attempt_unread_ocr = self._should_attempt_idle_unread_ocr(state)
+        if (
+            not render
+            and not should_update_tracks
+            and not should_rerecognize
+            and not should_probe_tracks
+            and not should_attempt_unread_ocr
+            and state.working_width > 0
+            and state.working_height > 0
+        ):
+            active_detections = self._scale_detections(
+                self._tracks_to_detections(state.tracks),
+                state.working_width,
+                state.working_height,
+                source_frame.shape[1],
+                source_frame.shape[0],
+            )
+            return None, active_detections, [], active_detections
+
+        working_frame = self._resize_frame_to_limit(
+            source_frame,
+            self._resolve_video_recognition_max_side(source_frame, state),
+        )
+        state.working_width = working_frame.shape[1]
+        state.working_height = working_frame.shape[0]
         if should_update_tracks:
             state.tracks = self._update_tracks(working_frame, state.tracks, state.frame_index)
             state.last_tracking_frame = state.frame_index
 
         fresh_working_detections: list[PlateDetection] = []
         ran_recognize = False
-        if self._should_rerecognize_video(state):
+        if should_rerecognize:
             ran_recognize = True
             use_heavy_scan = settings.plate_video_detector_full_frame_fallback and self._should_use_heavy_scan(state)
             raw_working_detections = self._recognize_detections(
@@ -920,7 +941,7 @@ class PlateService:
                 tracks=state.tracks,
             )
             state.last_recognition_frame = state.frame_index
-        if self._should_probe_new_video_tracks(state):
+        if should_probe_tracks:
             probe_hits = self._find_untracked_detector_hits(
                 working_frame,
                 state.tracks,
@@ -1142,6 +1163,22 @@ class PlateService:
         ):
             return False
         return not any(detection.plate_number for detection in fresh_detections)
+
+    def _should_attempt_idle_unread_ocr(self, state: PlateProcessingState) -> bool:
+        if self._should_use_fast_large_plate_mode(state):
+            return False
+        for track in state.tracks:
+            if track.plate_number or track.misses > 0:
+                continue
+            if not self._is_active_unread_ocr_candidate(track):
+                continue
+            if (
+                state.frame_index - track.last_unread_ocr_frame
+                < self._active_unread_ocr_interval_for_track(track)
+            ):
+                continue
+            return True
+        return False
 
     def _prepare_video_paths(self, filename: str) -> tuple[Path, Path]:
         suffix = Path(filename).suffix.lower() or ".mp4"
@@ -3334,8 +3371,12 @@ class PlateService:
 
     def _update_tracks(self, frame, tracks: list[PlateTrack], frame_index: int) -> list[PlateTrack]:
         active_tracks: list[PlateTrack] = []
+        gray_frame = None
+        if tracks:
+            cv2 = self._require_cv2()
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         for track in tracks:
-            tracked = self._track_plate(frame, track)
+            tracked = self._track_plate(gray_frame, track) if gray_frame is not None else False
             if tracked and self._should_reject_stale_tracked_plate(track, frame_index):
                 tracked = False
                 track.misses += 2
@@ -3349,9 +3390,8 @@ class PlateService:
                 active_tracks.append(track)
         return active_tracks
 
-    def _track_plate(self, frame, track: PlateTrack) -> bool:
+    def _track_plate(self, gray_frame, track: PlateTrack) -> bool:
         cv2 = self._require_cv2()
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         x, y, width, height = track.bbox
         template_height, template_width = track.template.shape[:2]
         if width <= 0 or height <= 0 or template_width <= 0 or template_height <= 0:
@@ -3471,10 +3511,14 @@ class PlateService:
     ) -> list[PlateTrack]:
         merged_tracks = list(tracks)
         matched_indices: set[int] = set()
+        gray_frame = None
+        if detections:
+            cv2 = self._require_cv2()
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         for detection in detections:
             match_index = self._find_track_match(detection, merged_tracks, matched_indices)
-            template = self._extract_template_from_frame(frame, detection.bbox)
+            template = self._extract_template_from_frame(frame, detection.bbox, gray_frame=gray_frame)
             if template is None:
                 continue
 
@@ -4342,9 +4386,10 @@ class PlateService:
         bottom = min(top + search_height, frame_height)
         return [left, top, max(right - left, width), max(bottom - top, height)]
 
-    def _extract_template_from_frame(self, frame, bbox: list[int]):
-        cv2 = self._require_cv2()
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    def _extract_template_from_frame(self, frame, bbox: list[int], *, gray_frame=None):
+        if gray_frame is None:
+            cv2 = self._require_cv2()
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         return self._extract_template(gray_frame, bbox)
 
     def _extract_template(self, gray_frame, bbox: list[int]):
