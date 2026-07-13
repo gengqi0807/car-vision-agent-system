@@ -5,12 +5,13 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="d266786f-ee78-41ea-9080-d512dbeddab5" name="更改" comment="解决合并冲突">
-      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/app/models_infer/gesture_classifier.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/models_infer/gesture_classifier.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/backend/.gitignore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/backend/app/services/owner_gesture_service.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/services/owner_gesture_service.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/test_hand.jpg" beforeDir="false" afterPath="$PROJECT_DIR$/test_hand.jpg" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/third_party/Real-time-GesRec" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/models/gesture_classifier_svm.joblib" beforeDir="false" afterPath="$PROJECT_DIR$/backend/models/gesture_classifier_svm.joblib" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/owner_gesture_dataset_features/features.npz" beforeDir="false" afterPath="$PROJECT_DIR$/owner_gesture_dataset_features/features.npz" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/scripts/extract_features.py" beforeDir="false" afterPath="$PROJECT_DIR$/scripts/extract_features.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/verify_owner_gesture.py" beforeDir="false" afterPath="$PROJECT_DIR$/verify_owner_gesture.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />

@@ -53,6 +53,9 @@ GESTURE_ACTION = {
     "unknown":     "idle",
 }
 
+# 音量类手势：允许在手未离开屏幕时连续 +/- 切换（连续调音）
+VOLUME_GESTURES = {"circle_cw", "circle_ccw"}
+
 
 def gesture_label(gesture: str) -> str:
     return GESTURE_ACTION.get(gesture, gesture)
@@ -217,7 +220,16 @@ def main():
             hand_gone_confirmed = False
 
         # 确定最终显示的文字结果
-        if hand_present and not result_locked:
+        if (hand_present and result_locked
+                and locked_gesture in VOLUME_GESTURES
+                and gesture in VOLUME_GESTURES):
+            # 音量手势：手未离开时允许连续 +/- 切换（连续调音）
+            result_locked = True
+            locked_gesture = gesture
+            locked_action = action
+            locked_conf = conf
+            out_g, out_a, out_c = gesture, action, conf
+        elif hand_present and not result_locked:
             if gesture not in ("unknown", "idle") and conf > 0.0:
                 result_locked = True
                 locked_gesture = gesture

@@ -57,6 +57,9 @@ GESTURE_ACTION_MAP: dict[str, str] = {
     "unknown":     "idle",
 }
 
+# 音量类手势：允许在手未离开屏幕时连续 +/- 切换（连续调音）
+VOLUME_GESTURES = {"circle_cw", "circle_ccw"}
+
 
 def gesture_to_action(gesture: str) -> str:
     return GESTURE_ACTION_MAP.get(gesture, "idle")
@@ -293,7 +296,18 @@ class OwnerGestureService:
 
                 # --- 确定最终输出的手势 ---
                 if hand_present:
-                    if not self._result_locked:
+                    if (self._result_locked
+                            and self._locked_gesture in VOLUME_GESTURES
+                            and gesture in VOLUME_GESTURES):
+                        # 音量手势：手未离开时允许连续 +/- 切换（连续调音）
+                        self._result_locked = True
+                        self._locked_gesture = gesture
+                        self._locked_action = gesture_to_action(gesture)
+                        self._locked_confidence = round(confidence, 4)
+                        output_gesture = gesture
+                        output_action = self._locked_action
+                        output_confidence = self._locked_confidence
+                    elif not self._result_locked:
                         # 尚未锁定：检查是否识别出有效手势，是则锁定
                         if gesture != "unknown" and gesture != "idle" and confidence > 0.0:
                             self._result_locked = True
