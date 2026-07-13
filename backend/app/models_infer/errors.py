@@ -8,7 +8,3 @@ class InferenceConfigurationError(PlateInferenceError):
 
 class InferenceDependencyError(PlateInferenceError):
     """Raised when an inference dependency is missing."""
-
-
-class InferenceTimeoutError(PlateInferenceError):
-    """Raised when inference exceeds the configured timeout."""

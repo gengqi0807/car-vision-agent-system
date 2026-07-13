@@ -28,7 +28,7 @@
             微
             <span>微信</span>
           </div>
-          <div class="icon clickable" role="button" tabindex="0" @click="openEmailLogin" @keydown.enter="openEmailLogin">
+          <div class="icon">
             邮
             <span>邮箱</span>
           </div>
@@ -48,39 +48,13 @@
         </div>
       </section>
     </div>
-
-    <div v-if="showEmailDialog" class="dialog-mask" @click.self="closeEmailLogin">
-      <section class="dialog-card">
-        <h3>邮箱验证码登录</h3>
-        <p class="dialog-sub">输入已绑定邮箱并完成验证码登录</p>
-        <form @submit.prevent="submitEmailLogin">
-          <label for="email">邮箱</label>
-          <input id="email" v-model="emailForm.email" class="auth-input" type="email" placeholder="输入绑定邮箱" />
-
-          <label for="code">验证码</label>
-          <div class="code-row">
-            <input id="code" v-model="emailForm.code" class="auth-input" type="text" maxlength="6" placeholder="6 位验证码" />
-            <button type="button" class="secondary-action" @click="sendEmailCode">
-              {{ sendingCode ? "发送中..." : countdown > 0 ? `${countdown}s` : "发送验证码" }}
-            </button>
-          </div>
-
-          <div class="dialog-actions">
-            <button type="button" class="cancel-btn" @click="closeEmailLogin">取消</button>
-            <button type="submit" class="login-btn">立即登录</button>
-          </div>
-        </form>
-      </section>
-    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import axios from "axios";
-import { onBeforeUnmount, reactive, ref } from "vue";
+import { reactive } from "vue";
 import { useRouter } from "vue-router";
 
-import { emailLoginApi, loginApi, sendEmailCodeApi } from "../api/auth";
 import { useUserStore } from "../stores/user";
 
 const router = useRouter();
@@ -90,110 +64,15 @@ const form = reactive({
   username: "demo_admin",
   password: "123456"
 });
-const showEmailDialog = ref(false);
-const sendingCode = ref(false);
-const countdown = ref(0);
-const emailForm = reactive({
-  email: "",
-  code: ""
-});
-let countdownTimer: number | null = null;
 
 function submit() {
   if (!form.username || !form.password) {
     return;
   }
 
-  void handleLogin();
+  userStore.setSession(form.username, "demo-token");
+  router.push({ name: "dashboard" });
 }
-
-async function handleLogin() {
-  try {
-    const { data } = await loginApi(form);
-    userStore.setSession(data.user.username, data.access_token);
-    userStore.setProfile(data.user);
-    router.push({ name: "dashboard" });
-  } catch (error) {
-    if (axios.isAxiosError(error)) {
-      window.alert(String(error.response?.data?.detail ?? "登录失败，请检查后端服务和账号密码。"));
-    } else {
-      window.alert("登录失败，请稍后重试。");
-    }
-  }
-}
-
-function openEmailLogin() {
-  showEmailDialog.value = true;
-}
-
-function closeEmailLogin() {
-  showEmailDialog.value = false;
-  emailForm.code = "";
-}
-
-async function sendEmailCode() {
-  if (!emailForm.email || sendingCode.value || countdown.value > 0) {
-    return;
-  }
-
-  sendingCode.value = true;
-  try {
-    await sendEmailCodeApi({ email: emailForm.email.trim() });
-    window.alert("验证码已发送，请查收邮箱。");
-    startCountdown();
-  } catch (error) {
-    if (axios.isAxiosError(error)) {
-      window.alert(String(error.response?.data?.detail ?? "验证码发送失败，请稍后重试。"));
-    } else {
-      window.alert("验证码发送失败，请稍后重试。");
-    }
-  } finally {
-    sendingCode.value = false;
-  }
-}
-
-async function submitEmailLogin() {
-  if (!emailForm.email || !emailForm.code) {
-    return;
-  }
-
-  try {
-    const { data } = await emailLoginApi({
-      email: emailForm.email.trim(),
-      code: emailForm.code.trim()
-    });
-    userStore.setSession(data.user.username, data.access_token);
-    userStore.setProfile(data.user);
-    closeEmailLogin();
-    router.push({ name: "dashboard" });
-  } catch (error) {
-    if (axios.isAxiosError(error)) {
-      window.alert(String(error.response?.data?.detail ?? "邮箱登录失败，请检查验证码。"));
-    } else {
-      window.alert("邮箱登录失败，请稍后重试。");
-    }
-  }
-}
-
-function startCountdown() {
-  countdown.value = 60;
-  if (countdownTimer !== null) {
-    window.clearInterval(countdownTimer);
-  }
-  countdownTimer = window.setInterval(() => {
-    countdown.value -= 1;
-    if (countdown.value <= 0 && countdownTimer !== null) {
-      window.clearInterval(countdownTimer);
-      countdownTimer = null;
-    }
-  }, 1000);
-}
-
-onBeforeUnmount(() => {
-  if (countdownTimer !== null) {
-    window.clearInterval(countdownTimer);
-  }
-});
 </script>
 
 <style scoped lang="scss">
@@ -318,13 +197,6 @@ form label {
   border-radius: 50%;
 }
 
-.icon.clickable {
-  cursor: pointer;
-}
-
-.icon.clickable:hover {
-  background: #ede7df;
-}
 .icon span {
   font-size: 10px;
   font-weight: 400;
@@ -343,67 +215,6 @@ form label {
   font-weight: 500;
 }
 
-.dialog-mask {
-  position: fixed;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  padding: 20px;
-  background: rgba(61, 53, 41, 0.18);
-}
-
-.dialog-card {
-  width: min(420px, 100%);
-  padding: 28px 30px 24px;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  box-shadow: 0 18px 50px rgba(61, 53, 41, 0.12);
-}
-
-.dialog-card h3 {
-  margin: 0;
-  font-size: 22px;
-  font-weight: 600;
-}
-
-.dialog-sub {
-  margin: 6px 0 18px;
-  font-size: 14px;
-  color: var(--muted);
-}
-
-.code-row {
-  display: grid;
-  grid-template-columns: 1fr 124px;
-  gap: 10px;
-}
-
-.secondary-action,
-.cancel-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0 14px;
-  color: var(--text-soft);
-  background: var(--surface-muted);
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  cursor: pointer;
-}
-
-.dialog-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-  margin-top: 22px;
-}
-
-.dialog-actions .login-btn {
-  width: auto;
-  margin-top: 0;
-  padding: 10px 22px;
-}
 @media (max-width: 900px) {
   .login-container {
     flex-direction: column;
@@ -413,10 +224,6 @@ form label {
 
   .login-card {
     width: 100%;
-  }
-
-  .code-row {
-    grid-template-columns: 1fr;
   }
 }
 

@@ -7,7 +7,6 @@ import Login from "../views/Login.vue";
 import OwnerGesture from "../views/OwnerGesture.vue";
 import PlateRecognition from "../views/PlateRecognition.vue";
 import PoliceGesture from "../views/PoliceGesture.vue";
-import Profile from "../views/Profile.vue";
 import Register from "../views/Register.vue";
 import { authGuard } from "./guards";
 
@@ -53,11 +52,6 @@ const router = createRouter({
           path: "alert-monitor",
           name: "alert-monitor",
           component: AlertMonitor
-        },
-        {
-          path: "profile",
-          name: "profile",
-          component: Profile
         }
       ]
     }

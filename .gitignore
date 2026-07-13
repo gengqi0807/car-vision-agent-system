@@ -7,7 +7,6 @@ __pycache__/
 .venv311/
 venv/
 env/
-.idea/
 
 node_modules/
 dist/
@@ -19,17 +18,7 @@ dist/
 
 backend/uploads/
 backend/logs/
-backend/runtime/
-backend/models/*.task
-backend/models/*.pt
-backend/models/*.onnx
-backend/models/*.tflite
-!backend/models/.gitkeep
-
-*.db
-*.sqlite3
-local.db
-owner_gesture_dataset_
 
 .DS_Store
 Thumbs.db
+backend/car_vision.db

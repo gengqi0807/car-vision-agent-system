@@ -12,7 +12,7 @@
         {{ item.label }}
       </RouterLink>
       <span class="spacer"></span>
-      <button type="button" class="avatar" title="个人资料" @click="openProfile">
+      <button type="button" class="avatar" title="退出登录" @click="logout">
         {{ avatarText }}
       </button>
     </header>
@@ -46,8 +46,9 @@ const avatarText = computed(() => {
   return base.slice(0, 1).toUpperCase();
 });
 
-function openProfile() {
-  router.push({ name: "profile" });
+function logout() {
+  userStore.logout();
+  router.push({ name: "login" });
 }
 </script>
 
