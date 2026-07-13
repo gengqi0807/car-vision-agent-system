@@ -109,14 +109,15 @@ class OwnerGestureService:
         # 告警回调（预留）
         self._alert_callbacks: list = []
 
-        # --- 手势结果锁定机制 ---
-        # 手在屏幕内时，一旦识别出有效手势就锁定，手消失后才允许更新
+        # --- 手势结果锁定机制（简化去抖：进手/撤手过渡窗口不记录）---
         self._result_locked = False           # 当前是否已锁定结果
         self._hand_present_prev = False       # 上一帧手是否在屏幕内
         self._locked_gesture: str | None = None
         self._locked_action: str | None = None
         self._locked_confidence: float = 0.0
         self._last_fired_action: str | None = None   # 上次已触发回调的动作，避免重复触发
+        self._grace_count = 0                 # 翻转后剩余宽限帧
+        self.GRACE_FRAMES = 8                 # 翻转后宽限帧数
 
     # ----------------------------------------------------------------
     # 单例获取
@@ -274,62 +275,62 @@ class OwnerGestureService:
                 hand_kp = hands[0] if hands else None
                 hand_present = hands is not None and len(hands) > 0
 
-                # ---- 手势结果锁定逻辑 ----
-                # 手从无到有 → 解锁，开始新一轮检测
-                if hand_present and not self._hand_present_prev:
+                # ---- 手势结果锁定逻辑（简化去抖）----
+                # 进手/撤手翻转 → 触发过渡宽限期，期间不记录/不更新结果，
+                # 统一输出 unknown/idle，避免撤手后沿用旧手势导致前端误触发。
+                if hand_present != self._hand_present_prev:
+                    self._grace_count = self.GRACE_FRAMES
+                    # 任何翻转都先解锁，开始新一轮，不沿用旧结果
                     self._result_locked = False
                     self._locked_gesture = None
                     self._locked_action = None
                     self._locked_confidence = 0.0
-                    self._last_fired_action = None
-
-                # 手消失 → 解锁，重置状态
-                if not hand_present:
-                    self._result_locked = False
-                    self._locked_gesture = None
-                    self._locked_action = None
-                    self._locked_confidence = 0.0
-                    self._last_fired_action = None
+                    if hand_present:
+                        # 进手：新一轮会话，允许再次触发回调
+                        self._last_fired_action = None
+                self._hand_present_prev = hand_present
 
                 # 统一手势分类（静态 + 动态 + 时序去抖）
                 gesture, confidence = classifier.classify_frame(hand_kp)
 
-                # --- 确定最终输出的手势 ---
-                if hand_present:
-                    if (self._result_locked
-                            and self._locked_gesture in VOLUME_GESTURES
-                            and gesture in VOLUME_GESTURES):
-                        # 音量手势：手未离开时允许连续 +/- 切换（连续调音）
-                        self._result_locked = True
-                        self._locked_gesture = gesture
-                        self._locked_action = gesture_to_action(gesture)
-                        self._locked_confidence = round(confidence, 4)
-                        output_gesture = gesture
-                        output_action = self._locked_action
+                if self._grace_count > 0:
+                    # 过渡窗口：不记录，输出 unknown/idle（不沿用旧结果）
+                    self._grace_count -= 1
+                    output_gesture = "unknown"
+                    output_action = "idle"
+                    output_confidence = 0.0
+                elif hand_present:
+                    # 稳定有手：正常识别 + 锁定
+                    if self._result_locked:
+                        # 音量手势：允许 +/- 切换（连续调音），仅稳定态生效
+                        if (self._locked_gesture in VOLUME_GESTURES
+                                and gesture in VOLUME_GESTURES
+                                and gesture != self._locked_gesture):
+                            self._locked_gesture = gesture
+                            self._locked_action = gesture_to_action(gesture)
+                            self._locked_confidence = round(confidence, 4)
+                        output_gesture = self._locked_gesture
+                        output_action = self._locked_action or "idle"
                         output_confidence = self._locked_confidence
-                    elif not self._result_locked:
-                        # 尚未锁定：检查是否识别出有效手势，是则锁定
+                    else:
                         if gesture != "unknown" and gesture != "idle" and confidence > 0.0:
                             self._result_locked = True
                             self._locked_gesture = gesture
                             self._locked_action = gesture_to_action(gesture)
                             self._locked_confidence = round(confidence, 4)
-
-                        output_gesture = gesture
-                        output_action = gesture_to_action(gesture)
-                        output_confidence = round(confidence, 4)
-                    else:
-                        # 已锁定：保持锁定结果不变
-                        output_gesture = self._locked_gesture or gesture
-                        output_action = self._locked_action or "idle"
-                        output_confidence = self._locked_confidence
+                        if self._result_locked:
+                            output_gesture = self._locked_gesture
+                            output_action = self._locked_action or "idle"
+                            output_confidence = self._locked_confidence
+                        else:
+                            output_gesture = gesture
+                            output_action = gesture_to_action(gesture)
+                            output_confidence = round(confidence, 4)
                 else:
-                    output_gesture = gesture
-                    output_action = gesture_to_action(gesture)
-                    output_confidence = round(confidence, 4)
-
-                # 更新帧间状态
-                self._hand_present_prev = hand_present
+                    # 稳定无手：不沿用旧结果，输出 unknown/idle
+                    output_gesture = "unknown"
+                    output_action = "idle"
+                    output_confidence = 0.0
 
                 # 转换为 keypoints
                 if hands:

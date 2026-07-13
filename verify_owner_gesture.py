@@ -184,10 +184,10 @@ def main():
     fps_timer = time.time()
     frame_count = 0
 
-    # ---- 手势结果锁定状态 ----
-    # 手在屏幕内时，一旦识别出有效手势就锁定文字；手真正离开后再出现才解锁
-    hand_gone_confirmed = False   # 已确认手"真正离开"
-    no_hand_count = 0
+    # ---- 手势结果锁定状态（简化去抖：进手/撤手过渡窗口不记录）----
+    GRACE_FRAMES = 8             # 翻转后宽限帧数（期间不记录识别结果）
+    grace_count = 0              # 剩余宽限帧
+    prev_hand = False            # 上一帧手是否在屏幕内
     result_locked = False
     locked_gesture = None
     locked_action = None
@@ -201,45 +201,43 @@ def main():
         gesture, action, conf, hc, kp = process_frame(frame, classifier)
         hand_present = hc > 0
 
-        # 手消失计数（连续 ≥3 帧无手才算"真正离开"，过滤单帧抖动）
-        if hand_present:
-            no_hand_count = 0
-        else:
-            no_hand_count += 1
-            if no_hand_count >= 15:
-                hand_gone_confirmed = True
-                result_locked = False
-                locked_gesture = locked_action = None
-                locked_conf = 0.0
-
-        # 手"真正离开后重新出现" → 解锁，开始新一轮检测
-        if hand_present and hand_gone_confirmed:
+        # ---- 进手/撤手翻转检测：触发过渡宽限期（简化去抖）----
+        # 手状态翻转（进手或撤手）的那一刻起，宽限 GRACE_FRAMES 帧；
+        # 期间不记录/不更新任何识别结果，统一输出 idle，避免翻转瞬间
+        # 噪声被锁定、或撤手后沿用旧手势导致前端误触发（如多切一次功能）。
+        if hand_present != prev_hand:
+            grace_count = GRACE_FRAMES
+            # 任何翻转都先解锁，开始新一轮，不沿用旧结果
             result_locked = False
             locked_gesture = locked_action = None
             locked_conf = 0.0
-            hand_gone_confirmed = False
+        prev_hand = hand_present
 
-        # 确定最终显示的文字结果
-        if (hand_present and result_locked
-                and locked_gesture in VOLUME_GESTURES
-                and gesture in VOLUME_GESTURES):
-            # 音量手势：手未离开时允许连续 +/- 切换（连续调音）
-            result_locked = True
-            locked_gesture = gesture
-            locked_action = action
-            locked_conf = conf
-            out_g, out_a, out_c = gesture, action, conf
-        elif hand_present and not result_locked:
-            if gesture not in ("unknown", "idle") and conf > 0.0:
-                result_locked = True
-                locked_gesture = gesture
-                locked_action = action
-                locked_conf = conf
-            out_g, out_a, out_c = gesture, action, conf
-        elif hand_present and result_locked:
-            out_g, out_a, out_c = locked_gesture, locked_action, locked_conf
+        if grace_count > 0:
+            # 过渡窗口：不记录，输出 idle（不沿用旧结果）
+            grace_count -= 1
+            out_g, out_a, out_c = "idle", "idle", 0.0
+        elif hand_present:
+            # 稳定有手：正常识别 + 锁定
+            if result_locked:
+                # 音量手势：允许 +/- 方向切换（连续调音），仅稳定态生效
+                if (locked_gesture in VOLUME_GESTURES
+                        and gesture in VOLUME_GESTURES
+                        and gesture != locked_gesture):
+                    locked_gesture = gesture
+                    locked_action = action
+                    locked_conf = conf
+                out_g, out_a, out_c = locked_gesture, locked_action, locked_conf
+            else:
+                if gesture not in ("unknown", "idle") and conf > 0.0:
+                    result_locked = True
+                    locked_gesture = gesture
+                    locked_action = action
+                    locked_conf = conf
+                out_g, out_a, out_c = (locked_gesture, locked_action, locked_conf) if result_locked else (gesture, action, conf)
         else:
-            out_g, out_a, out_c = gesture, action, conf
+            # 稳定无手：不沿用旧结果，输出 idle
+            out_g, out_a, out_c = "idle", "idle", 0.0
 
         # 文字用锁定结果（不再变化），关键点/手数用当前帧（手的位置仍跟随）
         frame = draw_result(frame, out_g, out_a, out_c, hc, kp)
