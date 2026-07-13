@@ -138,7 +138,7 @@ class VideoProcessingJob:
 
 
 class PlateService:
-    _VIDEO_ACTIVE_UNREAD_OCR_INTERVAL = 18
+    _VIDEO_ACTIVE_UNREAD_OCR_INTERVAL = 24
     _VIDEO_ACTIVE_UNREAD_OCR_MAX_TRACKS = 1
 
     def __init__(self) -> None:
@@ -719,10 +719,7 @@ class PlateService:
         output_frame_stride = max(int(round(fps / output_fps_target)), 1)
         output_fps = fps / output_frame_stride
         total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        recognition_interval = max(
-            settings.plate_video_process_every_n_frames,
-            max(int(round(fps * 0.75)), 16),
-        )
+        recognition_interval = self._resolve_video_recognition_interval(fps)
         heavy_scan_interval = max(recognition_interval * 8, 48)
         progress_log_interval = max(recognition_interval * 2, 30)
         preview_update_interval = max(recognition_interval * 2, 24)
@@ -866,6 +863,7 @@ class PlateService:
     ) -> tuple[object | None, list[PlateDetection], list[PlateDetection], list[PlateDetection]]:
         state.frame_index += 1
         use_fast_large_plate_mode = self._should_use_fast_large_plate_mode(state)
+        prioritize_small_targets = self._has_active_small_target_unread_track(state.tracks)
         if self._should_skip_light_video_frame(state=state, render=render, use_fast_large_plate_mode=use_fast_large_plate_mode):
             active_detections = self._scale_detections(
                 self._tracks_to_detections(state.tracks),
@@ -880,7 +878,11 @@ class PlateService:
             state.frame_index == 1
             or not state.tracks
             or any(track.misses > 0 for track in state.tracks)
-            or state.frame_index - state.last_tracking_frame >= self._video_track_update_interval(use_fast_large_plate_mode)
+            or state.frame_index - state.last_tracking_frame
+            >= self._video_track_update_interval(
+                use_fast_large_plate_mode,
+                prioritize_small_targets=prioritize_small_targets,
+            )
         )
         should_rerecognize = self._should_rerecognize_video(state)
         should_probe_tracks = self._should_probe_new_video_tracks(state)
@@ -1034,11 +1036,35 @@ class PlateService:
     def _resolve_video_output_fps_target(self, fps: float) -> int:
         configured = max(int(settings.plate_video_output_fps), 1)
         if fps >= 20:
-            return min(configured, 6)
+            return min(configured, 5)
         return configured
 
-    def _video_track_update_interval(self, use_fast_large_plate_mode: bool) -> int:
-        return 5 if use_fast_large_plate_mode else 2
+    def _video_track_update_interval(
+        self,
+        use_fast_large_plate_mode: bool,
+        *,
+        prioritize_small_targets: bool = False,
+    ) -> int:
+        return self._video_track_update_interval_for_mode(
+            use_fast_large_plate_mode,
+            prioritize_small_targets=prioritize_small_targets,
+        )
+
+    def _video_track_update_interval_for_mode(
+        self,
+        use_fast_large_plate_mode: bool,
+        *,
+        prioritize_small_targets: bool,
+    ) -> int:
+        if prioritize_small_targets:
+            return 6 if use_fast_large_plate_mode else 3
+        return 8 if use_fast_large_plate_mode else 4
+
+    def _resolve_video_recognition_interval(self, fps: float) -> int:
+        configured = max(int(settings.plate_video_process_every_n_frames), 1)
+        if fps <= 1:
+            return max(configured, 18)
+        return max(configured, max(int(round(fps)), 18))
 
     def _should_skip_light_video_frame(
         self,
@@ -1089,17 +1115,25 @@ class PlateService:
         if state.frame_index <= 1:
             return False
         unread_track_count = sum(1 for track in state.tracks if not track.plate_number and track.misses == 0)
+        has_small_target_unread = self._has_active_small_target_unread_track(state.tracks)
         if unread_track_count >= 2:
-            probe_interval = max(state.recognition_interval * 2, 24)
-        elif unread_track_count >= 1:
-            if any(self._is_large_recognized_track(track) for track in state.tracks):
-                probe_interval = max(state.recognition_interval * 2, 20)
+            if has_small_target_unread:
+                probe_interval = max(state.recognition_interval, 20)
             else:
-                probe_interval = max(state.recognition_interval // 2, 4)
+                probe_interval = max(state.recognition_interval * 2, 30)
+        elif unread_track_count >= 1:
+            if has_small_target_unread and any(self._is_large_recognized_track(track) for track in state.tracks):
+                probe_interval = max(state.recognition_interval, 18)
+            elif any(self._is_large_recognized_track(track) for track in state.tracks):
+                probe_interval = max(state.recognition_interval * 2, 28)
+            elif has_small_target_unread:
+                probe_interval = max(state.recognition_interval // 2, 10)
+            else:
+                probe_interval = max((state.recognition_interval * 3) // 4, 14)
         elif any(self._is_large_recognized_track(track) for track in state.tracks):
-            probe_interval = max(state.recognition_interval * 6, 72)
+            probe_interval = max(state.recognition_interval * 6, 84)
         else:
-            probe_interval = max(state.recognition_interval, 12)
+            probe_interval = max(state.recognition_interval, 16)
         return state.frame_index - state.last_probe_frame >= probe_interval
 
     def _is_large_recognized_track(self, track: PlateTrack) -> bool:
@@ -1114,6 +1148,14 @@ class PlateService:
         _, _, width, height = bbox
         area = width * height
         return width <= 60 and height <= 18 and 220 <= area <= 960
+
+    def _has_active_small_target_unread_track(self, tracks: list[PlateTrack]) -> bool:
+        return any(
+            not track.plate_number
+            and track.misses == 0
+            and self._is_small_target_track_bbox(track.bbox)
+            for track in tracks
+        )
 
     def _resolve_video_recognition_max_side(self, source_frame, state: PlateProcessingState) -> int:
         configured_limit = settings.plate_video_recognition_max_side
@@ -1460,8 +1502,8 @@ class PlateService:
 
     def _active_unread_ocr_interval_for_track(self, track: PlateTrack) -> int:
         if self._should_prioritize_unread_ocr_track(track):
-            return self._VIDEO_ACTIVE_UNREAD_OCR_INTERVAL
-        return max(self._VIDEO_ACTIVE_UNREAD_OCR_INTERVAL + 10, 28)
+            return max(self._VIDEO_ACTIVE_UNREAD_OCR_INTERVAL - 6, 18)
+        return max(self._VIDEO_ACTIVE_UNREAD_OCR_INTERVAL + 12, 36)
 
     def _expand_active_unread_source_bbox(
         self,

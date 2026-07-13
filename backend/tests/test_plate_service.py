@@ -1546,6 +1546,10 @@ def test_should_probe_new_video_tracks_runs_more_often_for_unread_tracks():
         ],
     )
 
+    assert service._should_probe_new_video_tracks(state) is False
+
+    state.frame_index = 18
+
     assert service._should_probe_new_video_tracks(state) is True
 
 
@@ -1581,7 +1585,7 @@ def test_should_probe_new_video_tracks_slows_unread_probe_when_large_plate_exist
 
     assert service._should_probe_new_video_tracks(state) is False
 
-    state.frame_index = 24
+    state.frame_index = 32
 
     assert service._should_probe_new_video_tracks(state) is True
 
@@ -1608,7 +1612,7 @@ def test_should_probe_new_video_tracks_waits_longer_for_large_recognized_track()
 
     assert service._should_probe_new_video_tracks(state) is False
 
-    state.frame_index = 76
+    state.frame_index = 88
 
     assert service._should_probe_new_video_tracks(state) is True
 
@@ -1677,7 +1681,7 @@ def test_should_probe_new_video_tracks_slows_down_when_two_unread_tracks_are_act
 
     assert service._should_probe_new_video_tracks(state) is False
 
-    state.frame_index = 26
+    state.frame_index = 32
 
     assert service._should_probe_new_video_tracks(state) is True
 
@@ -1792,7 +1796,7 @@ def test_recover_active_unread_tracks_recognizes_from_source_crop(monkeypatch):
 
     service = PlateService()
     state = plate_service_module.PlateProcessingState(
-        frame_index=20,
+        frame_index=24,
         working_width=160,
         working_height=90,
         tracks=[
@@ -1803,7 +1807,7 @@ def test_recover_active_unread_tracks_recognizes_from_source_crop(monkeypatch):
                 confidence=0.46,
                 bbox=[20, 18, 34, 10],
                 template=object(),
-                last_seen_frame=20,
+                last_seen_frame=24,
                 last_recognized_frame=10,
                 unread_observations=3,
                 last_unread_ocr_frame=0,
@@ -1835,7 +1839,7 @@ def test_recover_active_unread_tracks_recognizes_from_source_crop(monkeypatch):
     assert len(result) == 1
     assert result[0].plate_number == "73737"
     assert result[0].bbox == [20, 18, 34, 10]
-    assert state.tracks[0].last_unread_ocr_frame == 20
+    assert state.tracks[0].last_unread_ocr_frame == 24
 
 
 def test_should_attempt_active_unread_ocr_skips_non_small_unread_when_large_plate_exists():
@@ -1912,8 +1916,24 @@ def test_resolve_video_output_fps_target_reduces_high_fps_output_workload(monkey
     service = PlateService()
     monkeypatch.setattr(settings, "plate_video_output_fps", 8)
 
-    assert service._resolve_video_output_fps_target(25.0) == 6
+    assert service._resolve_video_output_fps_target(25.0) == 5
     assert service._resolve_video_output_fps_target(15.0) == 8
+
+
+def test_resolve_video_recognition_interval_uses_about_one_second_of_frames(monkeypatch):
+    service = PlateService()
+    monkeypatch.setattr(settings, "plate_video_process_every_n_frames", 10)
+
+    assert service._resolve_video_recognition_interval(25.0) == 25
+    assert service._resolve_video_recognition_interval(14.0) == 18
+    assert service._resolve_video_recognition_interval(0.0) == 18
+
+
+def test_video_track_update_interval_relaxes_upload_video_tracking_workload():
+    service = PlateService()
+
+    assert service._video_track_update_interval(use_fast_large_plate_mode=False) == 4
+    assert service._video_track_update_interval(use_fast_large_plate_mode=True) == 8
 
 
 def test_tracks_to_detections_defaults_small_video_plate_to_car():
