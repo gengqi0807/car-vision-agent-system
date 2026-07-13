@@ -3374,12 +3374,6 @@ class PlateService:
             return current
         if current == VEHICLE_TYPE_UNKNOWN:
             return candidate
-        if current == VEHICLE_TYPE_CAR and candidate in {
-            VEHICLE_TYPE_JEEP,
-            VEHICLE_TYPE_PICKUP,
-            VEHICLE_TYPE_MOTORCYCLE,
-        }:
-            return candidate
         if current == VEHICLE_TYPE_TRUCK and candidate == VEHICLE_TYPE_CRANE:
             return candidate
         return current
@@ -3457,7 +3451,7 @@ class PlateService:
 
             if track.misses <= settings.plate_stream_tracking_max_misses:
                 active_tracks.append(track)
-        return active_tracks
+        return self._collapse_duplicate_recognized_tracks(active_tracks)
 
     def _track_plate(self, gray_frame, track: PlateTrack) -> bool:
         cv2 = self._require_cv2()
@@ -3623,7 +3617,104 @@ class PlateService:
                 track.unread_observations += 1
             matched_indices.add(match_index)
 
-        return merged_tracks
+        return self._collapse_duplicate_recognized_tracks(merged_tracks)
+
+    def _collapse_duplicate_recognized_tracks(self, tracks: list[PlateTrack]) -> list[PlateTrack]:
+        collapsed: list[PlateTrack] = []
+        consumed: set[int] = set()
+
+        for index, track in enumerate(tracks):
+            if index in consumed:
+                continue
+
+            if not track.plate_number:
+                collapsed.append(track)
+                continue
+
+            merged_track = track
+            for other_index in range(index + 1, len(tracks)):
+                if other_index in consumed:
+                    continue
+                other = tracks[other_index]
+                if not other.plate_number:
+                    continue
+                if other.plate_number != merged_track.plate_number:
+                    continue
+                if not self._should_merge_same_plate_tracks(merged_track, other):
+                    continue
+                merged_track = self._merge_duplicate_tracks(merged_track, other)
+                consumed.add(other_index)
+
+            collapsed.append(merged_track)
+
+        return collapsed
+
+    def _should_merge_same_plate_tracks(self, track: PlateTrack, other: PlateTrack) -> bool:
+        if track.plate_number != other.plate_number:
+            return False
+        iou = self._compute_iou(track.bbox, other.bbox)
+        if iou >= 0.18:
+            return True
+        offset_x_ratio, offset_y_ratio = self._compute_bbox_center_offset_ratio(track.bbox, other.bbox)
+        return offset_x_ratio <= 0.75 and offset_y_ratio <= 0.42
+
+    def _merge_duplicate_tracks(self, primary: PlateTrack, secondary: PlateTrack) -> PlateTrack:
+        best = primary
+        other = secondary
+        if (
+            secondary.confidence,
+            secondary.last_recognized_frame,
+            secondary.last_seen_frame,
+        ) > (
+            primary.confidence,
+            primary.last_recognized_frame,
+            primary.last_seen_frame,
+        ):
+            best = secondary
+            other = primary
+
+        merged = PlateTrack(
+            track_id=best.track_id,
+            plate_number=best.plate_number,
+            plate_color=best.plate_color,
+            confidence=max(primary.confidence, secondary.confidence),
+            bbox=list(best.bbox),
+            template=best.template,
+            last_seen_frame=max(primary.last_seen_frame, secondary.last_seen_frame),
+            last_recognized_frame=max(primary.last_recognized_frame, secondary.last_recognized_frame),
+            misses=min(primary.misses, secondary.misses),
+            text_votes=dict(best.text_votes),
+            color_votes=dict(best.color_votes),
+            vehicle_type_votes=dict(best.vehicle_type_votes),
+            unread_snapshots_saved=max(primary.unread_snapshots_saved, secondary.unread_snapshots_saved),
+            last_unread_snapshot_frame=max(primary.last_unread_snapshot_frame, secondary.last_unread_snapshot_frame),
+            last_unread_ocr_frame=max(primary.last_unread_ocr_frame, secondary.last_unread_ocr_frame),
+            unread_observations=max(primary.unread_observations, secondary.unread_observations),
+            last_tracking_score=max(primary.last_tracking_score, secondary.last_tracking_score),
+            vehicle_type=best.vehicle_type,
+        )
+
+        for source in (primary, secondary):
+            for text, score in source.text_votes.items():
+                merged.text_votes[text] = merged.text_votes.get(text, 0.0) + float(score)
+            for color, score in source.color_votes.items():
+                merged.color_votes[color] = merged.color_votes.get(color, 0.0) + float(score)
+            self._merge_vehicle_type_vote_dict(merged.vehicle_type_votes, source.vehicle_type_votes)
+
+        merged.plate_color = self._pick_stable_track_color(
+            merged.color_votes,
+            merged.plate_number,
+            fallback_color=best.plate_color,
+        )
+        merged.vehicle_type = self._fallback_vehicle_type_for_bbox(
+            self._pick_stable_track_vehicle_type(
+                merged.vehicle_type_votes,
+                fallback_type=best.vehicle_type,
+            ),
+            merged.bbox,
+            video_mode=True,
+        )
+        return merged
 
     def _build_track_from_detection(
         self,
@@ -3782,9 +3873,32 @@ class PlateService:
         if not normalized_votes:
             return self._normalize_vehicle_type_from_label(fallback_type)
 
+        fallback_normalized = self._normalize_vehicle_type_from_label(fallback_type)
         car_score = normalized_votes.get(VEHICLE_TYPE_CAR, 0.0)
         truck_score = normalized_votes.get(VEHICLE_TYPE_TRUCK, 0.0)
         bus_score = normalized_votes.get(VEHICLE_TYPE_BUS, 0.0)
+
+        if fallback_normalized == VEHICLE_TYPE_CAR:
+            best_non_car_score = max(
+                truck_score,
+                bus_score,
+                normalized_votes.get(VEHICLE_TYPE_JEEP, 0.0),
+                normalized_votes.get(VEHICLE_TYPE_PICKUP, 0.0),
+                normalized_votes.get(VEHICLE_TYPE_MOTORCYCLE, 0.0),
+                normalized_votes.get(VEHICLE_TYPE_CRANE, 0.0),
+            )
+            if car_score > 0:
+                if bus_score >= max(car_score * 3.8, 2.4) and bus_score >= truck_score * 1.45:
+                    return VEHICLE_TYPE_BUS
+                if truck_score >= max(car_score * 3.2, 2.2):
+                    return VEHICLE_TYPE_TRUCK
+                for candidate in (VEHICLE_TYPE_JEEP, VEHICLE_TYPE_PICKUP, VEHICLE_TYPE_MOTORCYCLE, VEHICLE_TYPE_CRANE):
+                    candidate_score = normalized_votes.get(candidate, 0.0)
+                    if candidate_score >= max(car_score * 2.1, 1.8):
+                        return candidate
+                return VEHICLE_TYPE_CAR
+            if best_non_car_score < 1.9:
+                return VEHICLE_TYPE_CAR
 
         if bus_score >= max(car_score * 2.4, 1.6) and bus_score >= truck_score * 1.35:
             return VEHICLE_TYPE_BUS
@@ -3978,7 +4092,7 @@ class PlateService:
                     bbox=list(track.bbox),
                 )
             )
-        return detections
+        return self._deduplicate_display_detections(detections)
 
     def _should_display_unread_track(self, track: PlateTrack, tracks: list[PlateTrack]) -> bool:
         if track.plate_number:
@@ -3986,6 +4100,8 @@ class PlateService:
         if not self._is_plausible_plate_bbox(track.bbox):
             return False
         if self._is_likely_side_shadow_bbox_for_recognized_track(track.bbox, tracks):
+            return False
+        if self._is_nearby_unread_artifact_for_recognized_track(track.bbox, tracks):
             return False
         _, _, width, height = track.bbox
         area = width * height
@@ -4003,6 +4119,77 @@ class PlateService:
                 return False
             return True
         return area >= 320 and track.confidence >= 0.42
+
+    def _is_nearby_unread_artifact_for_recognized_track(self, bbox: list[int], tracks: list[PlateTrack]) -> bool:
+        for track in tracks:
+            if not track.plate_number:
+                continue
+            recognized_bbox = track.bbox
+            iou = self._compute_iou(bbox, recognized_bbox)
+            if iou >= 0.04:
+                return True
+            offset_x_ratio, offset_y_ratio = self._compute_bbox_center_offset_ratio(bbox, recognized_bbox)
+            width_ratio = bbox[2] / max(recognized_bbox[2], 1)
+            height_ratio = bbox[3] / max(recognized_bbox[3], 1)
+            if (
+                offset_x_ratio <= 0.85
+                and offset_y_ratio <= 1.85
+                and 0.5 <= width_ratio <= 1.6
+                and 0.5 <= height_ratio <= 1.8
+            ):
+                return True
+        return False
+
+    def _deduplicate_display_detections(self, detections: list[PlateDetection]) -> list[PlateDetection]:
+        deduplicated: list[PlateDetection] = []
+        consumed: set[int] = set()
+
+        for index, detection in enumerate(detections):
+            if index in consumed:
+                continue
+            if not detection.plate_number:
+                deduplicated.append(detection)
+                continue
+
+            merged = detection
+            for other_index in range(index + 1, len(detections)):
+                if other_index in consumed:
+                    continue
+                other = detections[other_index]
+                if not other.plate_number or other.plate_number != merged.plate_number:
+                    continue
+                if not self._should_merge_same_plate_display_detection(merged, other):
+                    continue
+                merged = self._merge_same_plate_display_detection(merged, other)
+                consumed.add(other_index)
+
+            deduplicated.append(merged)
+
+        return deduplicated
+
+    def _should_merge_same_plate_display_detection(
+        self,
+        current: PlateDetection,
+        other: PlateDetection,
+    ) -> bool:
+        iou = self._compute_iou(current.bbox, other.bbox)
+        if iou >= 0.1:
+            return True
+        offset_x_ratio, offset_y_ratio = self._compute_bbox_center_offset_ratio(current.bbox, other.bbox)
+        return offset_x_ratio <= 0.85 and offset_y_ratio <= 1.65
+
+    def _merge_same_plate_display_detection(
+        self,
+        current: PlateDetection,
+        other: PlateDetection,
+    ) -> PlateDetection:
+        best = current if current.confidence >= other.confidence else other
+        return best.model_copy(
+            update={
+                "vehicle_type": self._pick_better_vehicle_type(best.vehicle_type, other.vehicle_type),
+                "confidence": max(current.confidence, other.confidence),
+            }
+        )
 
     def _merge_best_detections(
         self,

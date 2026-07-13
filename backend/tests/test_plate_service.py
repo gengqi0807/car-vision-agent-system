@@ -2011,6 +2011,187 @@ def test_finalize_video_detections_merges_same_plate_number_with_different_color
     assert result[0].plate_color == "蓝牌"
 
 
+def test_finalize_video_detections_keeps_strong_visible_fallback_candidate():
+    service = PlateService()
+
+    result = service._finalize_video_detections(
+        {
+            "stable": plate_service_module.VideoDetectionStats(
+                detection=plate_service_module.PlateDetection(
+                    plate_number="ABC1234",
+                    plate_color="钃濈墝",
+                    confidence=0.62,
+                    bbox=[12, 12, 44, 14],
+                ),
+                fresh_count=2,
+                display_count=4,
+            ),
+            "visible": plate_service_module.VideoDetectionStats(
+                detection=plate_service_module.PlateDetection(
+                    plate_number="XYZ5678",
+                    plate_color="钃濈墝",
+                    confidence=0.56,
+                    bbox=[80, 18, 42, 14],
+                ),
+                fresh_count=1,
+                display_count=3,
+            ),
+        }
+    )
+
+    assert [item.plate_number for item in result] == ["ABC1234", "XYZ5678"]
+
+
+def test_fallback_vehicle_type_for_small_video_plate_prefers_car_over_bus_or_truck():
+    service = PlateService()
+
+    assert (
+        service._fallback_vehicle_type_for_bbox(
+            plate_service_module.VEHICLE_TYPE_BUS,
+            [10, 10, 64, 18],
+            video_mode=True,
+        )
+        == plate_service_module.VEHICLE_TYPE_CAR
+    )
+    assert (
+        service._fallback_vehicle_type_for_bbox(
+            plate_service_module.VEHICLE_TYPE_TRUCK,
+            [10, 10, 64, 18],
+            video_mode=True,
+        )
+        == plate_service_module.VEHICLE_TYPE_CAR
+    )
+
+
+def test_pick_stable_track_vehicle_type_keeps_car_when_non_car_votes_are_weak():
+    service = PlateService()
+
+    result = service._pick_stable_track_vehicle_type(
+        {
+            plate_service_module.VEHICLE_TYPE_CAR: 1.2,
+            plate_service_module.VEHICLE_TYPE_BUS: 1.6,
+            plate_service_module.VEHICLE_TYPE_TRUCK: 1.4,
+            plate_service_module.VEHICLE_TYPE_PICKUP: 1.1,
+        },
+        fallback_type=plate_service_module.VEHICLE_TYPE_CAR,
+    )
+
+    assert result == plate_service_module.VEHICLE_TYPE_CAR
+
+
+def test_pick_stable_track_vehicle_type_allows_non_car_when_evidence_is_strong():
+    service = PlateService()
+
+    result = service._pick_stable_track_vehicle_type(
+        {
+            plate_service_module.VEHICLE_TYPE_CAR: 0.9,
+            plate_service_module.VEHICLE_TYPE_TRUCK: 3.4,
+        },
+        fallback_type=plate_service_module.VEHICLE_TYPE_CAR,
+    )
+
+    assert result == plate_service_module.VEHICLE_TYPE_TRUCK
+
+
+def test_collapse_duplicate_recognized_tracks_merges_same_plate_tracks():
+    service = PlateService()
+    first = plate_service_module.PlateTrack(
+        track_id="a",
+        plate_number="京M76967",
+        plate_color="钃濈墝",
+        confidence=0.97,
+        bbox=[20, 20, 60, 18],
+        template=object(),
+        last_seen_frame=10,
+        last_recognized_frame=10,
+        text_votes={"京M76967": 1.8},
+        color_votes={"钃濈墝": 1.8},
+        vehicle_type_votes={plate_service_module.VEHICLE_TYPE_JEEP: 1.2},
+        vehicle_type=plate_service_module.VEHICLE_TYPE_JEEP,
+    )
+    second = plate_service_module.PlateTrack(
+        track_id="b",
+        plate_number="京M76967",
+        plate_color="钃濈墝",
+        confidence=0.96,
+        bbox=[24, 22, 60, 18],
+        template=object(),
+        last_seen_frame=11,
+        last_recognized_frame=11,
+        text_votes={"京M76967": 1.6},
+        color_votes={"钃濈墝": 1.6},
+        vehicle_type_votes={plate_service_module.VEHICLE_TYPE_CAR: 2.4},
+        vehicle_type=plate_service_module.VEHICLE_TYPE_CAR,
+    )
+
+    result = service._collapse_duplicate_recognized_tracks([first, second])
+
+    assert len(result) == 1
+    assert result[0].plate_number == "京M76967"
+    assert result[0].vehicle_type == plate_service_module.VEHICLE_TYPE_CAR
+
+
+def test_tracks_to_detections_merges_same_plate_display_boxes():
+    service = PlateService()
+    tracks = [
+        plate_service_module.PlateTrack(
+            track_id="a",
+            plate_number="京KS0537",
+            plate_color="钃濈墝",
+            confidence=0.956,
+            bbox=[20, 40, 70, 20],
+            template=object(),
+            last_seen_frame=10,
+            last_recognized_frame=10,
+            vehicle_type=plate_service_module.VEHICLE_TYPE_JEEP,
+        ),
+        plate_service_module.PlateTrack(
+            track_id="b",
+            plate_number="京KS0537",
+            plate_color="钃濈墝",
+            confidence=0.930,
+            bbox=[22, 72, 72, 22],
+            template=object(),
+            last_seen_frame=10,
+            last_recognized_frame=10,
+            vehicle_type=plate_service_module.VEHICLE_TYPE_BUS,
+        ),
+    ]
+
+    result = service._tracks_to_detections(tracks)
+
+    assert len(result) == 1
+    assert result[0].plate_number == "京KS0537"
+
+
+def test_should_display_unread_track_hides_artifact_near_recognized_plate():
+    service = PlateService()
+    recognized = plate_service_module.PlateTrack(
+        track_id="recognized",
+        plate_number="京KS0537",
+        plate_color="钃濈墝",
+        confidence=0.95,
+        bbox=[20, 60, 72, 22],
+        template=object(),
+        last_seen_frame=10,
+        last_recognized_frame=10,
+        vehicle_type=plate_service_module.VEHICLE_TYPE_CAR,
+    )
+    unread = plate_service_module.PlateTrack(
+        track_id="artifact",
+        plate_number="",
+        plate_color="未知",
+        confidence=0.52,
+        bbox=[18, 28, 74, 20],
+        template=object(),
+        last_seen_frame=10,
+        last_recognized_frame=10,
+        unread_observations=3,
+    )
+
+    assert service._should_display_unread_track(unread, [recognized, unread]) is False
+
+
 def test_deduplicate_plate_detections_merges_confusable_text_for_same_bbox():
     service = PlateService()
 
