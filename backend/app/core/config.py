@@ -1,0 +1,97 @@
+from functools import lru_cache
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    app_name: str = Field(default="Car Vision Agent System")
+    app_env: str = Field(default="development")
+    api_v1_prefix: str = Field(default="/api/v1")
+    secret_key: str = Field(default="change-me")
+    access_token_expire_minutes: int = Field(default=120)
+    database_url: str = Field(default="sqlite:///./car_vision.db")
+    redis_url: str = Field(default="redis://localhost:6379/0")
+    llm_provider: str = Field(default="openai-compatible")
+    llm_api_base: str = Field(default="")
+    llm_api_key: str = Field(default="")
+    allowed_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    inference_runtime_dir: str = Field(default="runtime")
+    plate_detector_enabled: bool = Field(default=True)
+    plate_detector_fallback_to_full_frame: bool = Field(default=True)
+    plate_detector_second_pass_enabled: bool = Field(default=True)
+    plate_detector_second_pass_confidence: float = Field(default=0.12)
+    plate_detector_second_pass_imgsz: int = Field(default=1280)
+    plate_detector_small_target_enabled: bool = Field(default=False)
+    plate_detector_small_target_confidence: float = Field(default=0.10)
+    plate_detector_small_target_imgsz: int = Field(default=1536)
+    plate_detector_small_target_upscale: float = Field(default=2.25)
+    plate_detector_crop_padding_x: float = Field(default=0.16)
+    plate_detector_crop_padding_y: float = Field(default=0.30)
+    plate_detector_max_candidates: int = Field(default=12)
+    plate_detector_class_names: list[str] = Field(
+        default_factory=lambda: ["plate", "license-plate", "licence-plate", "lp"]
+    )
+    plate_vehicle_detector_fallback_enabled: bool = Field(default=True)
+    plate_vehicle_class_names: list[str] = Field(default_factory=lambda: ["car", "truck", "bus"])
+    plate_vehicle_yolo_model_path: str = Field(default="yolov8n.pt")
+    plate_vehicle_yolo_confidence: float = Field(default=0.18)
+    plate_vehicle_yolo_imgsz: int = Field(default=640)
+    plate_vehicle_classifier_enabled: bool = Field(default=True)
+    plate_vehicle_classifier_weights_path: str = Field(
+        default="weights/vehicle_classifier_mobilenet_v3_small.pt"
+    )
+    plate_vehicle_classifier_confidence_threshold: float = Field(default=0.62)
+    plate_vehicle_classifier_input_size: int = Field(default=224)
+    plate_vehicle_crop_padding_x: float = Field(default=0.08)
+    plate_vehicle_crop_padding_y: float = Field(default=0.05)
+    plate_vehicle_plate_top_ratio: float = Field(default=0.52)
+    plate_vehicle_plate_height_ratio: float = Field(default=0.24)
+    plate_vehicle_plate_width_ratio: float = Field(default=0.60)
+    plate_yolo_model_path: str = Field(default="yolov8n.pt")
+    plate_yolo_confidence: float = Field(default=0.22)
+    plate_yolo_imgsz: int = Field(default=960)
+    plate_yolo_max_det: int = Field(default=20)
+    plate_yolo_device: str = Field(default="cpu")
+    plate_max_image_side: int = Field(default=1600)
+    plate_confidence_threshold: float = Field(default=0.5)
+    plate_ocr_enabled: bool = Field(default=True)
+    plate_ocr_confidence_threshold: float = Field(default=0.35)
+    paddleocr_use_angle_cls: bool = Field(default=True)
+    paddleocr_language: str = Field(default="ch")
+    paddleocr_text_recognition_model_name: str = Field(default="")
+    plate_stream_recognition_max_side: int = Field(default=0)
+    plate_stream_max_side: int = Field(default=960)
+    plate_stream_max_fps: int = Field(default=8)
+    plate_stream_process_every_n_frames: int = Field(default=8)
+    plate_stream_jpeg_quality: int = Field(default=80)
+    plate_stream_detection_hold_seconds: float = Field(default=0.8)
+    plate_stream_tracking_max_misses: int = Field(default=6)
+    plate_stream_tracking_match_threshold: float = Field(default=0.45)
+    plate_stream_tracking_search_expand: float = Field(default=2.4)
+    plate_stream_tracking_template_update_alpha: float = Field(default=0.18)
+    plate_stream_history_interval_seconds: int = Field(default=3)
+    plate_history_limit: int = Field(default=50)
+    plate_video_process_every_n_frames: int = Field(default=10)
+    plate_video_recognition_max_side: int = Field(default=1280)
+    plate_video_output_fps: int = Field(default=8)
+    plate_video_small_target_detector_enabled: bool = Field(default=False)
+    plate_video_detector_full_frame_fallback: bool = Field(default=False)
+    plate_save_uploads: bool = Field(default=False)
+    plate_upload_dir: str = Field(default="uploads/plate")
+    plate_push_ffmpeg_bin: str = Field(default="ffmpeg")
+    plate_push_stream_name: str = Field(default="plate-live")
+    plate_push_rtsp_base_url: str = Field(default="rtsp://127.0.0.1:8554")
+    plate_push_playback_base_url: str = Field(default="http://127.0.0.1:8889")
+    plate_push_fps: int = Field(default=25)
+    plate_push_bitrate: str = Field(default="2M")
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()
