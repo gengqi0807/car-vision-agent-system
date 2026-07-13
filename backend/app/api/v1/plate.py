@@ -1,15 +1,13 @@
-import asyncio
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
-
-from app.api.deps import get_current_user
-from app.models.user import User
 from app.models_infer.errors import PlateInferenceError
 from app.schemas.plate import (
     PlateRecognitionResponse,
     PlateRecordSummary,
     PlateStreamControlResponse,
     PlateStreamStartRequest,
+    PlateVideoJobCreateResponse,
+    PlateVideoJobStatusResponse,
     PlateVideoRecognitionResponse,
 )
 from app.services.plate_push_service import PlatePushService
@@ -17,65 +15,53 @@ from app.services.plate_service import PlateService
 
 router = APIRouter()
 service = PlateService()
-push_service = PlatePushService()
+push_service = PlatePushService(service)
 
 
-@router.post(
-    "/image",
-    response_model=PlateRecognitionResponse,
-    summary="上传图片进行车牌识别",
-    description="接收单张道路场景图片，返回检测到的车牌号码、颜色、置信度和检测框。",
-    responses={
-        200: {"description": "识别成功"},
-        400: {"description": "图片格式不合法或无法解析"},
-        401: {"description": "未登录或令牌失效"},
-        503: {"description": "推理服务暂时不可用"},
-    },
-)
-async def recognize_plate_image(
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-) -> PlateRecognitionResponse:
+def _absolutize_media_url(request: Request, media_url: str | None) -> str | None:
+    if not media_url:
+        return media_url
+    if media_url.startswith("/"):
+        return f"{str(request.base_url).rstrip('/')}{media_url}"
+    return media_url
+
+
+def _absolutize_video_job_response(
+    request: Request,
+    response: PlateVideoJobStatusResponse,
+) -> PlateVideoJobStatusResponse:
+    return response.model_copy(
+        update={
+            "preview_image_url": _absolutize_media_url(request, response.preview_image_url),
+            "processed_video_url": _absolutize_media_url(request, response.processed_video_url),
+            "unread_samples": [
+                _absolutize_media_url(request, item) if item.startswith("/") else item for item in response.unread_samples
+            ],
+        }
+    )
+
+
+@router.post("/image", response_model=PlateRecognitionResponse)
+async def recognize_plate_image(file: UploadFile = File(...)) -> PlateRecognitionResponse:
     image_bytes = await file.read()
     try:
-        return await service.recognize_image_bytes_async(
-            image_bytes,
-            file.filename or "unknown.jpg",
-            save_history=True,
-            user_id=current_user.id,
-        )
+        return await service.recognize_image(file.filename or "unknown.jpg", image_bytes)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PlateInferenceError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@router.get(
-    "/history",
-    response_model=list[PlateRecordSummary],
-    summary="查询车牌识别历史",
-    description="返回当前登录用户的历史车牌识别记录。",
-    responses={200: {"description": "查询成功"}, 401: {"description": "未登录或令牌失效"}},
-)
-async def get_plate_history(current_user: User = Depends(get_current_user)) -> list[PlateRecordSummary]:
-    return service.list_history(current_user.id)
+@router.get("/history", response_model=list[PlateRecordSummary])
+async def get_plate_history() -> list[PlateRecordSummary]:
+    return service.list_history()
 
 
 @router.post("/video", response_model=PlateVideoRecognitionResponse)
-async def recognize_plate_video(
-    request: Request,
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-) -> PlateVideoRecognitionResponse:
+async def recognize_plate_video(request: Request, file: UploadFile = File(...)) -> PlateVideoRecognitionResponse:
     video_bytes = await file.read()
     try:
-        response = await asyncio.to_thread(
-            service.recognize_video_bytes,
-            video_bytes,
-            file.filename or "unknown.mp4",
-            save_history=True,
-            user_id=current_user.id,
-        )
+        response = service.recognize_video_bytes(video_bytes, file.filename or "unknown.mp4")
         processed_url = response.processed_video_url
         if processed_url.startswith("/"):
             processed_url = f"{str(request.base_url).rstrip('/')}{processed_url}"
@@ -90,24 +76,44 @@ async def recognize_plate_video(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@router.post("/stream/start", response_model=PlateStreamControlResponse)
-async def start_plate_stream(
-    payload: PlateStreamStartRequest,
-    _current_user: User = Depends(get_current_user),
-) -> PlateStreamControlResponse:
+@router.post("/video/jobs", response_model=PlateVideoJobCreateResponse)
+async def create_plate_video_job(file: UploadFile = File(...)) -> PlateVideoJobCreateResponse:
+    video_bytes = await file.read()
     try:
-        return push_service.start(rtsp_url=payload.rtsp_url, stream_name=payload.stream_name)
+        return service.start_video_job(video_bytes, file.filename or "unknown.mp4")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except PlateInferenceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.get("/video/jobs/{job_id}", response_model=PlateVideoJobStatusResponse)
+async def get_plate_video_job_status(request: Request, job_id: str) -> PlateVideoJobStatusResponse:
+    response = service.get_video_job_status(job_id)
+    if response is None:
+        raise HTTPException(status_code=404, detail="Video job not found.")
+    return _absolutize_video_job_response(request, response)
+
+
+@router.post("/stream/start", response_model=PlateStreamControlResponse)
+async def start_plate_stream(payload: PlateStreamStartRequest) -> PlateStreamControlResponse:
+    try:
+        return push_service.start(
+            rtsp_url=payload.rtsp_url,
+            stream_name=payload.stream_name,
+            process_frames=payload.process_frames,
+        )
     except PlateInferenceError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.post("/stream/stop", response_model=PlateStreamControlResponse)
-async def stop_plate_stream(_current_user: User = Depends(get_current_user)) -> PlateStreamControlResponse:
+async def stop_plate_stream() -> PlateStreamControlResponse:
     return push_service.stop()
 
 
 @router.get("/stream/status", response_model=PlateStreamControlResponse)
-async def get_plate_stream_status(_current_user: User = Depends(get_current_user)) -> PlateStreamControlResponse:
+async def get_plate_stream_status() -> PlateStreamControlResponse:
     return push_service.status()
 
 

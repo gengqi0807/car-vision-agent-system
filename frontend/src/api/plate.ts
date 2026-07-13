@@ -3,6 +3,7 @@ import request from "./request";
 export interface PlateDetection {
   plate_number: string;
   plate_color: string;
+  vehicle_type: string;
   confidence: number;
   bbox: number[];
 }
@@ -16,9 +17,28 @@ export interface PlateVideoRecognitionResponse {
   source_filename: string;
   processed_video_url: string;
   detections: PlateDetection[];
-  unread_samples: string[];
   processed_frame_count: number;
   duration_seconds?: number | null;
+}
+
+export interface PlateVideoJobCreateResponse {
+  job_id: string;
+  status: string;
+}
+
+export interface PlateVideoJobStatusResponse {
+  job_id: string;
+  source_filename: string;
+  status: string;
+  progress: number;
+  processed_frame_count: number;
+  total_frames: number;
+  detections: PlateDetection[];
+  preview_image_url?: string | null;
+  processed_video_url?: string | null;
+  unread_samples: string[];
+  duration_seconds?: number | null;
+  error_message?: string | null;
 }
 
 export interface PlateRecordSummary {
@@ -31,6 +51,10 @@ export interface PlateRecordSummary {
 export interface PlateStreamControlResponse {
   running: boolean;
   published?: boolean;
+  publisher_started?: boolean;
+  phase?: string;
+  status_message?: string | null;
+  process_frames?: boolean;
   rtsp_url?: string | null;
   stream_name?: string | null;
   publish_rtsp_url?: string | null;
@@ -57,10 +81,22 @@ export function recognizePlateVideoApi(file: File) {
   });
 }
 
-export function startPlatePushStreamApi(rtspUrl: string, streamName?: string) {
+export function createPlateVideoJobApi(file: File) {
+  const formData = new FormData();
+  formData.append("file", file);
+  return request.post<PlateVideoJobCreateResponse>("/plate/video/jobs", formData, {
+    timeout: 2 * 60 * 1000
+  });
+}
+
+export const fetchPlateVideoJobStatusApi = (jobId: string) =>
+  request.get<PlateVideoJobStatusResponse>(`/plate/video/jobs/${jobId}`);
+
+export function startPlatePushStreamApi(rtspUrl: string, streamName?: string, processFrames = true) {
   return request.post<PlateStreamControlResponse>("/plate/stream/start", {
     rtsp_url: rtspUrl,
-    stream_name: streamName
+    stream_name: streamName,
+    process_frames: processFrames
   });
 }
 

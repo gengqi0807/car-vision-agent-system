@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 from datetime import datetime
+import re
 import subprocess
 import threading
 import time
+from urllib.parse import urlparse
 
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -19,6 +19,8 @@ logger = get_logger(__name__)
 class PlatePushState:
     running: bool = False
     published: bool = False
+    publisher_started: bool = False
+    process_frames: bool = True
     rtsp_url: str | None = None
     stream_name: str | None = None
     publish_rtsp_url: str | None = None
@@ -28,24 +30,34 @@ class PlatePushState:
 
 
 class PlatePushService:
-    def __init__(self) -> None:
-        self._plate_service = PlateService()
+    def __init__(self, plate_service: PlateService | None = None) -> None:
+        self._plate_service = plate_service or PlateService()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
         self._state = PlatePushState()
 
-    def start(self, rtsp_url: str, stream_name: str | None = None) -> PlateStreamControlResponse:
+    def start(
+        self,
+        rtsp_url: str,
+        stream_name: str | None = None,
+        process_frames: bool = True,
+    ) -> PlateStreamControlResponse:
         worker_to_stop: threading.Thread | None = None
         previous_rtsp_url: str | None = None
+        rtsp_url = rtsp_url.strip()
 
         with self._lock:
-            stream_name = (stream_name or settings.plate_push_stream_name).strip()
+            stream_name = self._resolve_stream_name(rtsp_url, stream_name)
             if not stream_name:
-                raise InferenceConfigurationError("推流名称不能为空。")
+                raise InferenceConfigurationError("Stream name cannot be empty.")
 
             if self._state.running:
-                if self._state.rtsp_url == rtsp_url and self._state.stream_name == stream_name:
+                if (
+                    self._state.rtsp_url == rtsp_url
+                    and self._state.stream_name == stream_name
+                    and self._state.process_frames == process_frames
+                ):
                     return self._to_response()
 
                 previous_rtsp_url = self._state.rtsp_url
@@ -58,13 +70,15 @@ class PlatePushService:
 
         with self._lock:
             if self._worker is not None and self._worker.is_alive():
-                raise InferenceConfigurationError("上一条推流还未完全停止，请稍后重试。")
+                raise InferenceConfigurationError("The previous stream is still shutting down. Please retry shortly.")
 
             self._worker = None
             self._stop_event = threading.Event()
             self._state = PlatePushState(
                 running=True,
                 published=False,
+                publisher_started=False,
+                process_frames=process_frames,
                 rtsp_url=rtsp_url,
                 stream_name=stream_name,
                 publish_rtsp_url=self._build_publish_rtsp_url(stream_name),
@@ -74,11 +88,16 @@ class PlatePushService:
             )
             self._worker = threading.Thread(
                 target=self._run_worker,
-                args=(rtsp_url, stream_name, self._stop_event),
+                args=(rtsp_url, stream_name, process_frames, self._stop_event),
                 daemon=True,
             )
             self._worker.start()
-            logger.info("Started plate push worker for %s -> %s", rtsp_url, self._state.publish_rtsp_url)
+            logger.info(
+                "Started plate push worker for %s -> %s | process_frames=%s",
+                rtsp_url,
+                self._state.publish_rtsp_url,
+                process_frames,
+            )
             return self._to_response()
 
     def stop(self) -> PlateStreamControlResponse:
@@ -96,6 +115,7 @@ class PlatePushService:
                 self._worker = None
                 self._state.running = False
                 self._state.published = False
+                self._state.publisher_started = False
             return self._to_response()
 
     def status(self) -> PlateStreamControlResponse:
@@ -104,7 +124,13 @@ class PlatePushService:
                 self._worker = None
                 self._state.running = False
                 self._state.published = False
-            should_probe = self._state.running and not self._state.published and bool(self._state.publish_rtsp_url)
+                self._state.publisher_started = False
+            should_probe = (
+                self._state.running
+                and self._state.publisher_started
+                and not self._state.published
+                and bool(self._state.publish_rtsp_url)
+            )
             publish_rtsp_url = self._state.publish_rtsp_url
 
         if should_probe and publish_rtsp_url:
@@ -117,7 +143,19 @@ class PlatePushService:
         with self._lock:
             return self._to_response()
 
-    def _run_worker(self, rtsp_url: str, stream_name: str, stop_event: threading.Event) -> None:
+    def _run_worker(
+        self,
+        rtsp_url: str,
+        stream_name: str,
+        process_frames: bool,
+        stop_event: threading.Event,
+    ) -> None:
+        if process_frames:
+            self._run_processed_worker(rtsp_url, stream_name, stop_event)
+        else:
+            self._run_passthrough_worker(rtsp_url, stream_name, stop_event)
+
+    def _run_processed_worker(self, rtsp_url: str, stream_name: str, stop_event: threading.Event) -> None:
         ffmpeg_process: subprocess.Popen[bytes] | None = None
         first_frame_written = False
         try:
@@ -129,11 +167,12 @@ class PlatePushService:
                 if ffmpeg_process is None:
                     height, width = frame.shape[:2]
                     ffmpeg_process = self._start_ffmpeg(width=width, height=height, publish_url=publish_url)
+                    self._mark_publisher_started(publish_url)
 
                 if ffmpeg_process.poll() is not None:
                     stderr_output = self._read_process_error(ffmpeg_process)
                     raise InferenceConfigurationError(
-                        f"ffmpeg 推流进程意外退出。{stderr_output or '请确认 mediamtx 已启动，并且推流地址可写。'}"
+                        f"ffmpeg publisher exited unexpectedly. {stderr_output or 'Check mediamtx and the publish URL.'}"
                     )
 
                 try:
@@ -144,17 +183,49 @@ class PlatePushService:
                         logger.info("First annotated frame written to ffmpeg stdin for %s", publish_url)
                         first_frame_written = True
                 except BrokenPipeError as exc:
-                    raise InferenceConfigurationError("ffmpeg 管道已断开，推流中止。") from exc
+                    raise InferenceConfigurationError("ffmpeg pipe closed while pushing the annotated stream.") from exc
         except Exception as exc:
             logger.exception("Plate push worker failed")
             with self._lock:
                 self._state.last_error = str(exc)
         finally:
             self._shutdown_ffmpeg(ffmpeg_process)
+            self._reset_state_after_worker_exit()
+
+    def _run_passthrough_worker(self, rtsp_url: str, stream_name: str, stop_event: threading.Event) -> None:
+        ffmpeg_process: subprocess.Popen[bytes] | None = None
+        try:
+            publish_url = self._build_publish_rtsp_url(stream_name)
+            ffmpeg_process = self._start_ffmpeg_passthrough(rtsp_url=rtsp_url, publish_url=publish_url)
+            self._mark_publisher_started(publish_url)
+            logger.info("Started passthrough publisher for %s -> %s", rtsp_url, publish_url)
+
+            while not stop_event.is_set():
+                if ffmpeg_process.poll() is not None:
+                    stderr_output = self._read_process_error(ffmpeg_process)
+                    raise InferenceConfigurationError(
+                        f"ffmpeg passthrough exited unexpectedly. {stderr_output or 'Check mediamtx, ffmpeg, and the source RTSP URL.'}"
+                    )
+                time.sleep(0.2)
+        except Exception as exc:
+            logger.exception("Plate passthrough worker failed")
             with self._lock:
-                self._state.running = False
-                self._state.published = False
-                self._worker = None
+                self._state.last_error = str(exc)
+        finally:
+            self._shutdown_ffmpeg(ffmpeg_process)
+            self._reset_state_after_worker_exit()
+
+    def _mark_publisher_started(self, publish_url: str) -> None:
+        with self._lock:
+            if self._state.running and self._state.publish_rtsp_url == publish_url:
+                self._state.publisher_started = True
+
+    def _reset_state_after_worker_exit(self) -> None:
+        with self._lock:
+            self._state.running = False
+            self._state.published = False
+            self._state.publisher_started = False
+            self._worker = None
 
     def _start_ffmpeg(self, width: int, height: int, publish_url: str) -> subprocess.Popen[bytes]:
         command = [
@@ -215,7 +286,39 @@ class PlatePushService:
             )
         except FileNotFoundError as exc:
             raise InferenceConfigurationError(
-                f"找不到 ffmpeg，可在 .env 中配置 PLATE_PUSH_FFMPEG_BIN。当前值为 {settings.plate_push_ffmpeg_bin!r}。"
+                f"ffmpeg was not found. Set PLATE_PUSH_FFMPEG_BIN in .env. Current value: {settings.plate_push_ffmpeg_bin!r}."
+            ) from exc
+
+    def _start_ffmpeg_passthrough(self, rtsp_url: str, publish_url: str) -> subprocess.Popen[bytes]:
+        command = [
+            settings.plate_push_ffmpeg_bin,
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            rtsp_url,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-c:v",
+            "copy",
+            "-f",
+            "rtsp",
+            "-rtsp_transport",
+            "tcp",
+            publish_url,
+        ]
+        try:
+            logger.info("Starting ffmpeg passthrough publisher: %s -> %s", rtsp_url, publish_url)
+            return subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+        except FileNotFoundError as exc:
+            raise InferenceConfigurationError(
+                f"ffmpeg was not found. Set PLATE_PUSH_FFMPEG_BIN in .env. Current value: {settings.plate_push_ffmpeg_bin!r}."
             ) from exc
 
     def _probe_publish_stream(self, publish_rtsp_url: str) -> bool:
@@ -279,10 +382,37 @@ class PlatePushService:
     def _build_playback_url(self, stream_name: str) -> str:
         return f"{settings.plate_push_playback_base_url.rstrip('/')}/{stream_name}"
 
+    def _resolve_stream_name(self, rtsp_url: str, stream_name: str | None) -> str:
+        candidate = (stream_name or "").strip()
+        if not candidate:
+            candidate = self._build_default_stream_name(rtsp_url)
+
+        sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", candidate).strip("-")
+        if not sanitized:
+            raise InferenceConfigurationError("Invalid stream name. Use letters, numbers, underscores, or hyphens.")
+        return sanitized[:64]
+
+    def _build_default_stream_name(self, rtsp_url: str) -> str:
+        try:
+            parsed = urlparse(rtsp_url)
+            path_parts = [part for part in parsed.path.split("/") if part]
+            if path_parts:
+                tail = path_parts[-1]
+                if tail:
+                    return f"plate-{tail}"
+        except Exception:
+            pass
+        return settings.plate_push_stream_name
+
     def _to_response(self) -> PlateStreamControlResponse:
+        phase, status_message = self._build_phase_and_message()
         return PlateStreamControlResponse(
             running=self._state.running,
             published=self._state.published,
+            publisher_started=self._state.publisher_started,
+            phase=phase,
+            status_message=status_message,
+            process_frames=self._state.process_frames,
             rtsp_url=self._state.rtsp_url,
             stream_name=self._state.stream_name,
             publish_rtsp_url=self._state.publish_rtsp_url,
@@ -290,3 +420,29 @@ class PlatePushService:
             last_error=self._state.last_error,
             started_at=self._state.started_at,
         )
+
+    def _build_phase_and_message(self) -> tuple[str, str]:
+        if self._state.running:
+            if self._state.published:
+                return "running", "识别推流中" if self._state.process_frames else "实时直推预览中"
+            if self._state.publisher_started:
+                return (
+                    "waiting_publish",
+                    "已连接源 RTSP，等待本地播放流发布"
+                    if self._state.process_frames
+                    else "源 RTSP 已接入，等待本地播放流发布",
+                )
+            return (
+                "connecting_source",
+                "正在连接源 RTSP，等待首帧"
+                if self._state.process_frames
+                else "正在连接源 RTSP，准备直接转发到前端",
+            )
+
+        if self._state.last_error:
+            lower = self._state.last_error.lower()
+            if "failed to open the rtsp stream" in lower or "timeout" in lower or "timed out" in lower:
+                return "source_unavailable", "源 RTSP 未开启、不可达，或当前没有可读视频帧"
+            return "interrupted", "推流中断"
+
+        return "idle", "未启动推流"

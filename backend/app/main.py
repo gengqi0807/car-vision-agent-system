@@ -7,9 +7,11 @@ from fastapi.staticfiles import StaticFiles
 
 from app import models  # noqa: F401
 from app.api.router import api_router
+from app.api.v1.plate import service as plate_service
 from app.core.config import settings
 from app.core.database import init_database
 from app.core.logger import configure_logging, get_logger
+from app.models_infer.runtime_config import configure_cpu_runtime
 
 configure_logging()
 logger = get_logger(__name__)
@@ -20,9 +22,23 @@ media_root.mkdir(parents=True, exist_ok=True)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_database()
+    configure_cpu_runtime()
     logger.info("Starting %s in %s mode", settings.app_name, settings.app_env)
-    yield
-    logger.info("Shutting down %s", settings.app_name)
+    if settings.plate_video_worker_prestart:
+        plate_service.start_video_worker()
+    try:
+        logger.info("Warming up plate recognition models...")
+        plate_service.warmup_runtime(silent=True)
+        logger.info("Plate recognition model warmup finished.")
+    except Exception:
+        logger.warning("Plate model warmup failed; lazy initialization will be used.", exc_info=True)
+    if settings.plate_video_worker_prestart and not plate_service.wait_video_worker_ready(timeout=120.0):
+        logger.warning("Plate video worker warmup did not finish before the startup timeout.")
+    try:
+        yield
+    finally:
+        plate_service.stop_video_worker()
+        logger.info("Shutting down %s", settings.app_name)
 
 
 app = FastAPI(
