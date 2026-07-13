@@ -10,7 +10,8 @@ from sqlalchemy.orm import sessionmaker
 from app.core.database import Base
 from app.models.owner_gesture_record import OwnerGestureRecord
 from app.models_infer.gesture_classifier import GestureClassifier, HandGestureTracker
-from app.services.owner_gesture_service import OwnerGestureService
+from app.schemas.gesture import ControlPanelState
+from app.services.owner_gesture_service import OwnerGestureService, RuntimeGestureSession
 
 
 def test_classify_frame_keeps_static_result_idle_until_one_second(monkeypatch):
@@ -29,7 +30,101 @@ def test_classify_frame_keeps_static_result_idle_until_one_second(monkeypatch):
     assert classifier.classify_frame(keypoints) == ("palm", 0.95)
 
 
-def test_build_panel_state_uses_latest_wake_window(tmp_path):
+def test_swipe_transition_accepts_open_palm_and_short_intermediate_state():
+    classifier = GestureClassifier(domain="owner")
+
+    assert classifier._detect_swipe_transition("fist", 100.0) is None
+    assert classifier._detect_swipe_transition("unknown", 100.6) is None
+    assert classifier._detect_swipe_transition("open_palm", 101.2) == "swipe_left"
+
+    classifier._swipe_from = None
+    classifier._swipe_from_time = 0.0
+    assert classifier._detect_swipe_transition("open_palm", 200.0) is None
+    assert classifier._detect_swipe_transition("pointing", 200.5) is None
+    assert classifier._detect_swipe_transition("fist", 201.1) == "swipe_right"
+
+
+def test_swipe_result_overrides_locked_endpoint_gesture():
+    service = OwnerGestureService()
+    session = RuntimeGestureSession(
+        panel_state=ControlPanelState(
+            **service._default_panel_state,
+            last_gesture=None,
+            last_command=None,
+            last_command_at=None,
+            updated_at=None,
+        ),
+        hand_present_prev=True,
+        result_locked=True,
+        locked_gesture="fist",
+        locked_confidence=0.91,
+    )
+
+    gesture, confidence = service._lock_camera_result(
+        session,
+        gesture="swipe_left",
+        confidence=0.9,
+        hand_present=True,
+    )
+
+    assert gesture == "swipe_left"
+    assert confidence == 0.9
+
+
+def test_volume_actions_can_repeat_only_after_fresh_circle_observation():
+    service = OwnerGestureService()
+    session = RuntimeGestureSession(
+        panel_state=ControlPanelState(
+            **service._default_panel_state,
+            last_gesture=None,
+            last_command=None,
+            last_command_at=None,
+            updated_at=None,
+        )
+    )
+
+    assert service._should_fire_verified_camera_action(
+        session,
+        action="volume_up",
+        control_command="AdjustVolumeUp",
+        observed_gesture="circle_cw",
+    ) is True
+    assert service._should_fire_verified_camera_action(
+        session,
+        action="volume_up",
+        control_command="AdjustVolumeUp",
+        observed_gesture="idle",
+    ) is False
+
+    session.last_fired_at_monotonic -= 1.0
+    assert service._should_fire_verified_camera_action(
+        session,
+        action="volume_up",
+        control_command="AdjustVolumeUp",
+        observed_gesture="circle_cw",
+    ) is True
+    assert service._should_fire_verified_camera_action(
+        session,
+        action="volume_down",
+        control_command="AdjustVolumeDown",
+        observed_gesture="circle_ccw",
+    ) is True
+
+    assert service._should_fire_verified_camera_action(
+        session,
+        action="confirm",
+        control_command="ConfirmAction",
+        observed_gesture="fist",
+    ) is True
+    assert service._should_fire_verified_camera_action(
+        session,
+        action="confirm",
+        control_command="ConfirmAction",
+        observed_gesture="fist",
+    ) is False
+
+
+def test_build_panel_state_keeps_page_on_repeated_wake(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'owner_gesture.db'}", future=True)
     testing_session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     Base.metadata.create_all(bind=engine)
@@ -74,10 +169,11 @@ def test_build_panel_state_uses_latest_wake_window(tmp_path):
         panel_state = service.control_panel(db, 7)
 
     assert panel_state.system_awake is True
-    assert panel_state.current_mode == "home"
-    assert panel_state.phone_call_active is False
+    assert panel_state.current_mode == "call"
+    assert panel_state.phone_call_active is True
     assert panel_state.last_gesture == "open_palm"
     assert panel_state.last_command == "WakeSystem"
+    assert panel_state.last_feedback == "系统已唤醒。"
 
 
 def test_build_panel_state_keeps_latest_triggered_mode_and_call_state(tmp_path):
@@ -242,7 +338,7 @@ def test_build_panel_state_supports_function_switch_volume_confirm_and_home(tmp_
                 OwnerGestureRecord(
                     user_id=13,
                     session_id="demo",
-                    gesture="wave",
+                    gesture="thunb_index",
                     confidence=0.83,
                     control_action="ReturnHome",
                     is_triggered=True,
@@ -261,7 +357,7 @@ def test_build_panel_state_supports_function_switch_volume_confirm_and_home(tmp_
     assert panel_state.comfort_scene == "舒享"
     assert panel_state.focus_tile == "home"
     assert panel_state.last_command == "ReturnHome"
-    assert panel_state.last_feedback == "已挥手返回主页。"
+    assert panel_state.last_feedback == "已捏指返回主页。"
 
 
 def test_motion_refinement_detects_wave_swipe_and_circle():
@@ -374,6 +470,33 @@ def test_should_trigger_immediately_for_image_input():
     )
 
     assert triggered is True
+
+
+def test_thunb_index_replaces_wave_as_return_home_gesture():
+    service = OwnerGestureService()
+
+    assert service._map_gesture_to_command("thunb_index") == ("ReturnHome", True)
+    assert service._map_gesture_to_command("thumb_index") == ("ReturnHome", True)
+    assert service._map_gesture_to_command("wave") == (None, False)
+
+
+def test_wake_system_keeps_current_page_when_already_awake():
+    service = OwnerGestureService()
+    state = {
+        **service._default_panel_state,
+        "system_awake": True,
+        "phone_call_active": True,
+        "current_mode": "call",
+        "focus_tile": "call",
+    }
+
+    service._apply_command_to_state(state, "WakeSystem")
+
+    assert state["system_awake"] is True
+    assert state["phone_call_active"] is True
+    assert state["current_mode"] == "call"
+    assert state["focus_tile"] == "call"
+    assert state["last_feedback"] == "系统已唤醒。"
 
 
 def test_classify_upload_gesture_image_mode_uses_single_hand_static_result():

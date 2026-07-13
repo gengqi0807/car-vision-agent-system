@@ -305,6 +305,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 
 import {
   fetchOwnerGestureApi,
+  fetchOwnerGestureStreamStateApi,
   fetchOwnerGestureStreamResultApi,
   startOwnerGestureStreamApi,
   stopOwnerGestureStreamApi,
@@ -341,6 +342,7 @@ let captureTimer: number | null = null;
 let requestInFlight = false;
 let uiClockTimer: number | null = null;
 let streamResultTimer: number | null = null;
+let streamStarting = false;
 let lastInferenceDurationMs = 120;
 
 const LABEL_MAP: Record<string, string> = {
@@ -358,6 +360,8 @@ const LABEL_MAP: Record<string, string> = {
   thumb_up: "拇指向上",
   thumbs_down: "拇指向下",
   thumb_down: "拇指向下",
+  thunb_index: "捏指",
+  thumb_index: "捏指",
   wave: "挥手",
   idle: "待机",
   unknown: "未识别",
@@ -379,7 +383,9 @@ const GESTURE_ACTION_MAP: Record<string, string> = {
   thumb_up: "接听",
   thumbs_down: "挂断",
   thumb_down: "挂断",
-  wave: "主页",
+  thunb_index: "主页",
+  thumb_index: "主页",
+  wave: "待机",
   idle: "待机",
   unknown: "等待",
   "未检测到手部": "无动作",
@@ -532,7 +538,8 @@ const callStatusText = computed(() => {
 
 const showConfirmSpotlight = computed(() => {
   return (
-    panelState.value.last_command === "ConfirmAction" &&
+    (panelState.value.last_command === "ConfirmAction" ||
+      panelState.value.last_command === "WakeSystem") &&
     isFreshCommand(panelState.value.last_command_at, 3200)
   );
 });
@@ -710,10 +717,11 @@ async function startCamera() {
     await stopOwnerGestureStreamApi().catch(() => undefined);
     const { data } = await startOwnerGestureStreamApi("0", 15);
     if (!data.playback_url) throw new Error("后端未返回 MediaMTX 播放地址");
-    streamVideoUrl.value = `${data.playback_url}?t=${Date.now()}`;
     cameraDeviceLabel.value = "后端摄像头 0";
     cameraActive.value = true;
+    streamStarting = true;
     startStreamResultPolling();
+    await waitForOwnerGestureStreamPublished(data.playback_url);
   } catch (err: any) {
     stopCamera();
     error.value = axios.isAxiosError(err)
@@ -725,6 +733,7 @@ async function startCamera() {
 function stopCamera() {
   void stopOwnerGestureStreamApi().catch(() => undefined);
   stopStreamResultPolling();
+  streamStarting = false;
   streamVideoUrl.value = "";
   stopCaptureLoop();
   loading.value = false;
@@ -757,12 +766,31 @@ function startStreamResultPolling() {
       if (data.panel_state) panelState.value = data.panel_state;
       error.value = "";
     } catch {
-      if (cameraActive.value) error.value = "无法获取后端手势识别结果";
+      if (cameraActive.value && !streamStarting) error.value = "无法获取后端手势识别结果";
     } finally {
       if (cameraActive.value) streamResultTimer = window.setTimeout(poll, 200);
     }
   };
   void poll();
+}
+
+async function waitForOwnerGestureStreamPublished(playbackUrl: string) {
+  const deadline = Date.now() + 12_000;
+  while (cameraActive.value && Date.now() < deadline) {
+    const { data } = await fetchOwnerGestureStreamStateApi();
+    if (data.last_error) throw new Error(data.last_error);
+    if (!data.running) throw new Error("后端手势推流已停止");
+    if (data.published) {
+      await new Promise((resolve) => window.setTimeout(resolve, 900));
+      if (!cameraActive.value) return;
+      streamVideoUrl.value = `${playbackUrl}?t=${Date.now()}`;
+      streamStarting = false;
+      error.value = "";
+      return;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 150));
+  }
+  throw new Error("等待 MediaMTX 手势流就绪超时");
 }
 
 function stopStreamResultPolling() {
@@ -1098,11 +1126,16 @@ function applyResultToPanelState(data: OwnerGestureFrameResult) {
 
   if (data.triggered && data.control_command) {
     if (data.control_command === "WakeSystem") {
+      const wasAwake = nextState.system_awake;
       nextState.system_awake = true;
-      nextState.phone_call_active = false;
-      nextState.current_mode = "home";
-      nextState.focus_tile = "home";
-      nextState.last_feedback = "CMC 已唤醒，主页信息恢复显示。";
+      if (wasAwake) {
+        nextState.last_feedback = "系统已唤醒。";
+      } else {
+        nextState.phone_call_active = false;
+        nextState.current_mode = "home";
+        nextState.focus_tile = "home";
+        nextState.last_feedback = "CMC 已唤醒，主页信息恢复显示。";
+      }
     } else if (data.control_command === "SwitchPrevFeature" && nextState.system_awake && !nextState.phone_call_active) {
       nextState.current_mode = shiftMode(nextState.current_mode, -1);
       nextState.focus_tile = nextState.current_mode;
@@ -1142,7 +1175,7 @@ function applyResultToPanelState(data: OwnerGestureFrameResult) {
     } else if (data.control_command === "ReturnHome" && nextState.system_awake && !nextState.phone_call_active) {
       nextState.current_mode = "home";
       nextState.focus_tile = "home";
-      nextState.last_feedback = "已挥手返回主页。";
+      nextState.last_feedback = "已捏指返回主页。";
     }
   }
 

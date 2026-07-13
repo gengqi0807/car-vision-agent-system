@@ -31,8 +31,8 @@ LABEL_MAP = {
     "fist":        "fist",         # 1
     "palm":        "palm",         # 2
     # 后续扩充：
-    # "thumb_down": "thumb_down",  # 3
-    # "pointing":   "pointing",    # 4
+    "thumb_down": "thumb_down",  # 3
+    "thumb_index": "thumb_index",    # 4
 }
 
 FOLDER_TO_INT = {folder: i for i, folder in enumerate(LABEL_MAP.keys())}

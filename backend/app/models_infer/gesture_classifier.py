@@ -445,12 +445,15 @@ class GestureClassifier:
     # ----------------------------------------------------------------
 
     def _detect_swipe_transition(self, gesture: str, now: float) -> str | None:
-        """单手时序切换: 1s 内 fist→palm=swipe_left, palm→fist=swipe_right。"""
-        WINDOW = 1.0       # 切换必须在 1 秒内完成
+        """单手时序切换: fist→palm=swipe_left, palm→fist=swipe_right。"""
+        WINDOW = 1.8       # 给实际推理帧率和手型过渡留出余量
         MIN_HOLD = 0.10    # 起点手势至少保持 0.1s，过滤抖动误触发
+        gesture = "palm" if gesture == "open_palm" else gesture
         if gesture not in ("fist", "palm"):
-            self._swipe_from = None
-            self._swipe_from_time = 0.0
+            # 张合过程中常有几帧 unknown/pointing，短暂中间态不应清空起点。
+            if self._swipe_from_time > 0 and now - self._swipe_from_time > WINDOW:
+                self._swipe_from = None
+                self._swipe_from_time = 0.0
             return None
         if self._swipe_from is None:
             self._swipe_from = gesture

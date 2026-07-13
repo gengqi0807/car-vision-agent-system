@@ -72,6 +72,9 @@ export const startOwnerGestureStreamApi = (source = "0", fps = 15) =>
 
 export const stopOwnerGestureStreamApi = () => request.post("/owner-gesture/stream/stop");
 
+export const fetchOwnerGestureStreamStateApi = () =>
+  request.get<OwnerGestureStreamState>("/owner-gesture/stream");
+
 export const fetchOwnerGestureStreamResultApi = () =>
   request.get<OwnerGestureStreamResult>("/owner-gesture/current");
 
