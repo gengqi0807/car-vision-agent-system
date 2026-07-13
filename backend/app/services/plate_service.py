@@ -3,10 +3,8 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field
 from datetime import datetime
-from multiprocessing import get_context
 import os
 from pathlib import Path
-from queue import Empty
 import re
 import subprocess
 import threading
@@ -22,7 +20,6 @@ from app.core.logger import get_logger
 from app.models.plate_record import PlateRecord
 from app.models_infer.errors import InferenceConfigurationError, InferenceDependencyError
 from app.models_infer.paddleocr_recognizer import PaddleOCRRecognizer
-from app.models_infer.runtime_config import configure_cpu_runtime
 from app.models_infer.vehicle_type_classifier import VehicleTypeClassifier
 from app.models_infer.yolo_detector import YoloDetector
 from app.schemas.plate import (
@@ -94,7 +91,6 @@ class PlateProcessingState:
     working_width: int = 0
     working_height: int = 0
     stream_mode: bool = False
-    detector_attempt_count: int = 0
 
 
 @dataclass
@@ -121,72 +117,6 @@ class BestUnreadCandidate:
     quality_score: float
 
 
-def _video_worker_process_entry(task_queue, progress_queue) -> None:
-    """Serve uploaded-video jobs from one persistent isolated process."""
-    configure_cpu_runtime()
-    service = PlateService()
-    service.warmup_runtime(silent=True)
-    progress_queue.put({"type": "worker_ready"})
-
-    while True:
-        task = task_queue.get()
-        if task is None:
-            return
-
-        job_id = str(task["job_id"])
-        source_path = Path(task["source_path"])
-        output_path = Path(task["output_path"])
-        preview_path = Path(task["preview_path"])
-        source_filename = str(task["source_filename"])
-        try:
-            def publish_progress(
-                *,
-                processed_frame_count: int,
-                total_frames: int,
-                detections: list[PlateDetection],
-                annotated_frame=None,
-            ) -> None:
-                preview_written = False
-                if annotated_frame is not None:
-                    cv2 = service._require_cv2()
-                    preview_path.parent.mkdir(parents=True, exist_ok=True)
-                    preview_written = bool(
-                        cv2.imwrite(
-                            str(preview_path),
-                            annotated_frame,
-                            [int(cv2.IMWRITE_JPEG_QUALITY), max(settings.plate_stream_jpeg_quality, 72)],
-                        )
-                    )
-                progress_queue.put(
-                    {
-                        "type": "progress",
-                        "job_id": job_id,
-                        "processed_frame_count": processed_frame_count,
-                        "total_frames": total_frames,
-                        "detections": [item.model_dump(mode="json") for item in detections],
-                        "preview_written": preview_written,
-                        "updated_at": int(time.time() * 1000),
-                    }
-                )
-
-            result = service._process_video_file(
-                source_path,
-                output_path,
-                source_filename,
-                progress_callback=publish_progress,
-            )
-            progress_queue.put(
-                {"type": "completed", "job_id": job_id, "result": result.model_dump(mode="json")}
-            )
-        except Exception as exc:
-            logger.exception("Isolated video job failed: %s", source_filename)
-            progress_queue.put({"type": "failed", "job_id": job_id, "error_message": str(exc)})
-        finally:
-            if not settings.plate_save_uploads:
-                try:
-                    source_path.unlink(missing_ok=True)
-                except Exception:
-                    logger.warning("Failed to remove temporary uploaded video: %s", source_path)
 @dataclass
 class VideoProcessingJob:
     job_id: str
@@ -219,11 +149,6 @@ class PlateService:
         self._upload_root = (self._backend_dir / settings.plate_upload_dir).resolve()
         self._video_jobs: dict[str, VideoProcessingJob] = {}
         self._video_jobs_lock = Lock()
-        self._video_worker_process = None
-        self._video_worker_task_queue = None
-        self._video_worker_progress_queue = None
-        self._video_worker_monitor = None
-        self._video_worker_ready = threading.Event()
         self._annotation_font_cache: dict[tuple[str, int], object] = {}
         self._runtime_warmed = False
 
@@ -390,66 +315,9 @@ class PlateService:
         with self._video_jobs_lock:
             self._video_jobs[job_id] = job
 
-        self.start_video_worker()
-        self._video_worker_task_queue.put(
-            {
-                "job_id": job_id,
-                "source_path": str(source_path),
-                "output_path": str(output_path),
-                "preview_path": str(preview_path),
-                "source_filename": filename,
-            }
-        )
+        worker = Thread(target=self._run_video_job, args=(job_id,), daemon=True)
+        worker.start()
         return PlateVideoJobCreateResponse(job_id=job_id, status=job.status)
-
-    def start_video_worker(self) -> None:
-        with self._video_jobs_lock:
-            if self._video_worker_process is not None and self._video_worker_process.is_alive():
-                return
-            context = get_context("spawn")
-            task_queue = context.Queue()
-            progress_queue = context.Queue()
-            process = context.Process(
-                target=_video_worker_process_entry,
-                args=(task_queue, progress_queue),
-                daemon=True,
-                name="plate-video-worker",
-            )
-            self._video_worker_task_queue = task_queue
-            self._video_worker_progress_queue = progress_queue
-            self._video_worker_process = process
-            self._video_worker_ready.clear()
-            process.start()
-            monitor = Thread(
-                target=self._monitor_video_worker,
-                args=(process, progress_queue),
-                daemon=True,
-                name="plate-video-monitor",
-            )
-            self._video_worker_monitor = monitor
-            monitor.start()
-
-    def wait_video_worker_ready(self, timeout: float = 120.0) -> bool:
-        return self._video_worker_ready.wait(timeout=max(timeout, 0.0))
-
-    def stop_video_worker(self) -> None:
-        with self._video_jobs_lock:
-            process = self._video_worker_process
-            task_queue = self._video_worker_task_queue
-        if process is None:
-            return
-        if process.is_alive() and task_queue is not None:
-            task_queue.put(None)
-            process.join(timeout=3.0)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=1.0)
-        with self._video_jobs_lock:
-            self._video_worker_process = None
-            self._video_worker_task_queue = None
-            self._video_worker_progress_queue = None
-            self._video_worker_monitor = None
-            self._video_worker_ready.clear()
 
     def get_video_job_status(self, job_id: str) -> PlateVideoJobStatusResponse | None:
         with self._video_jobs_lock:
@@ -686,82 +554,51 @@ class PlateService:
         separator = "&" if "?" in media_url else "?"
         return f"{media_url}{separator}ts={updated_at}"
 
-    def _monitor_video_worker(self, process, progress_queue) -> None:
+    def _run_video_job(self, job_id: str) -> None:
+        with self._video_jobs_lock:
+            job = self._video_jobs.get(job_id)
+        if job is None:
+            return
+
+        self._update_video_job(
+            job_id,
+            status="processing",
+            progress=0.0,
+            processed_frame_count=0,
+            total_frames=0,
+            error_message=None,
+        )
+
         try:
-            while process.is_alive():
-                try:
-                    message = progress_queue.get(timeout=0.4)
-                except Empty:
-                    continue
-
-                message_type = str(message.get("type", ""))
-                if message_type == "worker_ready":
-                    logger.info("Plate video worker is ready.")
-                    self._video_worker_ready.set()
-                    continue
-
-                job_id = str(message.get("job_id", ""))
-                if not job_id:
-                    continue
-                if message_type == "progress":
-                    detections = [PlateDetection.model_validate(item) for item in message.get("detections", [])]
-                    preview_url = None
-                    with self._video_jobs_lock:
-                        job = self._video_jobs.get(job_id)
-                    if job is None:
-                        continue
-                    if message.get("preview_written"):
-                        preview_url = self.public_media_url_for(job.preview_path)
-                    total_frames = int(message.get("total_frames", 0))
-                    processed_frames = int(message.get("processed_frame_count", 0))
-                    progress = processed_frames / total_frames if total_frames > 0 else 0.0
-                    self._update_video_job(
-                        job_id,
-                        status="processing",
-                        progress=min(max(progress, 0.0), 1.0),
-                        processed_frame_count=processed_frames,
-                        total_frames=total_frames,
-                        detections=detections,
-                        preview_image_url=preview_url,
-                        updated_at=int(message.get("updated_at", int(time.time() * 1000))),
-                    )
-                elif message_type == "completed":
-                    result = PlateVideoRecognitionResponse.model_validate(message["result"])
-                    self._update_video_job(
-                        job_id,
-                        status="completed",
-                        progress=1.0,
-                        processed_frame_count=result.processed_frame_count,
-                        detections=result.detections,
-                        unread_samples=result.unread_samples,
-                        duration_seconds=result.duration_seconds,
-                        processed_video_url=result.processed_video_url,
-                    )
-                elif message_type == "failed":
-                    self._update_video_job(
-                        job_id,
-                        status="failed",
-                        error_message=str(message.get("error_message") or "视频识别子进程异常退出。"),
-                    )
+            result = self._process_video_file(
+                job.source_path,
+                job.output_path,
+                job.source_filename,
+                progress_callback=lambda **payload: self._handle_video_job_progress(job_id, **payload),
+            )
+            self._update_video_job(
+                job_id,
+                status="completed",
+                progress=1.0,
+                processed_frame_count=result.processed_frame_count,
+                detections=result.detections,
+                unread_samples=result.unread_samples,
+                duration_seconds=result.duration_seconds,
+                processed_video_url=result.processed_video_url,
+            )
         except Exception as exc:
-            logger.exception("Video worker monitor failed.")
+            logger.exception("Video job failed: %s", job_id)
+            self._update_video_job(
+                job_id,
+                status="failed",
+                error_message=str(exc),
+            )
         finally:
-            with self._video_jobs_lock:
-                unfinished_ids = [
-                    job_id
-                    for job_id, job in self._video_jobs.items()
-                    if job.status in {"queued", "processing"}
-                ]
-            for job_id in unfinished_ids:
-                self._update_video_job(
-                    job_id,
-                    status="failed",
-                    error_message=f"视频识别工作进程异常退出（exitcode={process.exitcode}）。",
-                )
-            try:
-                progress_queue.close()
-            except Exception:
-                pass
+            if not settings.plate_save_uploads:
+                try:
+                    job.source_path.unlink(missing_ok=True)
+                except Exception:
+                    logger.warning("Failed to remove temporary uploaded video: %s", job.source_path)
 
     def _handle_video_job_progress(
         self,
@@ -983,10 +820,9 @@ class PlateService:
             self._save_history(detections, None)
 
         logger.info(
-            "Video detection stage finished: %s | processed_frames=%d detector_attempts=%d detection_hits=%d unique_plates=%d elapsed=%.1fs",
+            "Video detection stage finished: %s | processed_frames=%d detection_passes=%d unique_plates=%d elapsed=%.1fs",
             filename,
             processed_frame_count,
-            state.detector_attempt_count,
             detection_pass_count,
             len(detections),
             time.monotonic() - started_at,
@@ -1083,7 +919,6 @@ class PlateService:
         ran_recognize = False
         if should_rerecognize:
             ran_recognize = True
-            state.detector_attempt_count += 1
             use_heavy_scan = settings.plate_video_detector_full_frame_fallback and self._should_use_heavy_scan(state)
             raw_working_detections = self._recognize_detections(
                 working_frame,
@@ -1108,12 +943,7 @@ class PlateService:
                 tracks=state.tracks,
             )
             state.last_recognition_frame = state.frame_index
-            # A full recognition pass already scans the frame, so never run a
-            # second detector pass on this exact frame. Keep the independent
-            # probe schedule, though: its masked scan can reveal another plate
-            # beside an already tracked one.
-        if should_probe_tracks and not ran_recognize:
-            state.detector_attempt_count += 1
+        if should_probe_tracks:
             probe_hits = self._find_untracked_detector_hits(
                 working_frame,
                 state.tracks,
@@ -1272,10 +1102,7 @@ class PlateService:
                 return since_last >= max(interval * 3, 6)
             return since_last >= max(interval, 4)
         if not state.tracks:
-            # One full detector scan per second is sufficient for uploaded
-            # video and avoids doubling CPU inference work while no plate is
-            # being tracked. Stream mode keeps its more responsive policy.
-            return since_last >= max(interval, 12)
+            return since_last >= max(interval // 2, 8)
         if any(track.misses > 0 for track in state.tracks):
             return since_last >= max(interval // 2, 8)
         if any(not track.plate_number for track in state.tracks):

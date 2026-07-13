@@ -17,28 +17,11 @@ class YoloDetector:
     def warmup(self) -> None:
         if not self.is_available():
             return
-        import numpy as np
-
-        # Match the real image fast path so the first upload does not pay the
-        # Ultralytics graph/input-shape initialization cost.
-        warmup_image = np.zeros((384, 640, 3), dtype=np.uint8)
-        plate_model = self._load_model()
-        self._predict_with_model(
-            plate_model,
-            warmup_image,
-            conf=settings.plate_yolo_confidence,
-            imgsz=min(settings.plate_yolo_imgsz, 512),
-        )
+        self._load_model()
         detect_vehicle_classes = getattr(self, "detect_vehicle_classes", None)
         if callable(detect_vehicle_classes) and settings.plate_vehicle_detector_fallback_enabled:
             try:
-                vehicle_model = self._load_vehicle_model()
-                self._predict_with_model(
-                    vehicle_model,
-                    warmup_image,
-                    conf=settings.plate_vehicle_yolo_confidence,
-                    imgsz=min(settings.plate_vehicle_yolo_imgsz, 512),
-                )
+                self._load_vehicle_model()
             except Exception:
                 # Vehicle fallback is optional during warmup.
                 pass

@@ -1343,22 +1343,6 @@ def test_should_rerecognize_video_waits_longer_for_unread_tracks():
     assert service._should_rerecognize_video(state) is True
 
 
-def test_should_rerecognize_video_without_tracks_scans_once_per_second():
-    service = PlateService()
-    state = plate_service_module.PlateProcessingState(
-        frame_index=29,
-        last_recognition_frame=0,
-        recognition_interval=30,
-        tracks=[],
-    )
-
-    assert service._should_rerecognize_video(state) is False
-
-    state.frame_index = 30
-
-    assert service._should_rerecognize_video(state) is True
-
-
 def test_should_rerecognize_video_waits_longer_for_large_recognized_track():
     service = PlateService()
     state = plate_service_module.PlateProcessingState(

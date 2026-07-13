@@ -25,12 +25,7 @@ class VehicleTypeClassifier:
     def warmup(self) -> None:
         if not self.is_available():
             return
-        model, _ = self._load_model_bundle()
-        warmup_image = np.zeros(
-            (settings.plate_vehicle_classifier_input_size, settings.plate_vehicle_classifier_input_size, 3),
-            dtype=np.uint8,
-        )
-        self._predict_logits(model, warmup_image)
+        self._load_model_bundle()
 
     def is_available(self) -> bool:
         if not settings.plate_vehicle_classifier_enabled:

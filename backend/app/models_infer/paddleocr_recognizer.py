@@ -13,12 +13,6 @@ from app.core.config import settings
 from app.models_infer.errors import InferenceDependencyError
 
 
-# Paddle initializes its native logger during import, so these switches must
-# be present before importing PaddleOCR/PaddleX.
-os.environ.setdefault("GLOG_minloglevel", "2")
-os.environ.setdefault("FLAGS_logtostderr", "0")
-
-
 PROVINCE_PREFIXES = (
     "\u4eac\u6caa\u6d25\u6e1d\u5180\u664b\u8499\u8fbd\u5409\u9ed1\u82cf\u6d59\u7696"
     "\u95fd\u8d63\u9c81\u8c6b\u9102\u6e58\u7ca4\u6842\u743c\u5ddd\u8d35\u4e91\u85cf"
@@ -58,18 +52,9 @@ class PaddleOCRRecognizer:
             return
 
         def _load() -> None:
-            import numpy as np
-
             self._configure_paddle_runtime()
-            text_recognizer = self._load_text_recognizer()
-            ocr = self._load_ocr()
-            text_recognizer.predict(np.full((64, 256, 3), 255, dtype=np.uint8))
-            ocr.predict(
-                np.full((256, 256, 3), 255, dtype=np.uint8),
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=settings.paddleocr_use_angle_cls,
-            )
+            self._load_text_recognizer()
+            self._load_ocr()
 
         if not silent:
             _load()
@@ -180,8 +165,6 @@ class PaddleOCRRecognizer:
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=settings.paddleocr_use_angle_cls,
-                enable_mkldnn=settings.paddleocr_enable_mkldnn,
-                cpu_threads=max(settings.paddleocr_cpu_threads, 1),
             )
 
         return self._ocr
@@ -196,10 +179,7 @@ class PaddleOCRRecognizer:
             ) from exc
 
         if self._text_recognizer is None:
-            kwargs: dict[str, Any] = {
-                "enable_mkldnn": settings.paddleocr_enable_mkldnn,
-                "cpu_threads": max(settings.paddleocr_cpu_threads, 1),
-            }
+            kwargs: dict[str, Any] = {}
             configured_model_name = settings.paddleocr_text_recognition_model_name.strip()
             if configured_model_name:
                 kwargs["model_name"] = configured_model_name

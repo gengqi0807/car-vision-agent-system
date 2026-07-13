@@ -752,11 +752,7 @@ async function handleImageFileChange(event: Event) {
     await nextTick();
     const { data } = await recognizePlateImageApi(file);
     imageDetections.value = data.detections;
-    isLoading.value = false;
-    void loadHistory().catch(() => {
-      // Recognition has already succeeded; a history refresh failure should
-      // not keep the result view in a loading state.
-    });
+    await loadHistory();
   } catch (error) {
     imageDetections.value = [];
     requestError.value = extractErrorMessage(error, "图片识别失败，请确认后端服务已启动后重试。");
