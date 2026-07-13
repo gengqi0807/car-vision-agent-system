@@ -518,3 +518,6 @@ class PaddleOCRRecognizer:
     def _configure_paddle_runtime(self) -> None:
         os.environ.setdefault("GLOG_minloglevel", "2")
         os.environ.setdefault("FLAGS_logtostderr", "0")
+        os.environ.setdefault("DNNL_VERBOSE", "0")
+        os.environ.setdefault("ONEDNN_VERBOSE", "0")
+        os.environ.setdefault("KMP_WARNINGS", "0")

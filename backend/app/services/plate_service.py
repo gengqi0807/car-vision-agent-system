@@ -721,8 +721,8 @@ class PlateService:
         total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         recognition_interval = self._resolve_video_recognition_interval(fps)
         heavy_scan_interval = max(recognition_interval * 8, 48)
-        progress_log_interval = max(recognition_interval * 2, 30)
-        preview_update_interval = max(recognition_interval * 2, 24)
+        progress_log_interval = max(recognition_interval * 3, 45)
+        preview_update_interval = max(recognition_interval * 3, 48)
         summary_merge_interval = 3
         state = PlateProcessingState(
             recognition_interval=recognition_interval,
@@ -2467,6 +2467,11 @@ class PlateService:
         )
         if self._should_default_small_plate_to_car(detection.bbox, video_mode=video_mode):
             vehicle_type = self._pick_better_vehicle_type(vehicle_type, VEHICLE_TYPE_CAR)
+        elif (
+            self._should_prefer_car_vehicle_type_for_bbox(detection.bbox, video_mode=video_mode)
+            and vehicle_type in {VEHICLE_TYPE_BUS, VEHICLE_TYPE_TRUCK}
+        ):
+            vehicle_type = VEHICLE_TYPE_CAR
 
         refined_vehicle_type = self._classify_vehicle_type_with_classifier(
             image,
@@ -2476,6 +2481,11 @@ class PlateService:
             video_mode=video_mode,
         )
         if refined_vehicle_type != VEHICLE_TYPE_UNKNOWN:
+            if (
+                self._should_prefer_car_vehicle_type_for_bbox(detection.bbox, video_mode=video_mode)
+                and refined_vehicle_type in {VEHICLE_TYPE_BUS, VEHICLE_TYPE_TRUCK}
+            ):
+                return VEHICLE_TYPE_CAR
             return refined_vehicle_type
         return vehicle_type
 
@@ -2680,11 +2690,27 @@ class PlateService:
         area = width * height
         return width <= 80 and height <= 26 and 180 <= area <= 1700
 
+    def _should_prefer_car_vehicle_type_for_bbox(self, bbox: list[int], *, video_mode: bool) -> bool:
+        if len(bbox) != 4:
+            return False
+        _, _, width, height = bbox
+        area = width * height
+        if video_mode:
+            return width <= 132 and height <= 36 and 220 <= area <= 3600
+        return width <= 110 and height <= 32 and 220 <= area <= 3000
+
     def _fallback_vehicle_type_for_bbox(self, vehicle_type: str, bbox: list[int], *, video_mode: bool) -> str:
         normalized = self._normalize_vehicle_type_from_label(vehicle_type)
         if normalized != VEHICLE_TYPE_UNKNOWN:
+            if (
+                self._should_prefer_car_vehicle_type_for_bbox(bbox, video_mode=video_mode)
+                and normalized in {VEHICLE_TYPE_BUS, VEHICLE_TYPE_TRUCK}
+            ):
+                return VEHICLE_TYPE_CAR
             return normalized
         if self._should_default_small_plate_to_car(bbox, video_mode=video_mode):
+            return VEHICLE_TYPE_CAR
+        if self._should_prefer_car_vehicle_type_for_bbox(bbox, video_mode=video_mode):
             return VEHICLE_TYPE_CAR
         if video_mode and len(bbox) == 4:
             _, _, width, height = bbox
@@ -2873,6 +2899,7 @@ class PlateService:
             confidence=min(1.0, result.confidence * 0.82 + float(hit["confidence"]) * 0.18),
             bbox=list(crop_bbox),
         )
+
     def _is_reasonable_crop_bbox(self, bbox: list[int]) -> bool:
         if len(bbox) != 4:
             return False
@@ -4129,11 +4156,25 @@ class PlateService:
             if stats.fresh_count >= 1 and stats.display_count >= 5 and confidence >= 0.44:
                 accepted.append(stats.detection)
                 continue
+            if stats.fresh_count >= 1 and stats.display_count >= 3 and confidence >= 0.52:
+                fallback.append(stats.detection)
+                continue
             if stats.fresh_count >= 1 and confidence >= 0.66:
                 fallback.append(stats.detection)
 
         if not accepted:
             accepted = fallback[:5]
+        elif fallback:
+            accepted_numbers = {item.plate_number for item in accepted if item.plate_number}
+            supplement_limit = min(2, max(len(ranked_stats) - len(accepted), 0))
+            for item in fallback:
+                if supplement_limit <= 0:
+                    break
+                if not item.plate_number or item.plate_number in accepted_numbers:
+                    continue
+                accepted.append(item)
+                accepted_numbers.add(item.plate_number)
+                supplement_limit -= 1
         accepted = [self._stabilize_video_detection_color(item) for item in accepted]
         accepted = [
             item.model_copy(
