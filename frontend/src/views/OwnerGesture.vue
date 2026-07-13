@@ -2,7 +2,7 @@
   <section class="page-shell">
     <header class="page-header">
       <h1>手势控车</h1>
-      <p>支持单张图片与实时视频输入；图片模式仅识别静态手势，实时模式显示后端连续返回的标注画面</p>
+      <p>支持单张图片与实时视频输入；实时模式连续显示后端关键点与中文标注画面</p>
     </header>
 
     <section class="two-col">
@@ -39,25 +39,6 @@
             >
               停止识别
             </button>
-            <select
-              v-if="videoDevices.length > 1"
-              v-model="selectedDeviceId"
-              class="device-select"
-              :disabled="cameraActive"
-            >
-              <option v-for="device in videoDevices" :key="device.deviceId" :value="device.deviceId">
-                {{ device.label }}
-              </option>
-            </select>
-            <button
-              v-if="videoDevices.length > 1"
-              class="device-refresh"
-              type="button"
-              :disabled="cameraActive"
-              @click="refreshVideoDevices"
-            >
-              刷新设备
-            </button>
           </template>
 
           <template v-else>
@@ -90,27 +71,18 @@
 
         <div class="preview-canvas-wrap">
           <div v-if="inputMode === 'camera'" class="preview-stage">
-            <img
+            <iframe
               v-if="cameraActive && cameraDisplayUrl"
-              class="preview-image"
+              class="preview-image stream-player"
               :src="cameraDisplayUrl"
-              alt="手势实时识别标注画面"
+              title="手势实时识别标注画面"
+              allow="autoplay; fullscreen"
+              allowfullscreen
             />
-            <div
-              v-else-if="cameraActive"
-              class="image-placeholder gesture-frame"
-            >
-              后端正在返回标注画面
-              <div class="small">当前识别仍在进行，稍后会显示后端模型标注结果</div>
+            <div v-else-if="cameraActive" class="image-placeholder gesture-frame">
+              后端正在生成标注画面
+              <div class="small">识别结果返回后将显示关键点、手势与功能</div>
             </div>
-            <video
-              ref="videoRef"
-              class="capture-video"
-              autoplay
-              muted
-              playsinline
-              aria-hidden="true"
-            />
           </div>
           <div v-else-if="sourcePreviewUrl" class="preview-stage image-preview-stage">
             <img
@@ -333,6 +305,9 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 
 import {
   fetchOwnerGestureApi,
+  fetchOwnerGestureStreamResultApi,
+  startOwnerGestureStreamApi,
+  stopOwnerGestureStreamApi,
   type OwnerControlPanelState,
   type OwnerGestureFrameResult,
 } from "@/api/owner_gesture";
@@ -346,6 +321,7 @@ const videoRef = ref<HTMLVideoElement | null>(null);
 const captureCanvasRef = ref<HTMLCanvasElement | null>(null);
 const panelState = ref<OwnerControlPanelState>(createDefaultPanelState());
 const cameraActive = ref(false);
+const streamVideoUrl = ref("");
 const sessionId = ref("");
 const cameraDeviceLabel = ref("");
 const videoDevices = ref<Array<{ deviceId: string; label: string }>>([]);
@@ -353,17 +329,18 @@ const selectedDeviceId = ref("");
 const sourcePreviewUrl = ref("");
 const uiNow = ref(Date.now());
 
-const baseFrameIntervalMs = 16;
+const baseFrameIntervalMs = 8;
 const previewIdealWidth = 960;
 const previewIdealHeight = 720;
-const captureMaxWidth = 640;
-const captureMaxHeight = 480;
-const captureJpegQuality = 0.82;
+const captureMaxWidth = 960;
+const captureMaxHeight = 720;
+const captureJpegQuality = 0.88;
 let mediaStream: MediaStream | null = null;
 let activeSourceVideo: HTMLVideoElement | null = null;
 let captureTimer: number | null = null;
 let requestInFlight = false;
 let uiClockTimer: number | null = null;
+let streamResultTimer: number | null = null;
 let lastInferenceDurationMs = 120;
 
 const LABEL_MAP: Record<string, string> = {
@@ -375,8 +352,8 @@ const LABEL_MAP: Record<string, string> = {
   index_circle: "待机",
   circle_cw: "顺时针画圈",
   circle_ccw: "逆时针画圈",
-  swipe_left: "向左滑动",
-  swipe_right: "向右滑动",
+  swipe_left: "张开拳头",
+  swipe_right: "收回拳头",
   thumbs_up: "拇指向上",
   thumb_up: "拇指向上",
   thumbs_down: "拇指向下",
@@ -394,10 +371,10 @@ const GESTURE_ACTION_MAP: Record<string, string> = {
   point: "待机",
   pointing: "待机",
   index_circle: "待机",
-  circle_cw: "音量-",
-  circle_ccw: "音量+",
-  swipe_left: "切换",
-  swipe_right: "切换",
+  circle_cw: "音量+",
+  circle_ccw: "音量-",
+  swipe_left: "上一个功能",
+  swipe_right: "下一个功能",
   thumbs_up: "接听",
   thumb_up: "接听",
   thumbs_down: "挂断",
@@ -484,7 +461,7 @@ const recognitionConfidence = computed(() => `${((result.value?.confidence ?? 0)
 
 const cameraDisplayUrl = computed(() => {
   if (inputMode.value !== "camera") return "";
-  return result.value?.annotated_image || "";
+  return streamVideoUrl.value;
 });
 
 const imageDisplayUrl = computed(() => result.value?.annotated_image || sourcePreviewUrl.value || "");
@@ -530,20 +507,20 @@ const modeSummary = computed(() => {
 
 const mediaStatusText = computed(() => {
   return panelState.value.media_playing
-    ? "顺时针画圈降低音量，逆时针画圈升高音量，握拳可确认当前播放状态。"
+    ? "顺时针画圈升高音量，逆时针画圈降低音量，握拳可确认当前播放状态。"
     : "媒体已暂停，握拳后会恢复播放。";
 });
 
 const comfortStatusText = computed(() => {
   return panelState.value.comfort_scene === "舒享"
     ? "握拳后已执行舒享模式，温控与座椅同步强化。"
-    : "左右滑动切换到此页后，可通过握拳执行舒适场景。";
+    : "张开拳头或收回拳头切换到此页后，可通过握拳执行舒适场景。";
 });
 
 const vehicleStatusText = computed(() => {
   return panelState.value.vehicle_status === "已完成整车检查"
     ? "整车检查已执行完成，关键车况正常。"
-    : "可通过左右滑动切换到车辆页，再用握拳执行车况确认。";
+    : "可通过张开拳头或收回拳头切换到车辆页，再用握拳执行车况确认。";
 });
 
 const callStatusText = computed(() => {
@@ -583,7 +560,7 @@ const cameraStatusText = computed(() => {
 
 const inputStatusText = computed(() => {
   if (inputMode.value === "camera") {
-    return cameraActive.value ? "实时模式：显示后端标注画面并同步返回识别结果" : "摄像头未开启";
+    return cameraActive.value ? "实时模式：显示后端关键点与中文标注画面" : "摄像头未开启";
   }
   return sourcePreviewUrl.value ? "图片模式：仅识别静态手势，显示后端返回的标注结果" : "图片模式：等待上传";
 });
@@ -730,38 +707,25 @@ async function startCamera() {
   panelState.value = createDefaultPanelState();
 
   try {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      throw new Error("当前浏览器不支持摄像头调用");
-    }
-
-    await refreshVideoDevices();
-    const streamBinding = await requestPreferredStream();
-    mediaStream = streamBinding.stream;
-    cameraDeviceLabel.value = streamBinding.deviceLabel || "默认摄像头";
-
-    if (!mediaStream || !videoRef.value) {
-      throw new Error("摄像头初始化失败");
-    }
-    const track = mediaStream.getVideoTracks()[0];
-    await refreshVideoDevices();
-    if (!selectedDeviceId.value) {
-      selectedDeviceId.value = track?.getSettings().deviceId || pickBestVideoDeviceId(videoDevices.value);
-    }
-    bindTrackEvents(track);
-    videoRef.value.srcObject = mediaStream;
-    activeSourceVideo = videoRef.value;
+    await stopOwnerGestureStreamApi().catch(() => undefined);
+    const { data } = await startOwnerGestureStreamApi("0", 15);
+    if (!data.playback_url) throw new Error("后端未返回 MediaMTX 播放地址");
+    streamVideoUrl.value = `${data.playback_url}?t=${Date.now()}`;
+    cameraDeviceLabel.value = "后端摄像头 0";
     cameraActive.value = true;
-    await nextTick();
-    await videoRef.value.play();
-    await ensureVideoFrame(videoRef.value);
-    startCaptureLoop();
+    startStreamResultPolling();
   } catch (err: any) {
     stopCamera();
-    error.value = normalizeCameraError(err);
+    error.value = axios.isAxiosError(err)
+      ? String(err.response?.data?.detail || err.message || "后端摄像头启动失败")
+      : err?.message || "后端摄像头启动失败";
   }
 }
 
 function stopCamera() {
+  void stopOwnerGestureStreamApi().catch(() => undefined);
+  stopStreamResultPolling();
+  streamVideoUrl.value = "";
   stopCaptureLoop();
   loading.value = false;
   requestInFlight = false;
@@ -781,6 +745,31 @@ function stopCamera() {
     mediaStream = null;
   }
   cameraDeviceLabel.value = "";
+}
+
+function startStreamResultPolling() {
+  stopStreamResultPolling();
+  const poll = async () => {
+    if (!cameraActive.value) return;
+    try {
+      const { data } = await fetchOwnerGestureStreamResultApi();
+      result.value = data;
+      if (data.panel_state) panelState.value = data.panel_state;
+      error.value = "";
+    } catch {
+      if (cameraActive.value) error.value = "无法获取后端手势识别结果";
+    } finally {
+      if (cameraActive.value) streamResultTimer = window.setTimeout(poll, 200);
+    }
+  };
+  void poll();
+}
+
+function stopStreamResultPolling() {
+  if (streamResultTimer !== null) {
+    window.clearTimeout(streamResultTimer);
+    streamResultTimer = null;
+  }
 }
 
 function bindTrackEvents(track?: MediaStreamTrack) {
@@ -1277,7 +1266,6 @@ function handleViewportResize() {
 }
 
 onMounted(() => {
-  void refreshVideoDevices();
   window.addEventListener("resize", handleViewportResize);
   uiClockTimer = window.setInterval(() => {
     uiNow.value = Date.now();
@@ -1366,7 +1354,7 @@ onBeforeUnmount(() => {
 
 .preview-canvas-wrap {
   position: relative;
-  min-height: 292px;
+  min-height: 0;
 }
 
 .preview-stage {
@@ -1384,8 +1372,14 @@ onBeforeUnmount(() => {
 }
 
 .gesture-frame {
-  height: 272px;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 4 / 3;
   margin-top: 0;
+}
+
+.stream-player {
+  border: 0;
 }
 
 .preview-video,

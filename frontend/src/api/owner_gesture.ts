@@ -42,8 +42,21 @@ export interface OwnerGestureStreamResult {
   keypoints: OwnerGestureKeypoint[];
   annotated_image: string | null;
   hand_count: number;
+  control_command: string | null;
+  triggered: boolean;
   panel_state: OwnerControlPanelState | null;
   updated_at: string;
+}
+
+export interface OwnerGestureStreamState {
+  running: boolean;
+  source: string;
+  fps: number;
+  published: boolean;
+  publish_rtsp_url: string | null;
+  playback_url: string | null;
+  last_error: string | null;
+  started_at: string | null;
 }
 
 export const fetchOwnerGestureApi = (formData: FormData) =>
@@ -53,3 +66,16 @@ export const fetchOwnerGestureApi = (formData: FormData) =>
   });
 
 export const fetchOwnerPanelApi = () => request.get<OwnerControlPanelState>("/owner-gesture/panel");
+
+export const startOwnerGestureStreamApi = (source = "0", fps = 15) =>
+  request.post<OwnerGestureStreamState>("/owner-gesture/stream/start", { command: "start", source, fps });
+
+export const stopOwnerGestureStreamApi = () => request.post("/owner-gesture/stream/stop");
+
+export const fetchOwnerGestureStreamResultApi = () =>
+  request.get<OwnerGestureStreamResult>("/owner-gesture/current");
+
+export const ownerGestureVideoFeedUrl = () => {
+  const base = String(request.defaults.baseURL || "").replace(/\/$/, "");
+  return `${base}/owner-gesture/video-feed`;
+};

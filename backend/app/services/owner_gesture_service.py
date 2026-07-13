@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 import logging
 import math
 from pathlib import Path
+import socket
+import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -33,7 +35,7 @@ from app.services.alert_service import AlertService
 from app.services.monitor_service import MonitorService
 
 try:
-    from police.visualization import draw_chinese_text
+    from police.visualization import draw_chinese_text_lines
 except ModuleNotFoundError:
     import sys
 
@@ -41,7 +43,7 @@ except ModuleNotFoundError:
     project_root_str = str(project_root)
     if project_root_str not in sys.path:
         sys.path.insert(0, project_root_str)
-    from police.visualization import draw_chinese_text
+    from police.visualization import draw_chinese_text_lines
 
 if TYPE_CHECKING:
     from app.models_infer.gesture_classifier import GestureClassifier
@@ -63,8 +65,8 @@ GESTURE_ACTION_MAP: dict[str, str] = {
     "palm": "wake",
     "fist": "confirm",
     "index_circle": "idle",
-    "circle_cw": "volume_down",
-    "circle_ccw": "volume_up",
+    "circle_cw": "volume_up",
+    "circle_ccw": "volume_down",
     "swipe_left": "prev_func",
     "swipe_right": "next_func",
     "thumbs_up": "call_answer",
@@ -88,8 +90,8 @@ GESTURE_DISPLAY_MAP: dict[str, str] = {
     "index_circle": "单指画圈",
     "circle_cw": "顺时针画圈",
     "circle_ccw": "逆时针画圈",
-    "swipe_left": "向左滑动",
-    "swipe_right": "向右滑动",
+    "swipe_left": "张开拳头",
+    "swipe_right": "收回拳头",
     "thumbs_up": "拇指向上",
     "thumb_up": "拇指向上",
     "thumbs_down": "拇指向下",
@@ -136,8 +138,8 @@ GESTURE_LOG_LABEL_MAP: dict[str, str] = {
     "index_circle": "画圈",
     "circle_cw": "顺时针画圈",
     "circle_ccw": "逆时针画圈",
-    "swipe_left": "向左挥动",
-    "swipe_right": "向右挥动",
+    "swipe_left": "张开拳头",
+    "swipe_right": "收回拳头",
     "thumbs_up": "竖起大拇指",
     "thumb_up": "竖起大拇指",
     "thumbs_down": "倒拇指",
@@ -177,6 +179,12 @@ class RuntimeGestureSession:
     panel_state: ControlPanelState
     recent_records: list[RuntimeGestureRecord] = field(default_factory=list)
     inactivity_started_at: datetime | None = None
+    no_hand_count: int = 0
+    hand_gone_confirmed: bool = False
+    result_locked: bool = False
+    locked_gesture: str | None = None
+    locked_confidence: float = 0.0
+    last_fired_action: str | None = None
 
 
 class OwnerGestureService:
@@ -205,7 +213,9 @@ class OwnerGestureService:
 
     def __init__(self) -> None:
         self._stream_lock = threading.Lock()
+        self._frame_condition = threading.Condition()
         self._stream_thread: threading.Thread | None = None
+        self._mediamtx_process: subprocess.Popen[bytes] | None = None
         self._stream_running = False
         self._stream_source = ""
         self._stream_loop: asyncio.AbstractEventLoop | None = None
@@ -214,6 +224,8 @@ class OwnerGestureService:
         self._alert_callbacks: list[Any] = []
         self._runtime_sessions: dict[tuple[int, str], RuntimeGestureSession] = {}
         self._latest_stream_result: OwnerGestureResult | None = None
+        self._latest_stream_jpeg: bytes | None = None
+        self._stream_runtime_session: RuntimeGestureSession | None = None
         self._stream_state = StreamState(running=False)
         self._live_panel_state = ControlPanelState(
             **self._default_panel_state,
@@ -311,10 +323,17 @@ class OwnerGestureService:
             frame = self._prepare_frame_for_inference(frame)
         logger.info("Processing owner gesture frame '%s' (%dx%d)", filename, frame.shape[1], frame.shape[0])
 
+        verify_draw_result = None
+        verify_gesture_label = None
         if input_mode == "camera":
-            hands = self._infer_camera_hands(frame)
-            raw_kps = [point for hand in hands for point in hand]
-            num_hands = len(hands)
+            verify_process_frame, verify_draw_result, verify_gesture_label, _ = self._verify_owner_runtime()
+            raw_gesture_label, _, cls_conf, num_hands, detected_hand = verify_process_frame(
+                frame,
+                self.stream_classifier,
+            )
+            primary_hand = detected_hand or []
+            hands = [primary_hand] if primary_hand else []
+            raw_kps = list(primary_hand)
         else:
             infer_result = self.hands.infer(original_frame)
             raw_kps = infer_result["keypoints"]
@@ -333,14 +352,19 @@ class OwnerGestureService:
             primary_hand = hands[0] if hands else []
             image_gesture = None
             image_confidence = None
-        else:
+        elif input_mode != "camera":
             primary_hand, image_gesture, image_confidence = self._select_primary_hand(
                 hands,
                 input_mode=input_mode,
             )
 
         if input_mode == "camera":
-            raw_gesture_label, cls_conf = self.stream_classifier.classify_frame(primary_hand if primary_hand else None)
+            raw_gesture_label, cls_conf = self._lock_camera_result(
+                runtime_session,
+                gesture=raw_gesture_label,
+                confidence=cls_conf,
+                hand_present=bool(primary_hand),
+            )
         elif image_gesture is not None and image_confidence is not None:
             raw_gesture_label, cls_conf = image_gesture, image_confidence
         else:
@@ -354,21 +378,40 @@ class OwnerGestureService:
         control_command, _ = self._map_gesture_to_command(raw_gesture_label)
         action = GESTURE_ACTION_MAP.get(raw_gesture_label, "idle")
         gesture_label = self._normalize_public_gesture(raw_gesture_label)
-        triggered = self._should_trigger(
-            gesture=gesture_label,
-            control_command=control_command,
-            recent_records=recent_records,
-            input_mode=input_mode,
-        )
+        if input_mode == "camera" and runtime_session is not None:
+            triggered = self._should_fire_verified_camera_action(
+                runtime_session,
+                action=action,
+                control_command=control_command,
+            )
+        else:
+            triggered = self._should_trigger(
+                gesture=gesture_label,
+                control_command=control_command,
+                recent_records=recent_records,
+                input_mode=input_mode,
+            )
         processing_time_ms = int((perf_counter() - started_at) * 1000)
-        display_hands = [primary_hand] if primary_hand else hands
-        annotated_image = self._build_annotated_image(
-            original_frame if input_mode == "image" else frame,
-            hands=display_hands,
-            gesture=gesture_label,
-            confidence=cls_conf,
-            control_command=control_command if triggered else None,
-        )
+        if input_mode == "camera" and verify_draw_result is not None and verify_gesture_label is not None:
+            annotated_frame = verify_draw_result(
+                original_frame.copy(),
+                raw_gesture_label,
+                verify_gesture_label(raw_gesture_label),
+                cls_conf,
+                num_hands,
+                primary_hand,
+            )
+            self._draw_verified_locked_marker(annotated_frame, runtime_session)
+            annotated_image = self._encode_frame_to_data_url(annotated_frame)
+        else:
+            display_hands = [primary_hand] if primary_hand else hands
+            annotated_image = self._build_annotated_image(
+                original_frame,
+                hands=display_hands,
+                gesture=gesture_label,
+                confidence=cls_conf,
+                action=action,
+            )
 
         response_keypoints_source = primary_hand if primary_hand else raw_kps
         keypoints = [
@@ -469,6 +512,7 @@ class OwnerGestureService:
         )
 
     def start(self, source: str, fps: int = 15) -> StreamState:
+        self._ensure_mediamtx_running()
         with self._stream_lock:
             if self._stream_running:
                 return self._stream_state
@@ -477,6 +521,8 @@ class OwnerGestureService:
             self._stream_running = True
             self._stream_source = source
             self._latest_stream_result = None
+            self._latest_stream_jpeg = None
+            self._stream_runtime_session = RuntimeGestureSession(panel_state=self._live_panel_state)
             self._live_panel_state = ControlPanelState(
                 **self._default_panel_state,
                 last_gesture=None,
@@ -496,6 +542,9 @@ class OwnerGestureService:
                 running=True,
                 source=source,
                 fps=fps,
+                published=False,
+                publish_rtsp_url=self._owner_stream_publish_url(),
+                playback_url=self._owner_stream_playback_url(),
                 started_at=datetime.now(timezone.utc),
             )
             return self._stream_state
@@ -509,7 +558,27 @@ class OwnerGestureService:
 
         with self._stream_lock:
             self._stream_state = StreamState(running=False)
+            with self._frame_condition:
+                self._frame_condition.notify_all()
             return self._stream_state
+
+    def mjpeg_frames(self):
+        last_frame: bytes | None = None
+        while True:
+            with self._frame_condition:
+                self._frame_condition.wait_for(
+                    lambda: self._latest_stream_jpeg is not None
+                    and self._latest_stream_jpeg is not last_frame
+                    or not self._stream_running,
+                    timeout=1.0,
+                )
+                frame = self._latest_stream_jpeg
+                running = self._stream_running
+            if frame is not None and frame is not last_frame:
+                last_frame = frame
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            if not running and frame is last_frame:
+                break
 
     def current_stream_result(self) -> OwnerGestureResult:
         with self._stream_lock:
@@ -522,6 +591,8 @@ class OwnerGestureService:
                 keypoints=[],
                 annotated_image=None,
                 hand_count=0,
+                control_command=None,
+                triggered=False,
                 panel_state=self._live_panel_state,
                 updated_at=datetime.now(timezone.utc),
             )
@@ -539,8 +610,10 @@ class OwnerGestureService:
         return self._build_panel_state(db, user_id=user_id, session_id=session_id)
 
     def _configure_stream_runtime(self) -> None:
+        from app.models_infer.gesture_classifier import GestureClassifier
         from app.models_infer.mediapipe_hands import MediaPipeHands
 
+        MediaPipeHands.reset()
         MediaPipeHands.configure(
             settings.resolved_hand_model_path,
             num_hands=settings.num_hands,
@@ -548,7 +621,7 @@ class OwnerGestureService:
             min_presence_confidence=settings.min_hand_presence_confidence,
             min_tracking_confidence=settings.min_hand_tracking_confidence,
         )
-        _ = self.stream_classifier
+        self._stream_classifier = GestureClassifier(domain="owner")
 
     def _infer_camera_hands(self, frame: np.ndarray) -> list[list[dict]]:
         if not self._camera_runtime_ready:
@@ -559,6 +632,7 @@ class OwnerGestureService:
 
     def _stream_loop_worker(self, source: str, fps: int) -> None:
         from app.models_infer.mediapipe_hands import MediaPipeHands
+        verify_process_frame, verify_draw_result, verify_gesture_label, _ = self._verify_owner_runtime()
 
         capture = cv2.VideoCapture(self._resolve_stream_source(source))
         if not capture.isOpened():
@@ -568,7 +642,10 @@ class OwnerGestureService:
                 self._stream_state = StreamState(running=False)
             return
 
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         frame_interval = 1.0 / max(fps, 1)
+        ffmpeg_process: subprocess.Popen[bytes] | None = None
 
         try:
             while True:
@@ -583,10 +660,16 @@ class OwnerGestureService:
                     continue
 
                 try:
-                    prepared = self._prepare_frame_for_inference(frame_bgr)
-                    hands = MediaPipeHands.infer_video(prepared)
-                    primary_hand, _, _ = self._select_primary_hand(hands, input_mode="camera")
-                    raw_gesture, confidence = self.stream_classifier.classify_frame(primary_hand if primary_hand else None)
+                    raw_gesture, _, confidence, hand_count, primary_hand = verify_process_frame(
+                        frame_bgr,
+                        self.stream_classifier,
+                    )
+                    raw_gesture, confidence = self._lock_camera_result(
+                        self._stream_runtime_session,
+                        gesture=raw_gesture,
+                        confidence=confidence,
+                        hand_present=bool(primary_hand),
+                    )
                     control_command, _ = self._map_gesture_to_command(raw_gesture)
                     action = GESTURE_ACTION_MAP.get(raw_gesture, "idle")
                     gesture = self._normalize_public_gesture(raw_gesture)
@@ -596,33 +679,62 @@ class OwnerGestureService:
                         else []
                     )
 
+                    should_fire = self._should_fire_verified_camera_action(
+                        self._stream_runtime_session,
+                        action=action,
+                        control_command=control_command,
+                    )
+
                     panel_state = self._update_live_panel_state(
                         gesture=gesture,
-                        control_command=control_command,
+                        control_command=control_command if should_fire else None,
                         updated_at=datetime.now(timezone.utc),
                     )
-                    annotated_image = self._build_annotated_image(
-                        prepared,
-                        hands=[primary_hand] if primary_hand else hands,
-                        gesture=gesture,
-                        confidence=confidence,
-                        control_command=control_command if action != "idle" else None,
+                    annotated_frame = verify_draw_result(
+                        frame_bgr.copy(),
+                        raw_gesture,
+                        verify_gesture_label(raw_gesture),
+                        confidence,
+                        hand_count,
+                        primary_hand,
                     )
+                    self._draw_verified_locked_marker(annotated_frame, self._stream_runtime_session)
+                    jpeg = self._encode_frame_to_jpeg(annotated_frame)
+                    if ffmpeg_process is None:
+                        height, width = annotated_frame.shape[:2]
+                        ffmpeg_process = self._start_owner_stream_publisher(
+                            width=width,
+                            height=height,
+                            fps=fps,
+                        )
+                    if ffmpeg_process.poll() is not None:
+                        raise RuntimeError("手势标注流 FFmpeg 推流进程意外退出。")
+                    assert ffmpeg_process.stdin is not None
+                    ffmpeg_process.stdin.write(annotated_frame.tobytes())
+                    ffmpeg_process.stdin.flush()
                     result = OwnerGestureResult(
                         gesture=gesture,
                         action=action,
                         confidence=round(confidence, 4),
                         keypoints=keypoints,
-                        annotated_image=annotated_image,
-                        hand_count=len(hands),
+                        annotated_image=None,
+                        hand_count=hand_count,
+                        control_command=control_command if should_fire else None,
+                        triggered=should_fire,
                         panel_state=panel_state,
                         updated_at=datetime.now(timezone.utc),
                     )
 
                     with self._stream_lock:
                         self._latest_stream_result = result
+                        if not self._stream_state.published:
+                            self._stream_state = self._stream_state.model_copy(update={"published": True})
+                    if jpeg:
+                        with self._frame_condition:
+                            self._latest_stream_jpeg = jpeg
+                            self._frame_condition.notify_all()
 
-                    if action != "idle":
+                    if should_fire:
                         for callback in self._control_callbacks:
                             try:
                                 callback(action)
@@ -635,19 +747,24 @@ class OwnerGestureService:
                                 logger.debug("Owner gesture alert callback failed", exc_info=True)
 
                     self._emit_ws_payload(result.model_dump(mode="json"))
-                except Exception:
+                except Exception as exc:
                     logger.debug("Owner gesture stream frame processing failed", exc_info=True)
+                    with self._stream_lock:
+                        self._stream_state = self._stream_state.model_copy(update={"last_error": str(exc)})
 
                 elapsed = time.time() - tick_started
                 sleep_time = frame_interval - elapsed
                 if sleep_time > 0:
                     time.sleep(sleep_time)
         finally:
+            self._shutdown_owner_stream_publisher(ffmpeg_process)
             capture.release()
             MediaPipeHands.reset()
             with self._stream_lock:
                 self._stream_running = False
-                self._stream_state = StreamState(running=False)
+                self._stream_state = self._stream_state.model_copy(update={"running": False, "published": False})
+            with self._frame_condition:
+                self._frame_condition.notify_all()
 
     def _emit_ws_payload(self, payload: dict[str, Any]) -> None:
         for callback, loop in list(self._ws_callbacks):
@@ -663,6 +780,126 @@ class OwnerGestureService:
         if stripped.isdigit():
             return int(stripped)
         return stripped
+
+    def _ensure_mediamtx_running(self) -> None:
+        if self._is_tcp_port_open("127.0.0.1", 8554):
+            return
+
+        executable = Path(settings.owner_gesture_mediamtx_bin)
+        if not executable.is_file():
+            raise RuntimeError(f"找不到 MediaMTX：{executable}")
+
+        config_path = executable.with_name("mediamtx.yml")
+        command = [str(executable)]
+        if config_path.is_file():
+            command.append(str(config_path))
+
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self._mediamtx_process = subprocess.Popen(
+            command,
+            cwd=str(executable.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if self._is_tcp_port_open("127.0.0.1", 8554):
+                logger.info("MediaMTX started from %s", executable)
+                return
+            if self._mediamtx_process.poll() is not None:
+                break
+            time.sleep(0.1)
+        raise RuntimeError("MediaMTX 启动失败，RTSP 端口 8554 未就绪。")
+
+    def _is_tcp_port_open(self, host: str, port: int) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=0.25):
+                return True
+        except OSError:
+            return False
+
+    def _start_owner_stream_publisher(
+        self,
+        *,
+        width: int,
+        height: int,
+        fps: int,
+    ) -> subprocess.Popen[bytes]:
+        command = [
+            settings.owner_gesture_ffmpeg_bin,
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(fps),
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-g",
+            str(fps),
+            "-keyint_min",
+            str(fps),
+            "-sc_threshold",
+            "0",
+            "-bf",
+            "0",
+            "-b:v",
+            settings.owner_gesture_push_bitrate,
+            "-rtsp_transport",
+            "tcp",
+            "-f",
+            "rtsp",
+            self._owner_stream_publish_url(),
+        ]
+        try:
+            return subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"找不到 FFmpeg：{settings.owner_gesture_ffmpeg_bin}") from exc
+
+    def _shutdown_owner_stream_publisher(self, process: subprocess.Popen[bytes] | None) -> None:
+        if process is None:
+            return
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+            process.wait(timeout=3)
+        except Exception:
+            process.kill()
+
+    def _owner_stream_publish_url(self) -> str:
+        return (
+            f"{settings.owner_gesture_rtsp_base_url.rstrip('/')}"
+            f"/{settings.owner_gesture_stream_name.strip('/')}"
+        )
+
+    def _owner_stream_playback_url(self) -> str:
+        return (
+            f"{settings.owner_gesture_playback_base_url.rstrip('/')}"
+            f"/{settings.owner_gesture_stream_name.strip('/')}"
+        )
 
     def _update_live_panel_state(
         self,
@@ -695,8 +932,8 @@ class OwnerGestureService:
             "open_palm": ("WakeSystem", True),
             "palm": ("WakeSystem", True),
             "fist": ("ConfirmAction", True),
-            "circle_cw": ("AdjustVolumeDown", True),
-            "circle_ccw": ("AdjustVolumeUp", True),
+            "circle_cw": ("AdjustVolumeUp", True),
+            "circle_ccw": ("AdjustVolumeDown", True),
             "swipe_left": ("SwitchPrevFeature", True),
             "swipe_right": ("SwitchNextFeature", True),
             "thumbs_up": ("AnswerCall", True),
@@ -1047,27 +1284,99 @@ class OwnerGestureService:
         return gesture_label, cls_result["confidence"]
 
     def _normalize_public_gesture(self, gesture: str) -> str:
-        if gesture == "circle_cw":
-            return "circle_ccw"
-        if gesture == "circle_ccw":
-            return "circle_cw"
         if gesture in {"point", "pointing", "index_circle"}:
             return "idle"
         return gesture
 
-    def _build_annotated_image(
+    def _lock_camera_result(
+        self,
+        session: RuntimeGestureSession | None,
+        *,
+        gesture: str,
+        confidence: float,
+        hand_present: bool,
+    ) -> tuple[str, float]:
+        if session is None:
+            return gesture, confidence
+
+        if hand_present:
+            session.no_hand_count = 0
+            if session.hand_gone_confirmed:
+                session.result_locked = False
+                session.locked_gesture = None
+                session.locked_confidence = 0.0
+                session.last_fired_action = None
+                session.hand_gone_confirmed = False
+        else:
+            session.no_hand_count += 1
+            if session.no_hand_count >= 15:
+                session.hand_gone_confirmed = True
+                session.result_locked = False
+                session.locked_gesture = None
+                session.locked_confidence = 0.0
+
+        if hand_present and not session.result_locked:
+            if gesture not in {"unknown", "idle"} and confidence > 0.0:
+                session.result_locked = True
+                session.locked_gesture = gesture
+                session.locked_confidence = confidence
+        elif hand_present and session.result_locked:
+            return session.locked_gesture or gesture, session.locked_confidence
+
+        return gesture, confidence
+
+    def _verify_owner_runtime(self) -> tuple[Any, Any, Any, Any]:
+        import sys
+
+        project_root = Path(__file__).resolve().parents[3]
+        project_root_str = str(project_root)
+        if project_root_str not in sys.path:
+            sys.path.insert(0, project_root_str)
+
+        from verify_owner_gesture import draw_locked_marker, draw_result, gesture_label, process_frame
+
+        return process_frame, draw_result, gesture_label, draw_locked_marker
+
+    def _should_fire_verified_camera_action(
+        self,
+        session: RuntimeGestureSession | None,
+        *,
+        action: str,
+        control_command: str | None,
+    ) -> bool:
+        if session is None or action == "idle" or not control_command:
+            return False
+        if action == session.last_fired_action:
+            return False
+        session.last_fired_action = action
+        return True
+
+    def _draw_verified_locked_marker(
+        self,
+        frame: np.ndarray,
+        session: RuntimeGestureSession | None,
+    ) -> None:
+        if session is None or not session.result_locked:
+            return
+        _, _, _, draw_locked_marker = self._verify_owner_runtime()
+        locked_frame = draw_locked_marker(frame)
+        if locked_frame is not frame:
+            frame[:] = locked_frame
+
+    def _draw_annotated_frame(
         self,
         frame: np.ndarray,
         *,
         hands: list[list[dict]],
         gesture: str,
         confidence: float,
-        control_command: str | None,
-    ) -> str | None:
+        action: str | None = None,
+        control_command: str | None = None,
+    ) -> np.ndarray:
         annotated = frame.copy()
         height, width = annotated.shape[:2]
         longest_edge = max(width, height)
-        header_height = max(96, min(152, int(height * 0.13)))
+        header_height = max(118, min(176, int(height * 0.2)))
         title_font_size = 26 if longest_edge < 900 else 32 if longest_edge < 1400 else 40
         meta_font_size = 20 if longest_edge < 900 else 24 if longest_edge < 1400 else 30
         point_radius = 4 if longest_edge < 900 else 5 if longest_edge < 1400 else 7
@@ -1099,23 +1408,32 @@ class OwnerGestureService:
                 cv2.circle(annotated, point, point_radius, color, -1, cv2.LINE_AA)
 
         gesture_text = GESTURE_DISPLAY_MAP.get(gesture, gesture)
-        annotated = draw_chinese_text(
+        if action is None:
+            action = GESTURE_ACTION_MAP.get(gesture, "idle")
+        action_text = GESTURE_ACTION_DISPLAY_MAP.get(action, action)
+        return draw_chinese_text_lines(
             annotated,
-            f"手势: {gesture_text}",
-            (10, 10),
-            (0, 255, 0),
-            title_font_size,
+            [
+                (f"手势: {gesture_text}", (10, 10), (0, 255, 0), title_font_size),
+                (
+                    f"功能: {action_text}",
+                    (10, max(42, int(header_height * 0.46))),
+                    (0, 215, 255),
+                    meta_font_size,
+                ),
+                (
+                    f"置信度: {confidence:.3f}  |  手部: {len(hands)}",
+                    (10, max(76, int(header_height * 0.7))),
+                    (200, 200, 200),
+                    meta_font_size,
+                ),
+            ],
         )
-        annotated = draw_chinese_text(
-            annotated,
-            f"置信度: {confidence:.3f}  |  手部: {len(hands)}",
-            (10, max(42, int(header_height * 0.46))),
-            (200, 200, 200),
-            meta_font_size,
-        )
-        return self._encode_frame_to_data_url(annotated)
 
-    def _encode_frame_to_data_url(self, frame: np.ndarray) -> str | None:
+    def _build_annotated_image(self, frame: np.ndarray, **kwargs) -> str | None:
+        return self._encode_frame_to_data_url(self._draw_annotated_frame(frame, **kwargs))
+
+    def _encode_frame_to_jpeg(self, frame: np.ndarray) -> bytes | None:
         preview = frame
         height, width = frame.shape[:2]
         longest_edge = max(width, height)
@@ -1126,11 +1444,14 @@ class OwnerGestureService:
                 (max(1, int(width * scale)), max(1, int(height * scale))),
                 interpolation=cv2.INTER_AREA,
             )
+        ok, buffer = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        return buffer.tobytes() if ok else None
 
-        ok, buffer = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
-        if not ok:
+    def _encode_frame_to_data_url(self, frame: np.ndarray) -> str | None:
+        jpeg = self._encode_frame_to_jpeg(frame)
+        if jpeg is None:
             return None
-        encoded = base64.b64encode(buffer.tobytes()).decode("ascii")
+        encoded = base64.b64encode(jpeg).decode("ascii")
         return f"data:image/jpeg;base64,{encoded}"
 
     def _build_panel_state(

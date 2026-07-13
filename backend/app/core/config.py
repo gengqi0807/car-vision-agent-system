@@ -128,6 +128,16 @@ class Settings(BaseSettings):
     plate_push_playback_base_url: str = Field(default="http://127.0.0.1:8889")
     plate_push_fps: int = Field(default=25)
     plate_push_bitrate: str = Field(default="2M")
+    owner_gesture_mediamtx_bin: str = Field(
+        default=r"D:\tool\mediamtx\mediamtx_v1.19.2_windows_amd64\mediamtx.exe"
+    )
+    owner_gesture_ffmpeg_bin: str = Field(
+        default=r"D:\tool\ffmpeg\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe"
+    )
+    owner_gesture_stream_name: str = Field(default="owner-gesture-live")
+    owner_gesture_rtsp_base_url: str = Field(default="rtsp://127.0.0.1:8554")
+    owner_gesture_playback_base_url: str = Field(default="http://127.0.0.1:8889")
+    owner_gesture_push_bitrate: str = Field(default="2M")
 
     models_dir: str = Field(
         default=str(BACKEND_DIR / "models"),

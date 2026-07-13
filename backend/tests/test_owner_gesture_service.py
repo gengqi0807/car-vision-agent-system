@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 
 import cv2
 import numpy as np
+import app.models_infer.gesture_classifier as gesture_classifier_module
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -10,6 +11,22 @@ from app.core.database import Base
 from app.models.owner_gesture_record import OwnerGestureRecord
 from app.models_infer.gesture_classifier import GestureClassifier, HandGestureTracker
 from app.services.owner_gesture_service import OwnerGestureService
+
+
+def test_classify_frame_keeps_static_result_idle_until_one_second(monkeypatch):
+    classifier = GestureClassifier(domain="owner")
+    classifier._classify_dynamic_lstm = lambda _keypoints: None  # type: ignore[method-assign]
+    classifier.tracker = None
+    classifier.classify_static = lambda _keypoints: ("palm", 0.95)  # type: ignore[method-assign]
+    keypoints = [{"x": 0.5, "y": 0.5, "z": 0.0} for _ in range(21)]
+    now = [100.0]
+    monkeypatch.setattr(gesture_classifier_module.time, "time", lambda: now[0])
+
+    assert classifier.classify_frame(keypoints) == ("idle", 0.0)
+    now[0] = 100.99
+    assert classifier.classify_frame(keypoints) == ("idle", 0.0)
+    now[0] = 101.0
+    assert classifier.classify_frame(keypoints) == ("palm", 0.95)
 
 
 def test_build_panel_state_uses_latest_wake_window(tmp_path):
@@ -275,26 +292,26 @@ def test_hand_tracker_rejects_small_oscillation_as_wave():
         assert tracker.update(make_hand(x)) is None
 
 
-def test_classify_static_prefers_heuristic_for_open_palm_over_dynamic_ml():
+def test_classify_static_prefers_high_confidence_ml_wave_over_open_palm_heuristic():
     classifier = GestureClassifier(domain="owner")
     classifier._classify_ml = lambda _keypoints: ("wave", 0.99)  # type: ignore[method-assign]
     classifier._classify_heuristic = lambda _keypoints: ("open_palm", 0.92)  # type: ignore[method-assign]
 
     gesture, confidence = classifier.classify_static([{"x": 0.0, "y": 0.0, "z": 0.0} for _ in range(21)])
 
-    assert gesture == "open_palm"
-    assert confidence == 0.92
+    assert gesture == "wave"
+    assert confidence == 0.99
 
 
-def test_classify_static_prefers_heuristic_open_palm_over_ml_fist():
+def test_classify_static_prefers_high_confidence_ml_fist_over_open_palm_heuristic():
     classifier = GestureClassifier(domain="owner")
     classifier._classify_ml = lambda _keypoints: ("fist", 0.97)  # type: ignore[method-assign]
     classifier._classify_heuristic = lambda _keypoints: ("open_palm", 0.92)  # type: ignore[method-assign]
 
     gesture, confidence = classifier.classify_static([{"x": 0.0, "y": 0.0, "z": 0.0} for _ in range(21)])
 
-    assert gesture == "open_palm"
-    assert confidence == 0.92
+    assert gesture == "fist"
+    assert confidence == 0.97
 
 
 def test_classify_static_can_keep_high_confidence_ml_thumbs_up_when_heuristic_is_point():

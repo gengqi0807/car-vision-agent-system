@@ -291,3 +291,34 @@ def draw_chinese_text(img: np.ndarray,
         cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX,
                     size / 30.0, color, 2, cv2.LINE_AA)
         return img
+
+
+def draw_chinese_text_lines(
+    img: np.ndarray,
+    lines: list[tuple[str, tuple[int, int], tuple[int, int, int], int]],
+) -> np.ndarray:
+    """Draw multiple Chinese text lines with a single PIL conversion."""
+    try:
+        img_pil = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
+        for text, pos, color, size in lines:
+            draw.text(
+                pos,
+                text,
+                font=_get_chinese_font(size),
+                fill=(color[2], color[1], color[0]),
+            )
+        return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    except Exception:
+        for text, pos, color, size in lines:
+            cv2.putText(
+                img,
+                text,
+                pos,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                size / 30.0,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+        return img

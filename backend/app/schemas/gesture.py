@@ -88,6 +88,8 @@ class OwnerGestureResult(BaseModel):
     keypoints: list[Keypoint]
     annotated_image: str | None = None
     hand_count: int = Field(default=0, description="检测到的手数量")
+    control_command: str | None = None
+    triggered: bool = False
     panel_state: ControlPanelState | None = None
     updated_at: datetime
 
@@ -102,4 +104,8 @@ class StreamState(BaseModel):
     running: bool
     source: str = ""
     fps: int = 15
+    published: bool = False
+    publish_rtsp_url: str | None = None
+    playback_url: str | None = None
+    last_error: str | None = None
     started_at: datetime | None = None
