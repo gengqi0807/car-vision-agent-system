@@ -495,7 +495,7 @@ class CTPGREngine:
         #   关键差异：右腕是否贴近身体（用腕-髋距离/躯干长来衡量）
         if gesture_id in (3, 4):
             rw_to_hip   = np.linalg.norm(rw - mid_hip) / torso_len
-            rw_near_body = rw_to_hip < 0.45         # 右腕贴近身体 = 手臂休息位
+            rw_near_body = rw_to_hip < 0.55         # 右腕贴近身体（放宽，适配不同体态）
 
             # 侧身检测：肩膀 x 间距过小 → 身体侧转，右臂可能被遮挡
             #   MP 骨架会把右腕投射到左腕附近，rw_near_body 失效
@@ -510,7 +510,7 @@ class CTPGREngine:
             # 正脸左待转：右臂贴在身上不动 + 左臂侧前方划动
             left_wait_pat = (
                 left_active                         # 左臂抬起
-                and rw_near_body                    # ★ 右腕贴近身体
+                and rw_near_body                    # ★ 右腕贴近身体（阈值放宽至 0.55）
                 and lw_outside > -0.005             # 左腕不越过身体中线（放宽）
             )
             # 侧身左待转：右臂被遮挡，MP 可能误判右臂随左臂前伸
@@ -520,17 +520,20 @@ class CTPGREngine:
                 and left_active                     # 左臂抬起
                 and lw_outside > -0.015             # 左腕不跑到身体右侧
                 and not (rw_inside > 0.030)         # 右腕没越过左腕位置（极宽）
-                and rw_to_hip < 0.90                # 右腕别飞太远即可
+                and rw_to_hip < 1.10                # 右腕别飞太远即可（放宽）
             )
 
             if gesture_id == 3 and (left_wait_pat or left_wait_sideways_pat) and not left_turn_pat:
                 # 模型说左转弯，但几何特征指向左待转 → 改左待转
                 gesture_id = 4
-                confidence = float(probs[4])
+                confidence = max(float(probs[4]), 0.70)
             elif gesture_id == 4 and left_turn_pat and not (left_wait_pat or left_wait_sideways_pat):
                 # 模型说左待转，但右臂明显前伸 → 改左转弯
                 gesture_id = 3
                 confidence = float(probs[3])
+            elif gesture_id == 4 and (left_wait_pat or left_wait_sideways_pat):
+                # 模型说左待转 + 几何确认 → 提升置信度，防止被 0.70 门槛误杀
+                confidence = max(confidence, 0.71)
             elif gesture_id in (3, 4) and not (left_turn_pat or left_wait_pat or left_wait_sideways_pat):
                 gesture_id = 0
                 confidence = float(probs[0])
@@ -567,24 +570,28 @@ class CTPGREngine:
             # ---- 直行得分（两腕侧展程度） ----
             s_score = 0
             if both_active:           s_score += 1
-            if lw_outside > 0.010:    s_score += 3    # 左腕侧展（关键）
-            if rw_outside > 0.010:    s_score += 3    # 右腕侧展（关键）
+            if lw_outside > 0.003:    s_score += 4    # 左腕侧展（关键，放宽阈值）
+            if rw_outside > 0.003:    s_score += 4    # 右腕侧展（关键，放宽阈值）
             if at_shoulder:           s_score += 1
 
-            # ---- 右转弯得分（左腕前伸 + 右腕右前方） ----
+            # ---- 右转弯得分（左臂前伸 = 关键区分特征） ----
+            #   右转弯的核心是【左臂前伸】（lw_inside > 0），而非"不侧展"
+            #   用正向条件比负向条件更鲁棒：即使左臂有微小侧向分量也不会得分崩塌
             r_score = 0
-            if both_active:           r_score += 1
-            if lw_outside < 0.010:    r_score += 4    # 左腕不侧展 = 前伸（核心）
-            if rw_outside > 0.000:    r_score += 2    # 右腕在身体右侧
-            if rw_inside > -0.010:    r_score += 1    # 右腕不在身体左侧
+            if both_active:              r_score += 1
+            if lw_inside > 0.006:        r_score += 5    # 左腕在左肩右侧 = 前伸（强证据）
+            elif lw_outside < 0.000:     r_score += 2    # 左腕至少没侧展
+            if rw_outside > -0.005:      r_score += 2    # 右腕至少不严重交叉
+            if rw_outside > 0.005:       r_score += 1    # 右腕明显向右侧展开
 
-            # ---- 比较得分，差距 >2 才纠正（避免歧义帧反复跳动） ----
+            # ---- 比较得分，差距 >4 才纠正（避免歧义帧反复跳动） ----
             if gesture_id == 5:
                 # 右转弯必须是双臂动作；单臂高举更像停止
                 if stop_score > r_score and stop_score >= 6:
                     gesture_id = 1
                     confidence = float(probs[1])
-                elif s_score > r_score + 2:
+                elif s_score > r_score + 4 and float(probs[2]) > 0.15:
+                    # 直行得分高出 4 以上且模型自身对直行也有一定偏好 → 才翻转
                     gesture_id = 2
                     confidence = float(probs[2])
                 elif r_score < 3:
@@ -597,7 +604,7 @@ class CTPGREngine:
                 if stop_score > s_score and stop_score >= 6:
                     gesture_id = 1
                     confidence = float(probs[1])
-                elif r_score > s_score + 2:
+                elif r_score > s_score + 2 and float(probs[5]) > 0.12:
                     gesture_id = 5
                     confidence = float(probs[5])
                 elif s_score >= 5:
@@ -611,5 +618,97 @@ class CTPGREngine:
                     elif s_score > r_score:
                         gesture_id = 2
                         confidence = float(probs[2])
+
+        # ============================================================
+        #  减速 (7) — 几何校验
+        # ============================================================
+        #   减速 = 右手向右侧伸展，掌心向下/向前，手臂向下摆动
+        #   关键：右手单臂动作 + 左手基本不动（区别于直行的双臂侧展）
+        #   问题：右手侧展幅度可能不大，需要多层次匹配
+        if gesture_id == 7:
+            rw_to_hip = np.linalg.norm(rw - mid_hip) / torso_len
+            lw_to_hip = np.linalg.norm(lw - mid_hip) / torso_len
+            left_idle = lw_to_hip < 0.50  # 左手贴近身体
+            # 强减速模式：右手抬起 + 左手低垂 + 右腕在肩附近
+            slow_down_pat = (
+                right_active
+                and (not left_active or left_idle)   # 左手基本不动（允许微动）
+                and rw_outside > -0.005               # 右腕至少在肩附近
+                and rw_above_rs < 0.04                # 右腕不高于肩
+            )
+            # 弱减速模式：右手侧展幅度很小，但左手确实没动
+            slow_down_weak_pat = (
+                right_active
+                and (not left_active or left_idle)    # 左手基本不动
+                and rw_outside > -0.015               # 侧展极弱也能匹配
+                and rw_to_hip > 0.55                  # 右手离开身体一定距离
+            )
+
+            if slow_down_pat:
+                confidence = max(confidence, 0.72)
+            elif slow_down_weak_pat:
+                # 弱匹配 → 也必须 ≥0.71，否则被 _decode_output 的 0.70 门槛归零
+                confidence = max(confidence, 0.71)
+            elif not right_active:
+                gesture_id = 0
+                confidence = float(probs[0])
+
+        # ---- 非减速类被 LSTM 误判时，用几何纠正为减速 ----
+        #    关键修复：不排除 class-0。当 LSTM 输出"无手势"时，
+        #    只要几何特征指向减速就应当纠正。
+        if gesture_id != 7:
+            rw_to_hip = np.linalg.norm(rw - mid_hip) / torso_len
+            lw_to_hip = np.linalg.norm(lw - mid_hip) / torso_len
+            left_idle = lw_to_hip < 0.50
+            # 右手单臂 + 左手基本不动
+            slow_down_pat = (
+                right_active
+                and (not left_active or left_idle)
+                and rw_outside > -0.010
+                and rw_above_rs < 0.05
+            )
+            slow_down_prob = float(probs[7])
+            if slow_down_pat:
+                # LSTM 已输出非0手势且 probs[7] 有一定信号 → 直接纠正
+                if gesture_id != 0 and slow_down_prob > 0.08:
+                    gesture_id = 7
+                    confidence = max(slow_down_prob, 0.71)
+                # LSTM 输出"无手势" → 几何特征主导，不需要 probs[7] 门槛
+                elif gesture_id == 0:
+                    gesture_id = 7
+                    confidence = 0.71
+
+        # ============================================================
+        #  靠边停车 (8) — 几何校验
+        # ============================================================
+        #   靠边停车 = 一手高举过头 + 另一手下摆至腰间
+        #   若双手都没有靠近头部，说明是误判（LSTM 混淆了减速/变道）
+        if gesture_id == 8:
+            # 手腕与鼻子的垂直距离（y 向下增大，>0 = 腕高于鼻）
+            neck = coord_norm[:, 13]
+            lw_above_neck = float(neck[1] - lw[1])  # >0 左腕高于脖子
+            rw_above_neck = float(neck[1] - rw[1])  # >0 右腕高于脖子
+            lw_near_head = lw_above_neck > 0.01    # 左腕至少到脖子高度
+            rw_near_head = rw_above_neck > 0.01    # 右腕至少到脖子高度
+
+            # 腕 vs 身体中线水平偏移 (>0 = 腕在身体外侧/侧展)
+            lw_side_ext = float(lw[0] - neck[0])    # >0 左腕在脖子左侧
+            rw_side_ext = float(neck[0] - rw[0])    # >0 右腕在脖子右侧
+
+            # 靠边停车特征：左手高举过头 + 右手下摆至腰间
+            # 左手必须到脖子以上才算，否则判定为误判
+            if not lw_near_head:
+                # 左手不在头部高度 → 不可能是靠边停车
+                # 同时衰减 EMA 中 class-8 logit，打破反馈循环：
+                #   EMA 若不衰减，下一帧会继续输出 class 8 → 几何校验纠正 → 循环往复
+                if self.logit_ema is not None:
+                    self.logit_ema[8] *= 0.25          # 大幅压缩 class 8
+                    # class-6（变道）的 EMA 适度提升，帮助 EMA 朝正确方向移动
+                    if rw_side_ext > 0.03 or lw_side_ext > 0.03:
+                        # 有手臂侧展特征 → 更像变道，给 class 6 一定信号
+                        self.logit_ema[6] = max(self.logit_ema[6], self.logit_ema[8] + 1.5)
+
+                gesture_id = 0
+                confidence = float(probs[0])
 
         return gesture_id, confidence

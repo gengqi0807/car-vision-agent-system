@@ -184,6 +184,27 @@ def main():
     dl_counter = 0
     dl_error_once = False  # DL 错误只打印一次
 
+    # ================================================================
+    # 动作起止状态机（基于手部区域 + DL 结果滤波）
+    # ================================================================
+    action_state = "idle"           # "idle" | "active"
+    action_frame_count = 0          # 动作期间的推理帧数
+    hip_both_frames = 0             # 双手在 hip 的连续帧数
+    HIP_STOP_THRESHOLD = 8          # 连续 8 帧 → 动作停止
+
+    # DL 结果滑动窗口（用于 ACTIVE 期间的滤波）
+    dl_window = []                  # [(gesture, confidence), ...]
+    dl_filtered_gesture = "无手势"
+    dl_filtered_confidence = 0.0
+    GESTURE_MIN_CONF = 0.60         # 最低置信度阈值
+    GESTURE_MIN_RUN = 3             # 同一手势最少连续帧数
+    FIRST_GUESS_FRAMES = 5          # 动作开始后 5 帧内必须给出最佳判定动作
+
+    # 动作切换画面提示（使用 draw_chinese_text 走 PIL 渲染，无乱码）
+    action_flash_text = ""
+    action_flash_remaining = 0
+    ACTION_FLASH_FRAMES = 30        # 提示持续帧数（约 1 秒 @30fps）
+
     # 显示缩放（视频窗口缩小）
     DISPLAY_SCALE = 0.65  # 画面缩小到 65%
 
@@ -331,24 +352,114 @@ def main():
                     global_frame, feat.get("shoulder_width", 0.35)
                 )
 
+            # ============================================================
+            # 动作起止检测（基于手部区域）
+            #   开始：任意手离开 hip → 立即 ACTIVE
+            #   停止：双手在 hip 连续 8 帧 → 立即 IDLE
+            # ============================================================
+            if feat is not None:
+                lr = feat.get("left_region", "?")
+                rr = feat.get("right_region", "?")
+                both_hip = (lr == "hip" and rr == "hip")
+
+                if action_state == "idle":
+                    if not both_hip:
+                        action_state = "active"
+                        action_frame_count = 0
+                        dl_window.clear()
+                        dl_filtered_gesture = "无手势"
+                        dl_filtered_confidence = 0.0
+                        hip_both_frames = 0
+                        if dl_engine is not None:
+                            dl_engine.reset_state()
+                        action_flash_text = "动作开始"
+                        action_flash_remaining = ACTION_FLASH_FRAMES
+                else:  # active
+                    action_frame_count += 1
+                    if both_hip:
+                        hip_both_frames += 1
+                        if hip_both_frames >= HIP_STOP_THRESHOLD:
+                            action_state = "idle"
+                            dl_window.clear()
+                            dl_filtered_gesture = "无手势"
+                            dl_filtered_confidence = 0.0
+                            dl_gesture = "无手势"
+                            dl_confidence = 0.0
+                            if dl_engine is not None:
+                                dl_engine.reset_state()
+                            action_flash_text = "动作结束"
+                            action_flash_remaining = ACTION_FLASH_FRAMES
+                    else:
+                        hip_both_frames = 0
+
             # ---- 深度学习模型推理（复用 MediaPipe 关键点，无需 VGG+PAFs） ----
             if dl_engine is not None:
                 dl_counter += 1
                 try:
                     coord_aic = mediapipe_to_aic14(landmarks)
                     dl_result = dl_engine.predict_from_keypoints(coord_aic)
-                    dl_gesture = dl_result["gesture"]
-                    dl_confidence = dl_result["confidence"]
+                    raw_gesture = dl_result["gesture"]
+                    raw_confidence = dl_result["confidence"]
                 except Exception as e:
                     if not dl_error_once:
                         print(f"\n[DL-ERROR] 推理异常: {e}")
                         dl_error_once = True
-                    dl_gesture = "DL error"
+                    raw_gesture = "DL error"
+                    raw_confidence = 0.0
+
+                # ========================================================
+                # 动作期间 DL 结果滤波
+                # ========================================================
+                if action_state == "active":
+                    dl_window.append((raw_gesture, raw_confidence))
+                    if len(dl_window) > 60:
+                        dl_window = dl_window[-40:]
+
+                    if action_frame_count <= FIRST_GUESS_FRAMES:
+                        best = None
+                        for g, c in dl_window:
+                            if g not in ("无手势", "DL error", "loading...") and c > 0:
+                                if best is None or c > best[1]:
+                                    best = (g, c)
+                        if best:
+                            dl_filtered_gesture, dl_filtered_confidence = best
+                    else:
+                        recent = dl_window[-15:]
+                        runs = []
+                        if recent:
+                            cur_g, cur_confs = recent[0][0], [recent[0][1]]
+                            for i in range(1, len(recent)):
+                                g, c = recent[i]
+                                if g == cur_g:
+                                    cur_confs.append(c)
+                                else:
+                                    runs.append((cur_g, len(cur_confs), sum(cur_confs) / len(cur_confs)))
+                                    cur_g, cur_confs = g, [c]
+                            if cur_g:
+                                runs.append((cur_g, len(cur_confs), sum(cur_confs) / len(cur_confs)))
+
+                        valid = [
+                            (g, cnt, conf) for g, cnt, conf in runs
+                            if g not in ("无手势", "DL error", "loading...")
+                            and conf >= GESTURE_MIN_CONF and cnt >= GESTURE_MIN_RUN
+                        ]
+                        if valid:
+                            best = valid[-1]  # (gesture, count, avg_confidence)
+                            dl_filtered_gesture = best[0]
+                            dl_filtered_confidence = best[2]  # ← 置信度，非帧数
+
+                    dl_gesture = dl_filtered_gesture
+                    dl_confidence = dl_filtered_confidence
+                else:
+                    dl_gesture = "无手势"
                     dl_confidence = 0.0
+                    dl_window.clear()
+
                 if dl_counter % 30 == 0:
                     left_r = (last_feat or {}).get("left_region", "?")
                     right_r = (last_feat or {}).get("right_region", "?")
-                    print(f"  [DL] {dl_gesture} (置信度:{dl_confidence:.0%})  "
+                    state_mark = "[A]" if action_state == "active" else "[I]"
+                    print(f"  [DL] {state_mark} {dl_gesture} (置信度:{dl_confidence:.0%})  "
                           f"| 左手: {left_r}  右手: {right_r}")
 
         elif should_infer:
@@ -359,6 +470,13 @@ def main():
             last_feat = None
             last_hand_left = None
             last_hand_right = None
+            # 重置动作状态
+            action_state = "idle"
+            action_frame_count = 0
+            hip_both_frames = 0
+            dl_window.clear()
+            dl_filtered_gesture = "无手势"
+            dl_filtered_confidence = 0.0
 
         # ---- 非推理帧：绘制缓存骨架（防止闪烁） ----
         if not should_infer and last_landmarks is not None:
@@ -379,6 +497,27 @@ def main():
             # 未检测到人体
             frame = draw_chinese_text(frame, "未检测到人体",
                                       (10, 110), (0, 0, 255), 36)
+
+        # ---- 动作切换提示（画面中央偏上） ----
+        if action_flash_remaining > 0:
+            banner_w, banner_h = 300, 50
+            banner_x = (w - banner_w) // 2
+            banner_y = h // 8
+            overlay = frame.copy()
+            cv2.rectangle(overlay,
+                          (banner_x, banner_y),
+                          (banner_x + banner_w, banner_y + banner_h),
+                          (0, 0, 0), -1)
+            frame = cv2.addWeighted(overlay, 0.55, frame, 0.45, 0)
+
+            if action_flash_text == "动作开始":
+                flash_color = (0, 255, 0)
+            else:
+                flash_color = (0, 140, 255)
+            frame = draw_chinese_text(frame, action_flash_text,
+                                      (banner_x + 65, banner_y + 8),
+                                      flash_color, 32)
+            action_flash_remaining -= 1
 
         # ---- FPS 和帧号 ----
         cv2.putText(frame, f"FPS: {fps}  Frame: {global_frame}",
