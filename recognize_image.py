@@ -1,12 +1,14 @@
 """
 recognize_image.py — 单张图片交警手势识别
 
-使用规则模型（MediaPipe Pose + 手部区域划分）+ 深度学习模型（CTPGREngine）
-分别识别单张图片中的手势，不依赖状态机和帧累积。
+管线完全对标 run_recognition.py / recognize_camera.py，唯一区别是输入源为单张图片。
+  - MediaPipe Pose + Hand 骨架检测与绘制
+  - CTPGREngine（PyTorch LSTM）深度学习模型唯一判定手势
+  - 规则模型特征提取 + 状态机（用于调试辅助）
 
 Usage:
     python recognize_image.py
-    python recognize_image.py --image try.png
+    python recognize_image.py --image try.jpg
     python recognize_image.py --image C:/path/to/photo.jpg --no-dl
 """
 
@@ -14,26 +16,29 @@ import os
 import sys
 import argparse
 import cv2
-import numpy as np
 
 # ---- 确保项目根目录在 sys.path 中 ----
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# ---- 导入 police 包 ----
+# ---- 导入 police 包（MediaPipe 骨架 + 可视化） ----
 from police import config as police_cfg
 from police.models import (
     create_pose_detector, create_hand_detector,
     detect_pose, detect_hand,
 )
-from police.features import extract_features
-from police.visualization import draw_pose_landmarks, draw_hand_landmarks, draw_chinese_text
-from police.geometry import setup_local_frame
+from police.features import extract_features, classify_palm_orientation, associate_hands
+from police.gesture_classifier import GestureStateMachine
+from police.geometry import setup_local_frame, calc_dist
+from police.visualization import (
+    draw_pose_landmarks, draw_hand_landmarks, draw_chinese_text,
+    draw_wrist_marker,
+)
 
-# ---- 导入 CTPGREngine ----
+# ---- 导入 CTPGREngine（PyTorch pose_model.pt + lstm.pt RNN 深度学习模型） ----
 try:
-    from ctpgr_engine import CTPGREngine
+    from ctpgr_engine import CTPGREngine, mediapipe_to_aic14
     _DL_AVAILABLE = True
 except ImportError as e:
     print(f"[WARN] CTPGREngine 导入失败: {e}，将仅使用规则模型")
@@ -47,20 +52,22 @@ def parse_args():
         help="输入图片路径（默认: try.jpg）"
     )
     parser.add_argument(
-        "--pose-model", default=police_cfg.POSE_MODEL_PATH,
-        help=f"Pose 模型路径（默认: {police_cfg.POSE_MODEL_PATH}）"
+        "--pose-model",
+        default=police_cfg.POSE_MODEL_PATH,
+        help=f"MediaPipe Pose 模型路径（默认: {police_cfg.POSE_MODEL_PATH}）"
     )
     parser.add_argument(
-        "--hand-model", default=police_cfg.HAND_MODEL_PATH,
-        help=f"Hand 模型路径（默认: {police_cfg.HAND_MODEL_PATH}）"
+        "--hand-model",
+        default=police_cfg.HAND_MODEL_PATH,
+        help=f"MediaPipe Hand 模型路径（默认: {police_cfg.HAND_MODEL_PATH}）"
     )
     parser.add_argument(
         "--no-hand", action="store_true",
-        help="不使用 Hand Landmarker"
+        help="不使用 Hand Landmarker（仅 Pose）"
     )
     parser.add_argument(
         "--no-dl", action="store_true",
-        help="禁用深度学习模型"
+        help="禁用深度学习模型（仅规则）"
     )
     parser.add_argument(
         "--no-display", action="store_true",
@@ -90,178 +97,218 @@ def main():
         return
 
     # ================================================================
-    # 1. 加载模型
+    # 1. 加载 MediaPipe 模型
     # ================================================================
+    if not os.path.exists(args.pose_model):
+        print(f"[ERROR] Pose 模型不存在 -> {args.pose_model}")
+        print("  请确认 backend/pose_landmarker_lite.task 文件存在")
+        return
+
     print(f"[LOAD] Pose 模型: {args.pose_model}")
     pose_detector = create_pose_detector(args.pose_model)
-    print("[ OK ] PoseLandmarker 就绪")
+    print("[ OK ] PoseLandmarker 就绪（33 个身体关键点）")
 
     hand_detector = None
-    if not args.no_hand and os.path.exists(args.hand_model):
-        print(f"[LOAD] Hand 模型: {args.hand_model}")
-        hand_detector = create_hand_detector(args.hand_model)
-        print("[ OK ] HandLandmarker 就绪")
+    if not args.no_hand:
+        if os.path.exists(args.hand_model):
+            print(f"[LOAD] Hand 模型: {args.hand_model}")
+            hand_detector = create_hand_detector(args.hand_model)
+            print("[ OK ] HandLandmarker 就绪（21 个手部关键点）")
+        else:
+            print(f"[WARN] Hand 模型未找到 ({args.hand_model})，仅使用 Pose")
 
-    # DL 模型
+    # ================================================================
+    # 2. 加载 CTPGREngine 深度学习模型
+    # ================================================================
     dl_engine = None
     if _DL_AVAILABLE and not args.no_dl:
-        print("[LOAD] CTPGREngine 深度学习模型...")
+        print("[LOAD] CTPGREngine 深度学习模型（仅 LSTM，复用 MediaPipe 关键点）...")
         try:
-            dl_engine = CTPGREngine()
-            print("[ OK ] CTPGREngine 就绪")
+            dl_engine = CTPGREngine(load_pose_model=False)
+            print("[ OK ] CTPGREngine 就绪（MediaPipe→AIC14 映射 + LSTM 9 分类）")
         except Exception as e:
             import traceback
             print(f"[WARN] CTPGREngine 初始化失败: {e}")
             traceback.print_exc()
+            print("[WARN] 将仅使用规则模型，DL 模型不可用")
+            dl_engine = None
+    else:
+        print(f"[INFO] 深度学习模型未启用")
 
     # ================================================================
-    # 2. 读取图片
+    # 3. 读取图片
     # ================================================================
     print(f"\n[READ] 图片: {image_path}")
     frame = cv2.imread(image_path)
     if frame is None:
         print(f"[ERROR] 无法读取图片 -> {image_path}")
+        pose_detector.close()
+        if hand_detector:
+            hand_detector.close()
         return
     h, w = frame.shape[:2]
     print(f"       尺寸: {w}x{h}")
 
     # ================================================================
-    # 3. 推理
+    # 4. 推理（单帧，无跳帧，对标 run_recognition.py 管线）
     # ================================================================
     print("\n--- 推理中 ---")
 
-    # ---- 3a. MediaPipe Pose ----
+    state_machine = GestureStateMachine(verbose=False)
+
     pose_result = detect_pose(pose_detector, frame)
     hand_result = detect_hand(hand_detector, frame) if hand_detector else None
 
     if not pose_result or not pose_result.pose_landmarks:
         print("[WARN] 未检测到人体姿态")
-        cv2.putText(frame, "No person detected", (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-        if not args.no_display:
-            display_frame = cv2.resize(frame, None, fx=args.scale, fy=args.scale)
-            cv2.imshow("Image Gesture Recognition", display_frame)
-            cv2.waitKey(0)
-        return
-
-    landmarks = pose_result.pose_landmarks[0]
-    world_landmarks = pose_result.pose_world_landmarks[0] if pose_result.pose_world_landmarks else None
-
-    # ---- 3b. 绘制骨架 ----
-    draw_pose_landmarks(frame, landmarks, h, w)
-
-    # ---- 3c. 规则模型特征提取 ----
-    left_region = "?"
-    right_region = "?"
-    left_raise = 0.0
-    right_raise = 0.0
-
-    if world_landmarks is not None:
-        feat = extract_features(world_landmarks, landmarks, None, None)
-        left_region = feat.get("left_region", "?")
-        right_region = feat.get("right_region", "?")
-        left_raise = feat.get("left_raise", 0.0)
-        right_raise = feat.get("right_raise", 0.0)
-
-        # ---- 图片侧身补偿：根据手臂朝向修正手指高度 ----
-        # features.py 中统一用 wrist_y + 0.08 估算指尖（面向视频识别），
-        # 但对于举起的手臂（raise<0），指尖应在手腕上方（y 更小），
-        # 统一 +0.08 会把指尖估低一个档位。图片识别无帧累积补偿，
-        # 此处用方向感知的偏移重算 hand_region。
-        lw3 = world_landmarks[15]       # 左手腕
-        rw3 = world_landmarks[16]       # 右手腕
-        shoulder_y_avg = (world_landmarks[11].y + world_landmarks[12].y) / 2.0
-
-        # 手臂下垂 → 指尖在手腕下方 (+0.08)；手臂上举 → 指尖在手腕上方 (-0.08)
-        left_hand_y_corrected  = lw3.y + (0.08 if left_raise >= 0 else -0.08)
-        right_hand_y_corrected = rw3.y + (0.08 if right_raise >= 0 else -0.08)
-
-        from police.geometry import get_hand_region
-        left_region  = get_hand_region(left_hand_y_corrected,  shoulder_y_avg, 0, 0)
-        right_region = get_hand_region(right_hand_y_corrected, shoulder_y_avg, 0, 0)
-
-        # 打印规则模型结果
-        print(f"  [规则模型] 左手区域: {left_region}  (raise={left_raise:+.2f})")
-        print(f"  [规则模型] 右手区域: {right_region} (raise={right_raise:+.2f})")
-
-    # ---- 3d. 深度学习模型 ----
-    dl_gesture = "N/A"
-    dl_confidence = 0.0
-    if dl_engine is not None:
-        try:
-            dl_frame = cv2.resize(frame, (256, 256))
-            dl_result = dl_engine.predict_frame(dl_frame)
-            dl_gesture = dl_result["gesture"]
-            dl_confidence = dl_result["confidence"]
-            print(f"  [DL模型]  手势: {dl_gesture}  (置信度: {dl_confidence:.0%})")
-        except Exception as e:
-            print(f"  [DL-ERROR] 推理异常: {e}")
-            dl_gesture = "推理失败"
-
-    # ================================================================
-    # 4. 画面叠加
-    # ================================================================
-    # ---- 标题 ----
-    title_bar_h = 40
-    cv2.rectangle(frame, (0, 0), (w, title_bar_h), (30, 30, 30), -1)
-    cv2.putText(frame, "Image Gesture Recognition",
-                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-
-    # ---- 左上角：规则模型结果 ----
-    rule_x, rule_y = 10, title_bar_h + 15
-    box_w, box_h = 280, 90
-
-    # 半透明背景
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (rule_x, rule_y), (rule_x + box_w, rule_y + box_h),
-                  (40, 40, 40), -1)
-    frame = cv2.addWeighted(overlay, 0.55, frame, 0.45, 0)
-
-    cv2.putText(frame, "Rule Model", (rule_x + 10, rule_y + 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-    cv2.putText(frame, f"L: {left_region}  ({left_raise:+.2f})",
-                (rule_x + 10, rule_y + 48),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 2)
-    cv2.putText(frame, f"R: {right_region} ({right_raise:+.2f})",
-                (rule_x + 10, rule_y + 72),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 100, 255), 2)
-
-    # ---- 左下角：深度学习模型结果 ----
-    if dl_engine is not None:
-        dl_x, dl_y = 10, h - 100
-        dl_box_w, dl_box_h = 280, 80
-
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (dl_x, dl_y), (dl_x + dl_box_w, dl_y + dl_box_h),
-                      (25, 25, 50), -1)
-        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
-
-        cv2.putText(frame, "DL Model", (dl_x + 10, dl_y + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
-        # 手势名（中文，用 PIL）
-        frame = draw_chinese_text(frame, dl_gesture,
-                                  (dl_x + 10, dl_y + 42), (255, 200, 0), 24)
-        cv2.putText(frame, f"{dl_confidence:.0%}",
-                    (dl_x + 10, dl_y + 68),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 160, 80), 2)
+        frame = draw_chinese_text(frame, "未检测到人体",
+                                  (10, 110), (0, 0, 255), 36)
     else:
-        dl_x, dl_y = 10, h - 80
-        cv2.putText(frame, "DL: N/A", (dl_x + 10, dl_y + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (128, 128, 128), 2)
+        landmarks = pose_result.pose_landmarks[0]
 
-    # ---- 右上角：图片信息 ----
-    info_x = w - 200
-    cv2.putText(frame, f"Size: {w}x{h}", (info_x, title_bar_h + 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
-    cv2.putText(frame, f"Hands: L+R" if left_region != "?" else "Hands: ?",
-                (info_x, title_bar_h + 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+        world_landmarks = None
+        if pose_result.pose_world_landmarks:
+            world_landmarks = pose_result.pose_world_landmarks[0]
+
+        # ---- 绘制 Pose 骨架（33 个关键点 + 连线） ----
+        draw_pose_landmarks(frame, landmarks, h, w)
+
+        # ---- 提取像素关键点 ----
+        def px(idx):
+            lm = landmarks[idx]
+            return (lm.x * w, lm.y * h)
+
+        left_wrist    = px(15); right_wrist    = px(16)
+        left_shoulder = px(11); right_shoulder = px(12)
+        left_elbow    = px(13); right_elbow    = px(14)
+        nose          = px(0)
+        left_hip      = px(23); right_hip      = px(24)
+
+        # 肩部标签 L / R
+        cv2.putText(frame, "L", (int(left_shoulder[0]) - 15, int(left_shoulder[1]) - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
+        cv2.putText(frame, "R", (int(right_shoulder[0]) + 5, int(right_shoulder[1]) - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 3)
+
+        shoulder_width = calc_dist(left_shoulder, right_shoulder)
+
+        # ---- 局部坐标系（用于手掌朝向） ----
+        sm, body_right_2d, body_up_2d = setup_local_frame(
+            left_shoulder, right_shoulder, nose, left_hip, right_hip
+        )
+
+        # ---- 特征提取 ----
+        last_feat = None
+        last_hand_left = None
+        last_hand_right = None
+
+        # Hand 关联
+        hands = associate_hands(
+            hand_result,
+            (landmarks[15].x, landmarks[15].y),
+            (landmarks[16].x, landmarks[16].y),
+        )
+        last_hand_left  = hands["left"]
+        last_hand_right = hands["right"]
+
+        if world_landmarks is not None:
+            feat = extract_features(world_landmarks, landmarks,
+                                    last_hand_left, last_hand_right)
+            feat["left_visible"] = True
+            feat["right_visible"] = True
+            last_feat = feat
+
+        # ---- 绘制 Hand 骨架 ----
+        if last_hand_left:
+            draw_hand_landmarks(frame, last_hand_left, h, w)
+        else:
+            draw_wrist_marker(frame, landmarks, 15, h, w, side='L')
+        if last_hand_right:
+            draw_hand_landmarks(frame, last_hand_right, h, w)
+        else:
+            draw_wrist_marker(frame, landmarks, 16, h, w, side='R')
+
+        # ---- 手掌朝向 ----
+        left_palm_ori  = classify_palm_orientation(last_hand_left, body_right_2d, body_up_2d)
+        right_palm_ori = classify_palm_orientation(last_hand_right, body_right_2d, body_up_2d)
+
+        # ---- 状态机更新（仅追踪内部状态，不作为识别依据） ----
+        if last_feat is not None:
+            state_machine.update(
+                last_feat, left_palm_ori, right_palm_ori,
+                1, last_feat.get("shoulder_width", 0.35)
+            )
+
+        # ---- 深度学习模型推理（复用 MediaPipe 关键点，无需 VGG+PAFs） ----
+        dl_gesture = "N/A"
+        dl_confidence = 0.0
+        if dl_engine is not None:
+            try:
+                # ★ 重要：单张图片没有时序上下文，LSTM 从 h0/c0 直接推理。
+                #    推理前重置 LSTM 状态，得到单帧的判断结果。
+                dl_engine.reset_state()
+                coord_aic = mediapipe_to_aic14(landmarks)
+                dl_result = dl_engine.predict_from_keypoints(coord_aic)
+                dl_gesture = dl_result["gesture"]
+                dl_confidence = dl_result["confidence"]
+            except Exception as e:
+                print(f"  [DL-ERROR] 推理异常: {e}")
+                dl_gesture = "推理失败"
+
+            left_r = (last_feat or {}).get("left_region", "?")
+            right_r = (last_feat or {}).get("right_region", "?")
+            print(f"  [DL] {dl_gesture} (置信度:{dl_confidence:.0%})  "
+                  f"| 左手: {left_r}  右手: {right_r}")
 
     # ================================================================
-    # 5. 显示 / 保存
+    # 5. 画面文字叠加（对标 run_recognition.py）
+    # ================================================================
+
+    # ---- 右上角：双手高度区域 ----
+    if last_feat is not None:
+        rxx = w - 200
+        left_region = last_feat.get("left_region", "?")
+        right_region = last_feat.get("right_region", "?")
+        frame = draw_chinese_text(frame, f"左手: {left_region}",
+                                  (rxx, 15), (0, 200, 255), 20)
+        frame = draw_chinese_text(frame, f"右手: {right_region}",
+                                  (rxx, 42), (200, 100, 255), 20)
+
+    # ---- 左上角：深度学习模型结果（唯一识别依据） ----
+    if dl_engine is not None:
+        panel_w, panel_h = 260, 80
+        panel_x, panel_y = 15, 15
+
+        # 半透明背景
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (panel_x, panel_y),
+                      (panel_x + panel_w, panel_y + panel_h), (20, 20, 50), -1)
+        cv2.rectangle(overlay, (panel_x, panel_y),
+                      (panel_x + panel_w, panel_y + panel_h), (0, 200, 255), 2)
+        frame = cv2.addWeighted(overlay, 0.65, frame, 0.35, 0)
+
+        frame = draw_chinese_text(frame, "交警手势识别",
+                                  (panel_x + 10, panel_y + 5),
+                                  (0, 255, 255), 22)
+        frame = draw_chinese_text(frame, dl_gesture,
+                                  (panel_x + 10, panel_y + 28),
+                                  (0, 215, 255), 28)
+        frame = draw_chinese_text(frame, f"置信度: {dl_confidence:.1%}",
+                                  (panel_x + 10, panel_y + 60),
+                                  (255, 255, 255), 18)
+
+    # ---- 底部：图片信息 ----
+    cv2.putText(frame, f"Image: {os.path.basename(image_path)}  {w}x{h}",
+                (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+
+    # ================================================================
+    # 6. 显示 / 保存
     # ================================================================
     print("\n--- 完成 ---")
-    print(f"  规则模型: L={left_region}  R={right_region}")
+    if last_feat:
+        left_r = last_feat.get("left_region", "?")
+        right_r = last_feat.get("right_region", "?")
+        print(f"  规则模型: L={left_r}  R={right_r}")
     if dl_engine:
         print(f"  DL模型:   {dl_gesture}  ({dl_confidence:.0%})")
 
@@ -271,7 +318,7 @@ def main():
 
     if not args.no_display:
         display_frame = cv2.resize(frame, None, fx=args.scale, fy=args.scale)
-        cv2.imshow("Image Gesture Recognition", display_frame)
+        cv2.imshow("Police Gesture Recognition", display_frame)
         print("\n按任意键关闭窗口...")
         cv2.waitKey(0)
         cv2.destroyAllWindows()

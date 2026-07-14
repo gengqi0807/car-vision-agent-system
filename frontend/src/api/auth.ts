@@ -28,6 +28,7 @@ export interface UpdateProfilePayload {
 }
 export interface UserProfile {
   id: number;
+  uid: string;
   username: string;
   email: string | null;
   phone: string | null;

@@ -4,6 +4,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
+.venv*/
 venv/
 env/
 
@@ -11,12 +12,26 @@ node_modules/
 dist/
 .vite/
 
+owner_gesture_dataset_/
 .env
 .env.local
 .env.*.local
 
 backend/uploads/
 backend/logs/
+runtime/
+*.db
+*.log
+*.task
+*.pt
+*.pth
+*.joblib
+weights/*.pt
+weights/*.pth
+models/*.pt
+models/*.pth
+models/*.joblib
+models/*.task
 
 .DS_Store
 Thumbs.db

@@ -112,6 +112,7 @@ async function handleLogin() {
     const { data } = await loginApi(form);
     userStore.setSession(data.user.username, data.access_token);
     userStore.setProfile(data.user);
+    window.alert(`登录成功：${data.user.username}`);
     router.push({ name: "dashboard" });
   } catch (error) {
     if (axios.isAxiosError(error)) {
@@ -165,6 +166,7 @@ async function submitEmailLogin() {
     userStore.setSession(data.user.username, data.access_token);
     userStore.setProfile(data.user);
     closeEmailLogin();
+    window.alert(`登录成功：${data.user.username}`);
     router.push({ name: "dashboard" });
   } catch (error) {
     if (axios.isAxiosError(error)) {

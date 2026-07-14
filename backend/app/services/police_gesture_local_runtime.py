@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,9 +23,10 @@ from police.models import create_hand_detector, create_pose_detector, detect_han
 from police.visualization import draw_chinese_text, draw_hand_landmarks, draw_pose_landmarks, draw_wrist_marker
 
 try:
-    from ctpgr_engine import CTPGREngine
+    from ctpgr_engine import CTPGREngine, mediapipe_to_aic14
 except Exception:  # pragma: no cover - runtime import guard
     CTPGREngine = None
+    mediapipe_to_aic14 = None
 
 
 NO_VIDEO_GESTURE = "no_gesture"
@@ -74,14 +76,15 @@ class LocalPoliceGestureResult:
 
 
 class PoliceGestureVideoSession:
-    def __init__(self) -> None:
+    def __init__(self, *, realtime: bool = False) -> None:
+        self.realtime = realtime
         self.pose_detector = create_pose_detector(police_cfg.POSE_MODEL_PATH)
         self.hand_detector = None
         if os.path.exists(police_cfg.HAND_MODEL_PATH):
             self.hand_detector = create_hand_detector(police_cfg.HAND_MODEL_PATH)
-        self.dl_engine = CTPGREngine() if CTPGREngine is not None else None
+        self.dl_engine = CTPGREngine(load_pose_model=False) if CTPGREngine is not None else None
 
-        self.state_machine = GestureStateMachine()
+        self.state_machine = GestureStateMachine(verbose=False)
         self.frame_counter = 0
         self.global_frame = 0
         self.last_landmarks = None
@@ -92,9 +95,18 @@ class PoliceGestureVideoSession:
         self.display_result: str | None = None
         self.display_confidence = 0.0
         self.result_display_timer = 0
-        self.dl_gesture = "loading..."
+        self.dl_gesture = "预热中..." if realtime else "loading..."
         self.dl_confidence = 0.0
+        self.dl_keypoints: list[dict[str, float]] = []
         self.dl_error_once = False
+        self.dl_skip = 3
+        self.dl_warmed_up = not realtime
+        self.warmup_started_at = time.time()
+        self.warmup_seconds = 2.0
+        self.dl_persist_gesture = "无手势"
+        self.dl_persist_confidence = 0.0
+        self.dl_persist_counter = 0
+        self.dl_persist_max = 8
 
     def __enter__(self) -> PoliceGestureVideoSession:
         return self
@@ -145,9 +157,30 @@ class PoliceGestureVideoSession:
 
             left_shoulder = px(11)
             right_shoulder = px(12)
+            left_elbow = px(13)
+            right_elbow = px(14)
             nose = px(0)
             left_hip = px(23)
             right_hip = px(24)
+
+            cv2.putText(
+                annotated,
+                "L",
+                (int(left_shoulder[0]) - 15, int(left_shoulder[1]) - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255),
+                3,
+            )
+            cv2.putText(
+                annotated,
+                "R",
+                (int(right_shoulder[0]) + 5, int(right_shoulder[1]) - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 0, 0),
+                3,
+            )
 
             _ = calc_dist(left_shoulder, right_shoulder)
             _, body_right_2d, body_up_2d = setup_local_frame(
@@ -160,6 +193,58 @@ class PoliceGestureVideoSession:
 
             if world_landmarks is not None:
                 feat = extract_features(world_landmarks, landmarks, self.last_hand_left, self.last_hand_right)
+                if self.last_feat is not None:
+                    left_visibility = landmarks[15].visibility if landmarks else 0.0
+                    right_visibility = landmarks[16].visibility if landmarks else 0.0
+                    left_keys = (
+                        "left_raise",
+                        "left_stretch",
+                        "left_z_diff",
+                        "left_wx",
+                        "left_wy",
+                        "left_sx",
+                        "left_sy",
+                        "left_orient",
+                        "left_pose",
+                        "left_region",
+                        "left_fwd",
+                        "left_lat",
+                        "left_dir_raw",
+                        "left_arm_angle",
+                    )
+                    right_keys = (
+                        "right_raise",
+                        "right_stretch",
+                        "right_z_diff",
+                        "right_wx",
+                        "right_wy",
+                        "right_sx",
+                        "right_sy",
+                        "right_orient",
+                        "right_pose",
+                        "right_region",
+                        "right_fwd",
+                        "right_lat",
+                        "right_dir_raw",
+                        "right_arm_angle",
+                    )
+                    if left_visibility < 0.3:
+                        for key in left_keys:
+                            if key in feat and key in self.last_feat:
+                                feat[key] = self.last_feat[key]
+                        feat["left_visible"] = False
+                    else:
+                        feat["left_visible"] = True
+                    if right_visibility < 0.3:
+                        for key in right_keys:
+                            if key in feat and key in self.last_feat:
+                                feat[key] = self.last_feat[key]
+                        feat["right_visible"] = False
+                    else:
+                        feat["right_visible"] = True
+                else:
+                    feat["left_visible"] = True
+                    feat["right_visible"] = True
                 self.last_feat = feat
             else:
                 feat = self.last_feat
@@ -202,18 +287,50 @@ class PoliceGestureVideoSession:
             self.last_feat = None
             self.last_hand_left = None
             self.last_hand_right = None
+            self.dl_persist_counter = 0
 
-        if self.dl_engine is not None and self.frame_counter % 3 == 0:
-            try:
-                dl_frame = cv2.resize(source_frame, (512, 512))
-                dl_result = self.dl_engine.predict_frame(dl_frame)
-                self.dl_gesture = str(dl_result.get("gesture", "无手势"))
-                self.dl_confidence = float(dl_result.get("confidence", 0.0) or 0.0)
-            except Exception:
-                if not self.dl_error_once:
-                    self.dl_error_once = True
-                self.dl_gesture = "DL error"
+        if self.dl_engine is not None and self.frame_counter % self.dl_skip == 0:
+            if self.realtime and not self.dl_warmed_up and (time.time() - self.warmup_started_at) >= self.warmup_seconds:
+                self.dl_warmed_up = True
+                self.dl_engine.reset_state()
+                self.dl_gesture = "无手势"
                 self.dl_confidence = 0.0
+
+            if self.last_landmarks is not None and (not self.realtime or self.dl_warmed_up):
+                try:
+                    coord_aic = mediapipe_to_aic14(self.last_landmarks)
+                    dl_result = self.dl_engine.predict_from_keypoints(coord_aic)
+                    raw_gesture = str(dl_result.get("gesture", "无手势"))
+                    raw_confidence = float(dl_result.get("confidence", 0.0) or 0.0)
+                    self.dl_keypoints = [
+                        {"x": float(item.get("x", 0.0)), "y": float(item.get("y", 0.0)), "score": 1.0}
+                        for item in dl_result.get("keypoints", [])
+                    ]
+                except Exception:
+                    if not self.dl_error_once:
+                        self.dl_error_once = True
+                    raw_gesture = "DL error"
+                    raw_confidence = 0.0
+                    self.dl_keypoints = []
+
+                if self.realtime:
+                    if raw_gesture not in {"无手势", "DL error", "预热中..."}:
+                        self.dl_persist_gesture = raw_gesture
+                        self.dl_persist_confidence = raw_confidence
+                        self.dl_persist_counter = self.dl_persist_max
+                        self.dl_gesture = raw_gesture
+                        self.dl_confidence = raw_confidence
+                    elif self.dl_persist_counter > 0:
+                        decay = self.dl_persist_counter / self.dl_persist_max
+                        self.dl_gesture = self.dl_persist_gesture
+                        self.dl_confidence = self.dl_persist_confidence * max(0.55, decay)
+                        self.dl_persist_counter -= 1
+                    else:
+                        self.dl_gesture = raw_gesture
+                        self.dl_confidence = raw_confidence
+                else:
+                    self.dl_gesture = raw_gesture
+                    self.dl_confidence = raw_confidence
 
         if not should_infer and self.last_landmarks is not None:
             draw_pose_landmarks(annotated, self.last_landmarks, height, width)
@@ -232,70 +349,87 @@ class PoliceGestureVideoSession:
             self.display_result = None
             self.display_confidence = 0.0
 
-        status_y = 30
+        if self.realtime and self.dl_engine is not None and not self.dl_warmed_up:
+            remaining = self.warmup_seconds - (time.time() - self.warmup_started_at)
+            if remaining > 0:
+                overlay = annotated.copy()
+                cv2.rectangle(overlay, (0, 0), (width, height), (0, 0, 0), -1)
+                annotated = cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0)
+                annotated = draw_chinese_text(
+                    annotated,
+                    "请保持站立，倒计时结束后开始识别",
+                    (max(width // 2 - 220, 20), max(height // 2 - 10, 20)),
+                    (0, 255, 255),
+                    26,
+                )
+                annotated = draw_chinese_text(
+                    annotated,
+                    f"预热中 {max(remaining, 0.0):.0f}s",
+                    (max(width // 2 - 80, 20), max(height // 2 + 28, 20)),
+                    (255, 255, 255),
+                    24,
+                )
+
         if self.last_landmarks is None:
-            annotated = draw_chinese_text(annotated, "未检测到人体", (10, status_y), (0, 0, 255), 36)
+            annotated = draw_chinese_text(annotated, "未检测到人体", (10, 110), (0, 0, 255), 36)
         elif self.state_machine.state == police_cfg.STATE_ACTIVE:
-            annotated = draw_chinese_text(annotated, "动作识别中...", (10, status_y), (0, 255, 255), 30)
+            annotated = draw_chinese_text(annotated, "动作识别中...", (10, 110), (0, 255, 255), 30)
         elif self.state_machine.cooldown_counter > 0:
             annotated = draw_chinese_text(
                 annotated,
                 f"冷却中 {self.state_machine.cooldown_counter}",
-                (10, status_y),
+                (10, 110),
                 (128, 128, 128),
                 28,
             )
-        elif self.display_result and self.display_result != FILTERED_GESTURE:
+        elif self.dl_engine is None and self.display_result and self.display_result != FILTERED_GESTURE:
             annotated = draw_chinese_text(
                 annotated,
                 f"交警手势: {self.display_result}",
-                (10, status_y),
+                (10, 110),
                 (0, 255, 0),
-                36,
+                34,
             )
-            if self.display_confidence > 0:
-                annotated = draw_chinese_text(
-                    annotated,
-                    f"置信度: {self.display_confidence:.0%}",
-                    (10, 75),
-                    (0, 200, 0),
-                    22,
-                )
         else:
-            annotated = draw_chinese_text(annotated, "等待动作...", (10, status_y), (255, 255, 255), 30)
+            annotated = draw_chinese_text(annotated, "等待动作...", (10, 110), (255, 255, 255), 30)
+
+        if self.last_feat is not None:
+            info_x = width - 200
+            left_region = self.last_feat.get("left_region", "?")
+            right_region = self.last_feat.get("right_region", "?")
+            annotated = draw_chinese_text(annotated, f"左手: {left_region}", (info_x, 15), (0, 200, 255), 20)
+            annotated = draw_chinese_text(annotated, f"右手: {right_region}", (info_x, 42), (200, 100, 255), 20)
 
         if self.dl_engine is not None:
             panel_w, panel_h = 260, 80
-            panel_x, panel_y = width - panel_w - 15, height - panel_h - 15
+            panel_x, panel_y = 15, 15
             overlay = annotated.copy()
             cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (20, 20, 50), -1)
             cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (0, 200, 255), 2)
             annotated = cv2.addWeighted(overlay, 0.65, annotated, 0.35, 0)
-            cv2.putText(
+            annotated = draw_chinese_text(annotated, "交警手势识别", (panel_x + 10, panel_y + 5), (0, 255, 255), 22)
+            annotated = draw_chinese_text(annotated, self.dl_gesture, (panel_x + 10, panel_y + 28), (0, 215, 255), 28)
+            annotated = draw_chinese_text(
                 annotated,
-                "-- DL Model --",
-                (panel_x + 10, panel_y + 22),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 255, 255),
-                2,
-            )
-            annotated = draw_chinese_text(annotated, self.dl_gesture, (panel_x + 10, panel_y + 32), (0, 215, 255), 28)
-            cv2.putText(
-                annotated,
-                f"conf: {self.dl_confidence:.1%}",
-                (panel_x + 10, panel_y + 68),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
+                f"置信度: {self.dl_confidence:.1%}",
+                (panel_x + 10, panel_y + 60),
                 (255, 255, 255),
-                2,
+                18,
             )
 
         keypoints = _pose_landmarks_to_keypoints(self.last_landmarks)
-        if self.display_result and self.display_result != FILTERED_GESTURE:
+        if self.dl_engine is not None and self.dl_warmed_up:
+            gesture = normalize_gesture(self.dl_gesture)
+            confidence = round(float(self.dl_confidence), 4)
+            display_label = VIDEO_GESTURE_TEXT.get(gesture, self.dl_gesture)
+        elif self.display_result and self.display_result != FILTERED_GESTURE:
             gesture = normalize_gesture(self.display_result)
             confidence = round(float(self.display_confidence), 4)
-            display_label = self.display_result
+            display_label = VIDEO_GESTURE_TEXT.get(gesture, self.display_result)
+        elif self.last_landmarks is None:
+            gesture = NO_POSE_GESTURE
+            confidence = 0.0
+            display_label = NO_POSE_GESTURE
         else:
             gesture = NO_VIDEO_GESTURE
             confidence = 0.0
@@ -315,9 +449,14 @@ class PoliceGestureLocalRuntime:
         self._image_lock = threading.Lock()
         self._image_pose_detector = None
         self._image_hand_detector = None
+        self._image_dl_engine = None
+        self._image_timestamp_ms = 0
 
     def create_video_session(self) -> PoliceGestureVideoSession:
         return PoliceGestureVideoSession()
+
+    def create_camera_session(self) -> PoliceGestureVideoSession:
+        return PoliceGestureVideoSession(realtime=True)
 
     def recognize_image(self, frame: np.ndarray) -> LocalPoliceGestureResult:
         with self._image_lock:
@@ -326,9 +465,14 @@ class PoliceGestureLocalRuntime:
 
             annotated = frame.copy()
             height, width = annotated.shape[:2]
+            self._image_timestamp_ms += 33
 
             pose_result = detect_pose(pose_detector, frame)
-            hand_result = detect_hand(hand_detector, frame, timestamp_ms=33) if hand_detector is not None else None
+            hand_result = (
+                detect_hand(hand_detector, frame, timestamp_ms=self._image_timestamp_ms)
+                if hand_detector is not None
+                else None
+            )
 
             if not pose_result or not pose_result.pose_landmarks:
                 annotated = draw_chinese_text(annotated, "未检测到人体", (18, 18), (0, 0, 255), 34)
@@ -352,6 +496,9 @@ class PoliceGestureLocalRuntime:
             right_region = "?"
             left_raise = 0.0
             right_raise = 0.0
+            dl_gesture = NO_VIDEO_GESTURE
+            dl_confidence = 0.0
+            dl_keypoints: list[dict[str, float]] = []
             if world_landmarks is not None:
                 feat = extract_features(world_landmarks, landmarks, None, None)
                 left_region = feat.get("left_region", "?")
@@ -366,6 +513,22 @@ class PoliceGestureLocalRuntime:
                 right_hand_y = right_wrist.y + (0.08 if right_raise >= 0 else -0.08)
                 left_region = get_hand_region(left_hand_y, shoulder_y_avg, 0, 0)
                 right_region = get_hand_region(right_hand_y, shoulder_y_avg, 0, 0)
+
+            if CTPGREngine is not None and mediapipe_to_aic14 is not None:
+                try:
+                    engine = self._get_image_dl_engine()
+                    engine.reset_state()
+                    dl_result = engine.predict_from_keypoints(mediapipe_to_aic14(landmarks))
+                    dl_gesture = str(dl_result.get("gesture", NO_VIDEO_GESTURE) or NO_VIDEO_GESTURE)
+                    dl_confidence = float(dl_result.get("confidence", 0.0) or 0.0)
+                    dl_keypoints = [
+                        {"x": float(item.get("x", 0.0)), "y": float(item.get("y", 0.0)), "score": 1.0}
+                        for item in dl_result.get("keypoints", [])
+                    ]
+                except Exception:
+                    dl_gesture = NO_VIDEO_GESTURE
+                    dl_confidence = 0.0
+                    dl_keypoints = []
 
             title_bar_h = 40
             cv2.rectangle(annotated, (0, 0), (width, title_bar_h), (30, 30, 30), -1)
@@ -424,12 +587,31 @@ class PoliceGestureLocalRuntime:
             )
 
             keypoints = _pose_landmarks_to_keypoints(landmarks)
+            gesture = normalize_gesture(dl_gesture)
+            confidence = round(dl_confidence, 4)
+            display_label = VIDEO_GESTURE_TEXT.get(gesture, dl_gesture)
+            if dl_keypoints:
+                keypoints = dl_keypoints
+            annotated = draw_chinese_text(
+                annotated,
+                f"识别结果: {display_label}",
+                (10, title_bar_h + 112),
+                (0, 255, 0) if gesture != NO_VIDEO_GESTURE else (255, 255, 255),
+                28,
+            )
+            annotated = draw_chinese_text(
+                annotated,
+                f"置信度: {confidence:.1%}",
+                (10, title_bar_h + 148),
+                (255, 226, 145),
+                22,
+            )
             return LocalPoliceGestureResult(
-                gesture=NO_VIDEO_GESTURE,
-                confidence=0.0,
+                gesture=gesture,
+                confidence=confidence,
                 keypoints=keypoints,
                 annotated_frame=annotated,
-                display_label=VIDEO_GESTURE_TEXT[NO_VIDEO_GESTURE],
+                display_label=display_label,
             )
 
     def _get_image_pose_detector(self):
@@ -441,6 +623,13 @@ class PoliceGestureLocalRuntime:
         if self._image_hand_detector is None and os.path.exists(police_cfg.HAND_MODEL_PATH):
             self._image_hand_detector = create_hand_detector(police_cfg.HAND_MODEL_PATH)
         return self._image_hand_detector
+
+    def _get_image_dl_engine(self):
+        if self._image_dl_engine is None:
+            if CTPGREngine is None:
+                raise RuntimeError("CTPGREngine is not available")
+            self._image_dl_engine = CTPGREngine(load_pose_model=False)
+        return self._image_dl_engine
 
 
 def normalize_gesture(raw_gesture: str | None) -> str:
@@ -463,3 +652,34 @@ def _pose_landmarks_to_keypoints(landmarks: Any) -> list[dict[str, float]]:
         }
         for point in landmarks
     ]
+
+
+def _crop_person(frame: np.ndarray, landmarks: Any, target_size: int = 512, padding_ratio: float = 0.25) -> np.ndarray:
+    height, width = frame.shape[:2]
+    xs = [int(point.x * width) for point in landmarks]
+    ys = [int(point.y * height) for point in landmarks]
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
+
+    box_w, box_h = x2 - x1, y2 - y1
+    pad_w = int(box_w * padding_ratio)
+    pad_h = int(box_h * padding_ratio)
+    x1 = max(0, x1 - pad_w)
+    x2 = min(width, x2 + pad_w)
+    y1 = max(0, y1 - pad_h)
+    y2 = min(height, y2 + pad_h)
+
+    side = max(x2 - x1, y2 - y1)
+    center_x = (x1 + x2) // 2
+    center_y = (y1 + y2) // 2
+    half = side // 2
+    x1 = max(0, center_x - half)
+    x2 = min(width, center_x + half)
+    y1 = max(0, center_y - half)
+    y2 = min(height, center_y + half)
+
+    crop_w = x2 - x1
+    crop_h = y2 - y1
+    side = max(1, min(crop_w, crop_h))
+    crop = frame[y1:y1 + side, x1:x1 + side]
+    return cv2.resize(crop, (target_size, target_size))

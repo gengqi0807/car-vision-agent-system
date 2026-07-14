@@ -2,7 +2,7 @@
   <section class="page-shell">
     <header class="page-header">
       <h1>手势控车</h1>
-      <p>支持单张图片与实时视频输入，实时模式保留摄像头原画面并叠加手部节点识别结果</p>
+      <p>支持单张图片与实时视频输入；实时模式连续显示后端关键点与中文标注画面</p>
     </header>
 
     <section class="two-col">
@@ -39,25 +39,6 @@
             >
               停止识别
             </button>
-            <select
-              v-if="videoDevices.length > 1"
-              v-model="selectedDeviceId"
-              class="device-select"
-              :disabled="cameraActive"
-            >
-              <option v-for="device in videoDevices" :key="device.deviceId" :value="device.deviceId">
-                {{ device.label }}
-              </option>
-            </select>
-            <button
-              v-if="videoDevices.length > 1"
-              class="device-refresh"
-              type="button"
-              :disabled="cameraActive"
-              @click="refreshVideoDevices"
-            >
-              刷新设备
-            </button>
           </template>
 
           <template v-else>
@@ -90,31 +71,24 @@
 
         <div class="preview-canvas-wrap">
           <div v-if="inputMode === 'camera'" class="preview-stage">
-            <video
-              ref="videoRef"
-              class="preview-video"
-              autoplay
-              muted
-              playsinline
-              v-show="cameraActive"
+            <iframe
+              v-if="cameraActive && cameraDisplayUrl"
+              class="preview-image stream-player"
+              :src="cameraDisplayUrl"
+              title="手势实时识别标注画面"
+              allow="autoplay; fullscreen"
+              allowfullscreen
             />
-            <canvas
-              ref="overlayCanvasRef"
-              v-show="cameraActive"
-              class="overlay-canvas"
-            />
+            <div v-else-if="cameraActive" class="image-placeholder gesture-frame">
+              后端正在生成标注画面
+              <div class="small">识别结果返回后将显示关键点、手势与功能</div>
+            </div>
           </div>
           <div v-else-if="sourcePreviewUrl" class="preview-stage image-preview-stage">
             <img
-              ref="imagePreviewRef"
               class="preview-image image-preview-fit"
-              :src="sourcePreviewUrl"
-              alt="手势图片识别原图"
-              @load="handleImagePreviewLoad"
-            />
-            <canvas
-              ref="imageOverlayCanvasRef"
-              class="overlay-canvas image-overlay-canvas"
+              :src="imageDisplayUrl"
+              alt="手势图片识别标注画面"
             />
           </div>
           <canvas ref="captureCanvasRef" class="capture-canvas" />
@@ -124,7 +98,7 @@
           >
             {{ inputMode === "camera" ? "手势实时识别" : "手势图片识别" }}
             <div class="small">
-              {{ inputMode === "camera" ? "点击“开启摄像头”开始检测驾驶员手势" : "上传单张手势图片，直接查看原图与节点标注结果" }}
+              {{ inputMode === "camera" ? "点击“开启摄像头”开始检测驾驶员手势" : "上传单张手势图片，直接查看后端返回的标注结果" }}
             </div>
           </div>
         </div>
@@ -138,7 +112,6 @@
             置信度 {{ recognitionConfidence }}
           </span>
           <span class="gesture-action-chip">{{ gestureActionLabel }}</span>
-          <span class="recognition-chip">{{ gestureCommandLabel }}</span>
           <span class="recognition-chip" v-if="sessionId">会话 {{ sessionId }}</span>
         </div>
         </template>
@@ -166,7 +139,7 @@
 
           <div class="cockpit-display">
             <div v-if="showConfirmSpotlight" class="confirm-spotlight">
-              <span class="section-label">确认执行</span>
+              <span class="section-label">执行结果</span>
               <strong>{{ focusTileLabel }}</strong>
               <span>{{ confirmSpotlightText }}</span>
             </div>
@@ -195,7 +168,7 @@
                   <div class="widget-card" :class="{ focused: isTileFocused('media') }">
                     <span class="section-label">媒体</span>
                     <strong>{{ panelState.media_playing ? "蓝牙音乐播放中" : "媒体已暂停" }}</strong>
-                    <span>音量 {{ Math.round(panelState.volume) }}% · 单指画圈可直接调节</span>
+                    <span>音量 {{ Math.round(panelState.volume) }}% · 顺逆时针画圈可直接调节</span>
                     <div class="mini-track"><div class="mini-fill" :style="{ width: `${panelState.volume}%` }"></div></div>
                   </div>
                   <div class="widget-card" :class="{ focused: isTileFocused('vehicle') }">
@@ -229,7 +202,7 @@
                   <div class="metric-card">
                     <span class="section-label">推荐</span>
                     <strong>城市通勤</strong>
-                    <span>单指画圈时自动前置媒体页</span>
+                    <span>画圈调音量时会自动前置媒体页</span>
                   </div>
                 </div>
               </div>
@@ -332,6 +305,11 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 
 import {
   fetchOwnerGestureApi,
+  fetchOwnerGestureStreamStateApi,
+  fetchOwnerGestureStreamResultApi,
+  ownerGestureVideoFeedUrl,
+  startOwnerGestureStreamApi,
+  stopOwnerGestureStreamApi,
   type OwnerControlPanelState,
   type OwnerGestureFrameResult,
 } from "@/api/owner_gesture";
@@ -342,85 +320,90 @@ const result = ref<OwnerGestureFrameResult | null>(null);
 const inputMode = ref<"camera" | "image">("camera");
 const fileInputRef = ref<HTMLInputElement | null>(null);
 const videoRef = ref<HTMLVideoElement | null>(null);
-const imagePreviewRef = ref<HTMLImageElement | null>(null);
-const overlayCanvasRef = ref<HTMLCanvasElement | null>(null);
-const imageOverlayCanvasRef = ref<HTMLCanvasElement | null>(null);
 const captureCanvasRef = ref<HTMLCanvasElement | null>(null);
 const panelState = ref<OwnerControlPanelState>(createDefaultPanelState());
 const cameraActive = ref(false);
+const streamVideoUrl = ref("");
 const sessionId = ref("");
 const cameraDeviceLabel = ref("");
 const videoDevices = ref<Array<{ deviceId: string; label: string }>>([]);
 const selectedDeviceId = ref("");
 const sourcePreviewUrl = ref("");
-const annotatedPreviewUrl = ref("");
 const uiNow = ref(Date.now());
 
-const baseFrameIntervalMs = 125;
+const baseFrameIntervalMs = 8;
 const previewIdealWidth = 960;
 const previewIdealHeight = 720;
-const captureMaxWidth = 512;
-const captureMaxHeight = 384;
-const captureJpegQuality = 0.72;
+const captureMaxWidth = 960;
+const captureMaxHeight = 720;
+const captureJpegQuality = 0.88;
 let mediaStream: MediaStream | null = null;
 let activeSourceVideo: HTMLVideoElement | null = null;
 let captureTimer: number | null = null;
 let requestInFlight = false;
 let uiClockTimer: number | null = null;
-let overlayAnimationFrame: number | null = null;
-let overlayFromKeypoints: Array<{ x: number; y: number }> = [];
-let overlayTargetKeypoints: Array<{ x: number; y: number }> = [];
-let overlayDisplayKeypoints: Array<{ x: number; y: number }> = [];
-let overlayTransitionStartedAt = 0;
-let overlayTransitionDurationMs = 110;
+let streamResultTimer: number | null = null;
+let streamStarting = false;
 let lastInferenceDurationMs = 120;
-
-const HAND_CONNECTIONS: Array<[number, number]> = [
-  [0, 1], [1, 2], [2, 3], [3, 4],
-  [0, 5], [5, 6], [6, 7], [7, 8],
-  [0, 9], [9, 10], [10, 11], [11, 12],
-  [0, 13], [13, 14], [14, 15], [15, 16],
-  [0, 17], [17, 18], [18, 19], [19, 20],
-  [5, 9], [9, 13], [13, 17],
-];
 
 const LABEL_MAP: Record<string, string> = {
   open_palm: "手掌张开",
+  palm: "手掌张开",
   fist: "握拳",
-  point: "单指伸出",
-  index_circle: "单指画圈",
-  swipe_left: "向左滑动",
-  swipe_right: "向右滑动",
+  point: "待机",
+  pointing: "待机",
+  index_circle: "待机",
+  circle_cw: "顺时针画圈",
+  circle_ccw: "逆时针画圈",
+  swipe_left: "张开拳头",
+  swipe_right: "收回拳头",
   thumbs_up: "拇指向上",
+  thumb_up: "拇指向上",
   thumbs_down: "拇指向下",
+  thumb_down: "拇指向下",
+  thunb_index: "捏指",
+  thumb_index: "捏指",
   wave: "挥手",
+  idle: "待机",
   unknown: "未识别",
   "未检测到手部": "未检测到手部",
 };
 
 const GESTURE_ACTION_MAP: Record<string, string> = {
   open_palm: "唤醒",
+  palm: "唤醒",
   fist: "确认",
-  point: "待命",
-  index_circle: "音量",
-  swipe_left: "切换",
-  swipe_right: "切换",
+  point: "待机",
+  pointing: "待机",
+  index_circle: "待机",
+  circle_cw: "音量+",
+  circle_ccw: "音量-",
+  swipe_left: "上一个功能",
+  swipe_right: "下一个功能",
   thumbs_up: "接听",
+  thumb_up: "接听",
   thumbs_down: "挂断",
-  wave: "主页",
+  thumb_down: "挂断",
+  thunb_index: "主页",
+  thumb_index: "主页",
+  wave: "待机",
+  idle: "待机",
   unknown: "等待",
   "未检测到手部": "无动作",
 };
 
-const COMMAND_DISPLAY_MAP: Record<string, string> = {
-  WakeSystem: "系统唤醒",
-  ConfirmAction: "确认执行",
-  AdjustVolume: "音量调节",
-  SwitchPrevFeature: "切换功能",
-  SwitchNextFeature: "切换功能",
-  AnswerCall: "接听电话",
-  HangUpCall: "挂断电话",
-  ReturnHome: "返回主页",
+const ACTION_KEY_LABEL_MAP: Record<string, string> = {
+  wake: "唤醒",
+  confirm: "确认",
+  volume_adjust: "音量",
+  volume_up: "音量+",
+  volume_down: "音量-",
+  prev_func: "切换",
+  next_func: "切换",
+  call_answer: "接听",
+  call_hangup: "挂断",
+  home: "主页",
+  idle: "待机",
 };
 
 const MODE_LABEL_MAP: Record<string, string> = {
@@ -459,23 +442,36 @@ function createDefaultPanelState(): OwnerControlPanelState {
   };
 }
 
+const currentGestureKey = computed(() => {
+  if (result.value?.gesture) {
+    return result.value.gesture;
+  }
+  return panelState.value.last_gesture || "";
+});
+
 const gestureLabel = computed(() => {
-  const gesture = result.value?.gesture || panelState.value.last_gesture || "";
+  const gesture = currentGestureKey.value;
   if (!gesture) return "—";
   return LABEL_MAP[gesture] || gesture;
 });
 
 const gestureActionLabel = computed(() => {
-  const key = result.value?.gesture || panelState.value.last_gesture || "unknown";
+  const action = result.value?.action;
+  if (action) {
+    return ACTION_KEY_LABEL_MAP[action] || action;
+  }
+  const key = currentGestureKey.value || "unknown";
   return GESTURE_ACTION_MAP[key] || GESTURE_ACTION_MAP.unknown;
 });
 
 const recognitionConfidence = computed(() => `${((result.value?.confidence ?? 0) * 100).toFixed(1)}%`);
 
-const gestureCommandLabel = computed(() => {
-  const command = result.value?.control_command || panelState.value.last_command;
-  return command ? COMMAND_DISPLAY_MAP[command] || command : "等待动作";
+const cameraDisplayUrl = computed(() => {
+  if (inputMode.value !== "camera") return "";
+  return streamVideoUrl.value;
 });
+
+const imageDisplayUrl = computed(() => result.value?.annotated_image || sourcePreviewUrl.value || "");
 
 const systemAwake = computed(() => panelState.value.system_awake);
 
@@ -518,20 +514,20 @@ const modeSummary = computed(() => {
 
 const mediaStatusText = computed(() => {
   return panelState.value.media_playing
-    ? "单指画圈可直接提高音量，握拳可确认当前播放状态。"
+    ? "顺时针画圈升高音量，逆时针画圈降低音量，握拳可确认当前播放状态。"
     : "媒体已暂停，握拳后会恢复播放。";
 });
 
 const comfortStatusText = computed(() => {
   return panelState.value.comfort_scene === "舒享"
     ? "握拳后已执行舒享模式，温控与座椅同步强化。"
-    : "左右滑动切换到此页后，可通过握拳执行舒适场景。";
+    : "张开拳头或收回拳头切换到此页后，可通过握拳执行舒适场景。";
 });
 
 const vehicleStatusText = computed(() => {
   return panelState.value.vehicle_status === "已完成整车检查"
     ? "整车检查已执行完成，关键车况正常。"
-    : "可通过左右滑动切换到车辆页，再用握拳执行车况确认。";
+    : "可通过张开拳头或收回拳头切换到车辆页，再用握拳执行车况确认。";
 });
 
 const callStatusText = computed(() => {
@@ -543,7 +539,8 @@ const callStatusText = computed(() => {
 
 const showConfirmSpotlight = computed(() => {
   return (
-    panelState.value.last_command === "ConfirmAction" &&
+    (panelState.value.last_command === "ConfirmAction" ||
+      panelState.value.last_command === "WakeSystem") &&
     isFreshCommand(panelState.value.last_command_at, 3200)
   );
 });
@@ -571,9 +568,9 @@ const cameraStatusText = computed(() => {
 
 const inputStatusText = computed(() => {
   if (inputMode.value === "camera") {
-    return cameraActive.value ? "实时模式：保留摄像头原画面，自适应节奏更新识别节点" : "摄像头未开启";
+    return cameraActive.value ? "实时模式：显示后端关键点与中文标注画面" : "摄像头未开启";
   }
-  return sourcePreviewUrl.value ? "图片模式：显示上传原图，识别结果可直接驱动右侧 CMC" : "图片模式：等待上传";
+  return sourcePreviewUrl.value ? "图片模式：仅识别静态手势，显示后端返回的标注结果" : "图片模式：等待上传";
 });
 
 const previewStatusText = computed(() => {
@@ -581,15 +578,15 @@ const previewStatusText = computed(() => {
     if (!cameraActive.value) {
       return cameraStatusText.value;
     }
-    return `${cameraStatusText.value} · 节点覆盖层已启用`;
+    return `${cameraStatusText.value} · 当前显示后端实时返回的标注画面`;
   }
   if (loading.value) {
-    return "图片识别中 ...";
+    return "图片识别中 ... 仅支持静态手势";
   }
   if (sourcePreviewUrl.value) {
-    return result.value?.keypoints?.length ? "已显示上传原图与节点标注" : "已加载上传原图";
+    return result.value?.annotated_image ? "已显示后端返回的标注结果 · 动态手势请使用实时模式" : "已加载上传图片";
   }
-  return "上传图片后可直接查看原图与节点标注";
+  return "上传图片后可查看后端标注结果，图片模式仅识别静态手势";
 });
 
 function isTileFocused(tile: string) {
@@ -634,9 +631,6 @@ function resetRecognitionState() {
   result.value = null;
   sessionId.value = "";
   panelState.value = createDefaultPanelState();
-  annotatedPreviewUrl.value = "";
-  resetOverlayState();
-  clearImageOverlayCanvas();
 }
 
 function revokeSourcePreview() {
@@ -675,10 +669,8 @@ async function onImageSelected(event: Event) {
 
   error.value = "";
   revokeSourcePreview();
-  clearImageOverlayCanvas();
   inputMode.value = "image";
   sourcePreviewUrl.value = URL.createObjectURL(file);
-  annotatedPreviewUrl.value = "";
   result.value = null;
   if (!sessionId.value) {
     sessionId.value = createSessionId();
@@ -695,9 +687,6 @@ async function onImageSelected(event: Event) {
     const { data } = await fetchOwnerGestureApi(formData);
     result.value = data;
     applyResultToPanelState(data);
-    annotatedPreviewUrl.value = "";
-    await nextTick();
-    drawImageOverlay();
   } catch (err: unknown) {
     if (axios.isAxiosError(err)) {
       error.value = String(err.response?.data?.detail || err.message || "识别失败");
@@ -716,220 +705,6 @@ function clearImageSelection() {
   resetRecognitionState();
 }
 
-function resetOverlayState() {
-  overlayFromKeypoints = [];
-  overlayTargetKeypoints = [];
-  overlayDisplayKeypoints = [];
-  overlayTransitionStartedAt = 0;
-  clearOverlayCanvas();
-}
-
-function clearOverlayCanvas() {
-  const canvas = overlayCanvasRef.value;
-  const context = canvas?.getContext("2d");
-  if (!canvas || !context) return;
-  context.clearRect(0, 0, canvas.width, canvas.height);
-}
-
-function clearImageOverlayCanvas() {
-  const canvas = imageOverlayCanvasRef.value;
-  const context = canvas?.getContext("2d");
-  if (!canvas || !context) return;
-  context.clearRect(0, 0, canvas.width, canvas.height);
-}
-
-function syncImageOverlayCanvasSize() {
-  const canvas = imageOverlayCanvasRef.value;
-  const image = imagePreviewRef.value;
-  if (!canvas || !image) return;
-
-  const width = Math.max(1, Math.round(image.clientWidth));
-  const height = Math.max(1, Math.round(image.clientHeight));
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
-  }
-}
-
-function drawImageOverlay() {
-  const canvas = imageOverlayCanvasRef.value;
-  const image = imagePreviewRef.value;
-  const keypoints = result.value?.keypoints || [];
-  const context = canvas?.getContext("2d");
-  if (!canvas || !image || !context) return;
-
-  syncImageOverlayCanvasSize();
-  context.clearRect(0, 0, canvas.width, canvas.height);
-  if (!keypoints.length || !image.naturalWidth || !image.naturalHeight) {
-    return;
-  }
-
-  const scale = Math.min(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight);
-  const drawWidth = image.naturalWidth * scale;
-  const drawHeight = image.naturalHeight * scale;
-  const offsetX = (canvas.width - drawWidth) / 2;
-  const offsetY = (canvas.height - drawHeight) / 2;
-
-  const perHand = 21;
-  const handCount = Math.floor(keypoints.length / perHand);
-  for (let handIndex = 0; handIndex < handCount; handIndex += 1) {
-    const hand = keypoints.slice(handIndex * perHand, (handIndex + 1) * perHand);
-
-    context.strokeStyle = "rgba(74, 192, 183, 0.92)";
-    context.lineWidth = 2.2;
-    context.lineCap = "round";
-    context.lineJoin = "round";
-    for (const [start, end] of HAND_CONNECTIONS) {
-      const startPoint = hand[start];
-      const endPoint = hand[end];
-      if (!startPoint || !endPoint) continue;
-      context.beginPath();
-      context.moveTo(offsetX + startPoint.x * drawWidth, offsetY + startPoint.y * drawHeight);
-      context.lineTo(offsetX + endPoint.x * drawWidth, offsetY + endPoint.y * drawHeight);
-      context.stroke();
-    }
-
-    for (const point of hand) {
-      const x = offsetX + point.x * drawWidth;
-      const y = offsetY + point.y * drawHeight;
-      context.beginPath();
-      context.fillStyle = "rgba(247, 235, 222, 0.96)";
-      context.arc(x, y, 3.2, 0, Math.PI * 2);
-      context.fill();
-      context.beginPath();
-      context.strokeStyle = "rgba(74, 192, 183, 0.42)";
-      context.lineWidth = 5.2;
-      context.arc(x, y, 5.2, 0, Math.PI * 2);
-      context.stroke();
-    }
-  }
-}
-
-function handleImagePreviewLoad() {
-  drawImageOverlay();
-}
-
-function syncOverlayCanvasSize() {
-  const canvas = overlayCanvasRef.value;
-  const video = videoRef.value;
-  if (!canvas || !video) return;
-
-  const width = Math.max(1, Math.round(video.clientWidth || video.videoWidth || 0));
-  const height = Math.max(1, Math.round(video.clientHeight || video.videoHeight || 0));
-  if (width === 0 || height === 0) return;
-
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
-  }
-}
-
-function updateOverlayKeypoints(keypoints: Array<{ x: number; y: number }>) {
-  const now = performance.now();
-  overlayFromKeypoints = overlayDisplayKeypoints.length ? overlayDisplayKeypoints.map((point) => ({ ...point })) : [];
-  overlayTargetKeypoints = keypoints.map((point) => ({ x: point.x, y: point.y }));
-  overlayTransitionStartedAt = now;
-  overlayTransitionDurationMs = Math.max(80, Math.min(140, Math.round(lastInferenceDurationMs * 0.16)));
-
-  if (overlayFromKeypoints.length !== overlayTargetKeypoints.length) {
-    overlayFromKeypoints = overlayTargetKeypoints.map((point) => ({ ...point }));
-    overlayDisplayKeypoints = overlayTargetKeypoints.map((point) => ({ ...point }));
-  }
-}
-
-function interpolateOverlayKeypoints(now: number) {
-  if (!overlayTargetKeypoints.length) {
-    overlayDisplayKeypoints = [];
-    return;
-  }
-
-  if (!overlayFromKeypoints.length || overlayFromKeypoints.length !== overlayTargetKeypoints.length) {
-    overlayDisplayKeypoints = overlayTargetKeypoints.map((point) => ({ ...point }));
-    return;
-  }
-
-  const progress = Math.min(1, (now - overlayTransitionStartedAt) / Math.max(overlayTransitionDurationMs, 1));
-  const eased = 1 - (1 - progress) * (1 - progress);
-  overlayDisplayKeypoints = overlayTargetKeypoints.map((point, index) => ({
-    x: overlayFromKeypoints[index].x + (point.x - overlayFromKeypoints[index].x) * eased,
-    y: overlayFromKeypoints[index].y + (point.y - overlayFromKeypoints[index].y) * eased,
-  }));
-}
-
-function drawOverlayFrame(now: number) {
-  if (!cameraActive.value || inputMode.value !== "camera") {
-    clearOverlayCanvas();
-    return;
-  }
-
-  syncOverlayCanvasSize();
-  interpolateOverlayKeypoints(now);
-
-  const canvas = overlayCanvasRef.value;
-  const context = canvas?.getContext("2d");
-  if (!canvas || !context) return;
-
-  context.clearRect(0, 0, canvas.width, canvas.height);
-  if (!overlayDisplayKeypoints.length) {
-    return;
-  }
-
-  const perHand = 21;
-  const handCount = Math.floor(overlayDisplayKeypoints.length / perHand);
-  const width = canvas.width;
-  const height = canvas.height;
-
-  for (let handIndex = 0; handIndex < handCount; handIndex += 1) {
-    const hand = overlayDisplayKeypoints.slice(handIndex * perHand, (handIndex + 1) * perHand);
-
-    context.strokeStyle = "rgba(74, 192, 183, 0.92)";
-    context.lineWidth = 2.4;
-    context.lineCap = "round";
-    context.lineJoin = "round";
-    for (const [start, end] of HAND_CONNECTIONS) {
-      const startPoint = hand[start];
-      const endPoint = hand[end];
-      if (!startPoint || !endPoint) continue;
-      context.beginPath();
-      context.moveTo(startPoint.x * width, startPoint.y * height);
-      context.lineTo(endPoint.x * width, endPoint.y * height);
-      context.stroke();
-    }
-
-    for (const point of hand) {
-      const x = point.x * width;
-      const y = point.y * height;
-      context.beginPath();
-      context.fillStyle = "rgba(247, 235, 222, 0.95)";
-      context.arc(x, y, 3.2, 0, Math.PI * 2);
-      context.fill();
-      context.beginPath();
-      context.strokeStyle = "rgba(74, 192, 183, 0.42)";
-      context.lineWidth = 5.5;
-      context.arc(x, y, 5.4, 0, Math.PI * 2);
-      context.stroke();
-    }
-  }
-}
-
-function startOverlayLoop() {
-  stopOverlayLoop();
-
-  const animate = (now: number) => {
-    drawOverlayFrame(now);
-    overlayAnimationFrame = window.requestAnimationFrame(animate);
-  };
-
-  overlayAnimationFrame = window.requestAnimationFrame(animate);
-}
-
-function stopOverlayLoop() {
-  if (overlayAnimationFrame !== null) {
-    window.cancelAnimationFrame(overlayAnimationFrame);
-    overlayAnimationFrame = null;
-  }
-}
-
 async function startCamera() {
   if (cameraActive.value) return;
 
@@ -938,50 +713,32 @@ async function startCamera() {
   sessionId.value = createSessionId();
   result.value = null;
   panelState.value = createDefaultPanelState();
-  annotatedPreviewUrl.value = "";
 
   try {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      throw new Error("当前浏览器不支持摄像头调用");
-    }
-
-    await refreshVideoDevices();
-    const streamBinding = await requestPreferredStream();
-    mediaStream = streamBinding.stream;
-    cameraDeviceLabel.value = streamBinding.deviceLabel || "默认摄像头";
-
-    if (!mediaStream || !videoRef.value) {
-      throw new Error("摄像头初始化失败");
-    }
-    const track = mediaStream.getVideoTracks()[0];
-    await refreshVideoDevices();
-    if (!selectedDeviceId.value) {
-      selectedDeviceId.value = track?.getSettings().deviceId || pickBestVideoDeviceId(videoDevices.value);
-    }
-    bindTrackEvents(track);
-    videoRef.value.srcObject = mediaStream;
-    activeSourceVideo = videoRef.value;
+    await stopOwnerGestureStreamApi().catch(() => undefined);
+    await startOwnerGestureStreamApi("0", 15);
+    cameraDeviceLabel.value = "后端摄像头 0";
     cameraActive.value = true;
-    await nextTick();
-    await videoRef.value.play();
-    await ensureVideoFrame(videoRef.value);
-    syncOverlayCanvasSize();
-    startOverlayLoop();
-    startCaptureLoop();
+    streamStarting = true;
+    startStreamResultPolling();
+    await waitForOwnerGestureStreamPublished();
   } catch (err: any) {
     stopCamera();
-    error.value = normalizeCameraError(err);
+    error.value = axios.isAxiosError(err)
+      ? String(err.response?.data?.detail || err.message || "后端摄像头启动失败")
+      : err?.message || "后端摄像头启动失败";
   }
 }
 
 function stopCamera() {
+  void stopOwnerGestureStreamApi().catch(() => undefined);
+  stopStreamResultPolling();
+  streamStarting = false;
+  streamVideoUrl.value = "";
   stopCaptureLoop();
-  stopOverlayLoop();
   loading.value = false;
   requestInFlight = false;
   cameraActive.value = false;
-  annotatedPreviewUrl.value = "";
-  resetOverlayState();
 
   if (videoRef.value) {
     videoRef.value.pause();
@@ -997,6 +754,50 @@ function stopCamera() {
     mediaStream = null;
   }
   cameraDeviceLabel.value = "";
+}
+
+function startStreamResultPolling() {
+  stopStreamResultPolling();
+  const poll = async () => {
+    if (!cameraActive.value) return;
+    try {
+      const { data } = await fetchOwnerGestureStreamResultApi();
+      result.value = data;
+      if (data.panel_state) panelState.value = data.panel_state;
+      error.value = "";
+    } catch {
+      if (cameraActive.value && !streamStarting) error.value = "无法获取后端手势识别结果";
+    } finally {
+      if (cameraActive.value) streamResultTimer = window.setTimeout(poll, 200);
+    }
+  };
+  void poll();
+}
+
+async function waitForOwnerGestureStreamPublished() {
+  const deadline = Date.now() + 12_000;
+  while (cameraActive.value && Date.now() < deadline) {
+    const { data } = await fetchOwnerGestureStreamStateApi();
+    if (data.last_error) throw new Error(data.last_error);
+    if (!data.running) throw new Error("后端手势推流已停止");
+    if (data.published) {
+      await new Promise((resolve) => window.setTimeout(resolve, 900));
+      if (!cameraActive.value) return;
+      streamVideoUrl.value = `${ownerGestureVideoFeedUrl()}?t=${Date.now()}`;
+      streamStarting = false;
+      error.value = "";
+      return;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 150));
+  }
+  throw new Error("等待 MediaMTX 手势流就绪超时");
+}
+
+function stopStreamResultPolling() {
+  if (streamResultTimer !== null) {
+    window.clearTimeout(streamResultTimer);
+    streamResultTimer = null;
+  }
 }
 
 function bindTrackEvents(track?: MediaStreamTrack) {
@@ -1237,7 +1038,7 @@ function startCaptureLoop() {
     if (!cameraActive.value) return;
     await captureFrame();
     if (!cameraActive.value) return;
-    const nextDelay = Math.max(70, Math.min(150, Math.round(lastInferenceDurationMs * 0.22 + baseFrameIntervalMs)));
+    const nextDelay = Math.max(8, Math.min(24, Math.round(lastInferenceDurationMs * 0.04 + baseFrameIntervalMs)));
     captureTimer = window.setTimeout(() => {
       void tick();
     }, nextDelay);
@@ -1293,7 +1094,6 @@ async function captureFrame() {
     lastInferenceDurationMs = performance.now() - inferStartedAt;
     result.value = data;
     applyResultToPanelState(data);
-    updateOverlayKeypoints(data.keypoints);
   } catch (err: any) {
     if (axios.isAxiosError(err)) {
       if (err.response?.status === 401 || err.response?.status === 403) {
@@ -1326,11 +1126,16 @@ function applyResultToPanelState(data: OwnerGestureFrameResult) {
 
   if (data.triggered && data.control_command) {
     if (data.control_command === "WakeSystem") {
+      const wasAwake = nextState.system_awake;
       nextState.system_awake = true;
-      nextState.phone_call_active = false;
-      nextState.current_mode = "home";
-      nextState.focus_tile = "home";
-      nextState.last_feedback = "CMC 已唤醒，主页信息恢复显示。";
+      if (wasAwake) {
+        nextState.last_feedback = "系统已唤醒。";
+      } else {
+        nextState.phone_call_active = false;
+        nextState.current_mode = "home";
+        nextState.focus_tile = "home";
+        nextState.last_feedback = "CMC 已唤醒，主页信息恢复显示。";
+      }
     } else if (data.control_command === "SwitchPrevFeature" && nextState.system_awake && !nextState.phone_call_active) {
       nextState.current_mode = shiftMode(nextState.current_mode, -1);
       nextState.focus_tile = nextState.current_mode;
@@ -1339,12 +1144,22 @@ function applyResultToPanelState(data: OwnerGestureFrameResult) {
       nextState.current_mode = shiftMode(nextState.current_mode, 1);
       nextState.focus_tile = nextState.current_mode;
       nextState.last_feedback = `已切换至${MODE_LABEL_MAP[nextState.current_mode] || "主页"}界面。`;
-    } else if (data.control_command === "AdjustVolume" && nextState.system_awake) {
+    } else if (
+      (data.control_command === "AdjustVolume" ||
+        data.control_command === "AdjustVolumeUp" ||
+        data.control_command === "AdjustVolumeDown") &&
+      nextState.system_awake
+    ) {
       nextState.current_mode = "media";
       nextState.focus_tile = "media";
       nextState.media_playing = true;
-      nextState.volume = Math.min(100, nextState.volume + 6);
-      nextState.last_feedback = `媒体音量已调至 ${nextState.volume}%。`;
+      if (data.control_command === "AdjustVolumeDown") {
+        nextState.volume = Math.max(0, nextState.volume - 6);
+        nextState.last_feedback = `媒体音量已下调至 ${nextState.volume}%。`;
+      } else {
+        nextState.volume = Math.min(100, nextState.volume + 6);
+        nextState.last_feedback = `媒体音量已调至 ${nextState.volume}%。`;
+      }
     } else if (data.control_command === "ConfirmAction" && nextState.system_awake) {
       applyConfirmActionLocally(nextState);
     } else if (data.control_command === "AnswerCall" && nextState.system_awake) {
@@ -1360,7 +1175,7 @@ function applyResultToPanelState(data: OwnerGestureFrameResult) {
     } else if (data.control_command === "ReturnHome" && nextState.system_awake && !nextState.phone_call_active) {
       nextState.current_mode = "home";
       nextState.focus_tile = "home";
-      nextState.last_feedback = "已挥手返回主页。";
+      nextState.last_feedback = "已捏指返回主页。";
     }
   }
 
@@ -1480,12 +1295,10 @@ function sampleFrameSignature(ctx: CanvasRenderingContext2D, width: number, heig
 }
 
 function handleViewportResize() {
-  syncOverlayCanvasSize();
-  drawImageOverlay();
+  return;
 }
 
 onMounted(() => {
-  void refreshVideoDevices();
   window.addEventListener("resize", handleViewportResize);
   uiClockTimer = window.setInterval(() => {
     uiNow.value = Date.now();
@@ -1574,13 +1387,17 @@ onBeforeUnmount(() => {
 
 .preview-canvas-wrap {
   position: relative;
-  min-height: 292px;
+  min-height: 0;
 }
 
 .preview-stage {
   position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   overflow: hidden;
   border-radius: 10px;
+  background: #f0ece5;
 }
 
 .image-preview-stage {
@@ -1588,8 +1405,14 @@ onBeforeUnmount(() => {
 }
 
 .gesture-frame {
-  height: 272px;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 4 / 3;
   margin-top: 0;
+}
+
+.stream-player {
+  border: 0;
 }
 
 .preview-video,
@@ -1599,22 +1422,24 @@ onBeforeUnmount(() => {
   min-height: 272px;
   aspect-ratio: 4 / 3;
   max-height: 408px;
-  object-fit: cover;
+  object-fit: contain;
   border-radius: 8px;
   background: #f0ece5;
+}
+
+.capture-video {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+  left: -9999px;
+  top: -9999px;
 }
 
 .image-preview-fit {
   object-fit: contain;
   background: #f0ece5;
-}
-
-.overlay-canvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
 }
 
 .capture-canvas {

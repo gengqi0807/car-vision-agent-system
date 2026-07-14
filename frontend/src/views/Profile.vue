@@ -28,6 +28,10 @@
       <article class="panel">
         <h4>账号信息</h4>
         <div class="info-row">
+          <span>UID</span>
+          <strong>{{ profile?.uid || "加载中" }}</strong>
+        </div>
+        <div class="info-row">
           <span>当前用户</span>
           <strong>{{ profile?.username || userStore.username }}</strong>
         </div>
@@ -65,6 +69,39 @@ const form = reactive({
   phone: ""
 });
 
+type ProfileFieldKey = "username" | "email" | "phone";
+
+const profileFieldLabels: Record<ProfileFieldKey, string> = {
+  username: "用户名",
+  email: "邮箱",
+  phone: "手机号"
+};
+
+function normalizeProfileValue(value: string | null | undefined) {
+  return (value ?? "").trim();
+}
+
+function displayProfileValue(value: string | null | undefined) {
+  const normalizedValue = normalizeProfileValue(value);
+  return normalizedValue || "未绑定";
+}
+
+function buildProfileUpdateMessage(before: UserProfile | null, after: UserProfile) {
+  const changedFields = (["username", "email", "phone"] as ProfileFieldKey[])
+    .map((field) => {
+      const beforeValue = normalizeProfileValue(before?.[field]);
+      const afterValue = normalizeProfileValue(after[field]);
+      if (beforeValue === afterValue) {
+        return null;
+      }
+      return `${profileFieldLabels[field]}：${displayProfileValue(beforeValue)} -> ${displayProfileValue(afterValue)}`;
+    })
+    .filter((item): item is string => item !== null);
+  const changeContent = changedFields.length > 0 ? changedFields.join("；") : "无字段变化";
+
+  return `资料保存成功\n修改账号UID：${after.uid}\n修改内容：${changeContent}`;
+}
+
 async function loadProfile() {
   try {
     const { data } = await fetchProfileApi();
@@ -84,6 +121,7 @@ async function loadProfile() {
 
 async function submit() {
   try {
+    const beforeProfile = profile.value ? { ...profile.value } : null;
     const { data } = await updateProfileApi({
       username: form.username.trim(),
       email: form.email.trim() || undefined,
@@ -91,7 +129,7 @@ async function submit() {
     });
     profile.value = data;
     userStore.setProfile(data);
-    window.alert("个人资料已更新。");
+    window.alert(buildProfileUpdateMessage(beforeProfile, data));
   } catch (error) {
     if (axios.isAxiosError(error)) {
       window.alert(String(error.response?.data?.detail ?? "更新资料失败，请检查输入内容。"));

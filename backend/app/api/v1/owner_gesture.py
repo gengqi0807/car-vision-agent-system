@@ -3,6 +3,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -58,12 +59,23 @@ async def get_stream_state() -> StreamState:
 
 @router.post("/stream/start", response_model=StreamState)
 async def start_stream(payload: StreamControlRequest) -> StreamState:
+    if service.stream_state.running:
+        service.stop()
     return service.start(source=payload.source, fps=payload.fps)
 
 
 @router.post("/stream/stop", response_model=StreamState)
 async def stop_stream() -> StreamState:
     return service.stop()
+
+
+@router.get("/video-feed")
+async def owner_gesture_video_feed() -> StreamingResponse:
+    return StreamingResponse(
+        service.mjpeg_frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 @router.get(

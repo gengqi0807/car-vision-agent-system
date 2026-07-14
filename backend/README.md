@@ -10,10 +10,10 @@
 
 ## Plate Recognition Setup
 
-- Backend engine: the project now uses `HyperLPR3`, a Chinese license plate recognition framework that can be installed directly with `pip`.
-- Model files: `hyperlpr3` packages its own runtime assets, so you do not need to place a separate `.pt` file under `backend/weights`.
-- Runtime cache: the first import writes model assets under `backend/runtime/.hyperlpr3`. You can change that with `HYPERLPR_HOME_DIR`.
-- Detection level: set `HYPERLPR_DETECT_LEVEL=low` for faster CPU inference or `high` for better recall.
+- Backend pipeline: the project now uses `YOLO + PaddleOCR` for Chinese license plate detection and text recognition.
+- Detection weights: configure `PLATE_YOLO_MODEL_PATH` to point to your plate detector weights. The default sample is `weights/open_traffic_flow_best.pt`.
+- OCR runtime: PaddleOCR downloads and caches its runtime files on first use. The Ultralytics runtime cache lives under `backend/runtime/ultralytics`.
+- OCR options: tune `PLATE_OCR_CONFIDENCE_THRESHOLD`, `PADDLEOCR_USE_ANGLE_CLS`, and `PADDLEOCR_LANGUAGE` for your data.
 - Large image optimization: `PLATE_MAX_IMAGE_SIDE=1600` downsizes oversized uploads before inference and maps boxes back to the original image.
 - Confidence threshold: set `PLATE_CONFIDENCE_THRESHOLD` to filter weak recognition results.
 - RTSP stream: the backend can pull an RTSP stream and push processed frames through `/api/v1/plate/ws/stream`.
@@ -23,13 +23,12 @@
 
 ## Source Notes
 
-- HyperLPR3 GitHub: https://github.com/szad670401/HyperLPR
-- The repository documents `pip install hyperlpr3`, Python/Windows support, a direct Python API, and Chinese plate types supported by the packaged model.
-- We evaluated OpenALPR as an alternative, but its official CLI documentation only lists `us` and `eu` country codes, so it is not a good default for Chinese license plates.
+- PaddleOCR GitHub: https://github.com/PaddlePaddle/PaddleOCR
+- The official PaddleOCR docs cover Python inference, Windows deployment, and the 3.x runtime API for local OCR integration.
 
 ## Current Scope
 
 - FastAPI application skeleton
 - API route placeholders for the four major business domains
-- Plate recognition now uses HyperLPR3 for Chinese license plate detection and recognition
+- Plate recognition now uses YOLO detection plus PaddleOCR recognition for Chinese license plates
 - Alert agent and websocket manager scaffolding

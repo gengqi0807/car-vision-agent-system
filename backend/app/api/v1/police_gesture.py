@@ -47,23 +47,30 @@ def _get_current_user_from_query_token(token: str | None) -> User:
 )
 async def current_police_gesture(
     file: UploadFile = File(...),
+    session_id: str | None = Form(default=None),
+    input_mode: str = Form(default="image"),
     current_user: User = Depends(get_current_user),
 ) -> GestureFrameResult:
-    filename = file.filename or "upload.jpg"
     image_bytes = await file.read()
     try:
-        return await service.process_frame(image_bytes, filename, current_user.id)
+        return await service.process_frame(
+            image_bytes,
+            file.filename or "upload.jpg",
+            current_user.id,
+            session_id=session_id,
+            input_mode=input_mode,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         await service._capture_error(
-            filename=filename,
+            filename=file.filename or "upload.jpg",
             event_type="police_gesture_image_failure",
-            summary=f"Police gesture image recognition failed: {exc}",
+            summary=str(exc),
             user_id=current_user.id,
-            details={"filename": filename},
+            details={"input_mode": input_mode, "session_id": session_id},
         )
-        logger.exception("Police gesture image recognition failed for %s", filename)
+        logger.exception("Police gesture image recognition failed for %s", file.filename or "upload.jpg")
         raise HTTPException(status_code=500, detail=f"交警手势图片识别失败：{exc}") from exc
 
 
@@ -80,14 +87,13 @@ async def recognize_police_gesture_video(
     task_id: str | None = Form(default=None),
     current_user: User = Depends(get_current_user),
 ) -> PoliceGestureVideoResult:
-    filename = file.filename or "upload.mp4"
-    logger.info("Received police gesture video request: %s", filename)
+    logger.info("Received police gesture video request: %s", file.filename or "upload.mp4")
     video_bytes = await file.read()
     try:
         response = await asyncio.to_thread(
             service.process_video_bytes,
             video_bytes,
-            filename,
+            file.filename or "upload.mp4",
             current_user.id,
             task_id,
         )
@@ -95,22 +101,22 @@ async def recognize_police_gesture_video(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         await service._capture_error(
-            filename=filename,
+            filename=file.filename or "upload.mp4",
             event_type="police_gesture_video_failure",
-            summary=f"Police gesture video recognition failed: {exc}",
+            summary=str(exc),
             user_id=current_user.id,
-            details={"filename": filename, "task_id": task_id},
+            details={"task_id": task_id},
         )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         await service._capture_error(
-            filename=filename,
+            filename=file.filename or "upload.mp4",
             event_type="police_gesture_video_failure",
-            summary=f"Police gesture video recognition failed: {exc}",
+            summary=str(exc),
             user_id=current_user.id,
-            details={"filename": filename, "task_id": task_id},
+            details={"task_id": task_id},
         )
-        logger.exception("Police gesture video recognition failed for %s", filename)
+        logger.exception("Police gesture video recognition failed for %s", file.filename or "upload.mp4")
         raise HTTPException(status_code=500, detail=f"交警手势视频识别失败：{exc}") from exc
 
     processed_url = response.processed_video_url

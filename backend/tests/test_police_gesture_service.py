@@ -1,6 +1,6 @@
-import asyncio
 import os
 import sys
+from collections import deque
 from pathlib import Path
 
 from sqlalchemy import create_engine
@@ -19,33 +19,44 @@ for path in (ROOT_DIR, BACKEND_DIR):
 from app.core.database import Base
 from app.models.monitor_log import MonitorLog
 from app.services import police_gesture_service as police_gesture_service_module
-from app.services.police_gesture_local_runtime import NO_VIDEO_GESTURE
 from app.services.police_gesture_service import PoliceGestureService
 
 
-def test_record_video_monitor_result_persists_no_detection_warning(tmp_path, monkeypatch):
+def test_low_confidence_monitor_event_warns_after_ten_hits(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{tmp_path / 'police_monitor.db'}", future=True)
     testing_session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     Base.metadata.create_all(bind=engine)
     monkeypatch.setattr(police_gesture_service_module, "SessionLocal", testing_session)
 
     service = PoliceGestureService()
+    hits = deque()
 
-    asyncio.run(
-        service._record_video_monitor_result(
-            filename="no-gesture.mp4",
-            user_id=1,
-            gesture=NO_VIDEO_GESTURE,
-            confidence=0.0,
-            processed_frame_count=48,
-            total_frames=48,
+    for now in range(1, 10):
+        service._handle_low_confidence_monitor_event_sync(
+            hits=hits,
+            now=float(now),
+            filename="low-confidence.mp4",
+            gesture="stop",
+            confidence=0.45,
+            source_kind="视频",
         )
+
+    with testing_session() as session:
+        assert session.query(MonitorLog).count() == 0
+
+    service._handle_low_confidence_monitor_event_sync(
+        hits=hits,
+        now=10.0,
+        filename="low-confidence.mp4",
+        gesture="stop",
+        confidence=0.45,
+        source_kind="视频",
     )
 
     with testing_session() as session:
         logs = session.query(MonitorLog).all()
 
     assert len(logs) == 1
-    assert logs[0].event_type == "police_gesture_no_detection"
+    assert logs[0].event_type == "police_gesture_low_confidence"
     assert logs[0].level == "warning"
-    assert logs[0].status == "no_detection"
+    assert logs[0].status == "processed"
