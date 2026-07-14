@@ -61,7 +61,7 @@ class GestureClassifier:
     # 动态手势稳定延迟：动作开始 N 秒后才输出结果，避免初期跳变
     DYNAMIC_SETTLE_SECONDS: float = 1.0
 
-    def __init__(self, domain: str = "owner"):
+    def __init__(self, domain: str = "owner", load_custom: bool = True):
         self.domain = domain
         self.tracker: HandGestureTracker | None = (
             HandGestureTracker() if domain == "owner" else None
@@ -102,7 +102,8 @@ class GestureClassifier:
         if domain == "owner":
             self._load_ml_model()
             self._load_dynamic_lstm()
-            self._load_custom_model()
+            if load_custom:
+                self._load_custom_model()
 
     # ----------------------------------------------------------------
     # ML 模型加载与推理

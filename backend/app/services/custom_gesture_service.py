@@ -31,6 +31,24 @@ from app.schemas.custom_gesture import (
 
 logger = logging.getLogger(__name__)
 
+# 固有静态手势类别名（来自 owner_gesture_dataset_features/features.npz）。
+# 合并训练时这些类别会与自定义手势共用一个 label 空间，
+# 因此禁止用户用这些名字创建自定义手势，避免 label 冲突。
+RESERVED_STATIC_GESTURE_NAMES = {
+    "thumb_up",
+    "fist",
+    "palm",
+    "thumb_down",
+    "thumb_index",
+}
+
+# 固有静态离线特征集（合并训练强依赖）
+_FEATURES_FILE = (
+    Path(__file__).resolve().parents[3]
+    / "owner_gesture_dataset_features"
+    / "features.npz"
+)
+
 
 # ── 关键点提取（复用 MediaPipeHands） ─────────────────────────────
 
@@ -65,6 +83,56 @@ def extract_keypoints_from_image(image_bytes: bytes) -> list[dict]:
     return kps_21
 
 
+def extract_keypoints_batch(
+    image_list: list[tuple[str, bytes]],
+) -> list[tuple[list[dict] | None, str | None]]:
+    """批量提取手部关键点，复用单个 MediaPipeHands 实例。
+
+    Args:
+        image_list: [(filename, image_bytes), ...]
+
+    Returns:
+        [(keypoints_21 or None, error_reason or None), ...] 顺序与输入一致。
+    """
+    # 预解码所有图片
+    frames_and_errors: list[tuple[np.ndarray | None, str | None]] = []
+    for filename, img_bytes in image_list:
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if frame is None:
+            frames_and_errors.append((None, "无法解码图片，请确认上传的是有效的图片文件"))
+        else:
+            frames_and_errors.append((frame, None))
+
+    # 复用单个 MediaPipeHands 实例批量推理
+    with MediaPipeHands(
+        num_hands=1,
+        min_detection_confidence=0.5,
+        min_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    ) as hands:
+        batch_results: list[tuple[list[dict] | None, str | None]] = []
+        for frame, pre_err in frames_and_errors:
+            if pre_err is not None:
+                batch_results.append((None, pre_err))
+                continue
+            try:
+                result = hands.infer(frame)
+                kps = result.get("keypoints", [])
+                if not kps or result.get("num_hands_detected", 0) == 0:
+                    batch_results.append((None, "未检测到手部，请确保图片中包含清晰完整的手部"))
+                    continue
+                kps_21 = kps[:21]
+                if len(kps_21) < 21:
+                    batch_results.append((None, f"检测到的手部关键点不足（{len(kps_21)}/21），请换一张更清晰的手势图片"))
+                    continue
+                batch_results.append((kps_21, None))
+            except Exception as exc:
+                batch_results.append((None, f"处理异常: {str(exc)}"))
+
+    return batch_results
+
+
 # ── 手势元数据管理 ────────────────────────────────────────────────
 
 def list_custom_gestures(db: Session) -> tuple[list[CustomGestureOut], int]:
@@ -75,6 +143,11 @@ def list_custom_gestures(db: Session) -> tuple[list[CustomGestureOut], int]:
 
 
 def create_custom_gesture(db: Session, payload: CustomGestureCreate) -> CustomGestureOut:
+    if payload.name in RESERVED_STATIC_GESTURE_NAMES:
+        raise ValueError(
+            f"'{payload.name}' 是固有静态手势名，已被系统占用，请换一个名字"
+        )
+
     existing = db.query(CustomGesture).filter(CustomGesture.name == payload.name).first()
     if existing:
         raise ValueError(f"手势 '{payload.name}' 已存在")
@@ -96,6 +169,13 @@ def delete_custom_gesture(db: Session, gesture_name: str) -> bool:
         return False
     db.delete(gesture)
     db.commit()
+
+    # 1) 清除内存中的分类器实例
+    _clear_custom_classifiers()
+
+    # 2) 重建模型文件（若剩余数据充足），否则删除磁盘模型
+    _rebuild_or_remove_custom_model(db, gesture_name)
+
     return True
 
 
@@ -206,12 +286,16 @@ def run_train(
                 class_names=[g.name for g in gestures],
             )
 
-        if len(gestures) < 2:
+        # 合并训练依赖固有静态特征集，缺失则无法训练
+        if not _FEATURES_FILE.exists():
             return CustomGestureTrainOut(
-                status="single_class",
-                message="自定义手势至少需要 2 个类别才能训练 SVM。",
+                status="error",
+                message=(
+                    f"固有静态手势特征文件不存在: {_FEATURES_FILE}，"
+                    "合并训练依赖该文件，请先运行 scripts/extract_features.py 生成。"
+                ),
                 n_samples=total_samples,
-                n_classes=1,
+                n_classes=len(gestures),
                 class_names=[g.name for g in gestures],
             )
 
@@ -294,18 +378,59 @@ def run_train(
 
 
 def _reload_custom_classifier() -> None:
-    """通知 GestureClassifier 重新加载自定义手势模型。"""
-    try:
-        from app.models_infer.gesture_classifier import GestureClassifier
+    """通知所有 GestureClassifier 实例重新加载自定义手势模型。"""
+    _clear_custom_classifiers()
 
-        # 强制重建单例分类器（下次请求时自动加载新模型）
-        if hasattr(GestureClassifier, "_custom_model_path"):
-            # 清除已加载的模型引用，下次 classify_custom 时重新加载
-            _cls = GestureClassifier
-            if hasattr(_cls, "_custom_model") and _cls._custom_model is not None:
-                _cls._custom_model = None
-                _cls._custom_scaler = None
-                _cls._custom_labels = None
-                logger.info("自定义手势分类器已热卸载，下次推理时自动重新加载")
+
+def _clear_custom_classifiers() -> None:
+    """清除 OwnerGestureService 中所有 GestureClassifier 实例的模型引用，
+    使下次 classify_custom 时重新从磁盘加载模型。"""
+    try:
+        from app.services.owner_gesture_service import OwnerGestureService
+
+        svc = OwnerGestureService._instance
+        if svc is None:
+            return
+
+        for attr_name in ("_classifier", "_stream_classifier"):
+            instance = getattr(svc, attr_name, None)
+            if instance is not None:
+                instance._custom_model = None
+                instance._custom_scaler = None
+                instance._custom_labels = None
+
+        logger.info("自定义手势分类器已热卸载，下次推理时自动重新加载")
     except Exception:
-        logger.debug("热加载自定义分类器时出错，忽略", exc_info=True)
+        logger.debug("热卸载自定义分类器时出错，忽略", exc_info=True)
+
+
+def _rebuild_or_remove_custom_model(
+    db: Session, deleted_gesture_name: str
+) -> None:
+    """删除手势后重建 SVM 模型文件（若剩余类别/样本充足），否则删除磁盘模型。"""
+    model_path = settings.resolved_custom_gesture_classifier_model_path
+
+    # 查询剩余手势
+    remaining = db.query(CustomGesture).all()
+    total_samples = sum(g.sample_count or 0 for g in remaining)
+
+    if len(remaining) >= 1 and total_samples >= 10:
+        # 剩余数据充足 → 自动重新训练（合并固有静态类别，单个自定义类也可训练）
+        logger.info(
+            "删除 '%s' 后剩余 %d 个手势 / %d 个样本，触发自动重训练",
+            deleted_gesture_name,
+            len(remaining),
+            total_samples,
+        )
+        run_train(gesture_names=[g.name for g in remaining])
+    else:
+        # 不足 → 删除磁盘模型
+        if os.path.exists(model_path):
+            os.remove(model_path)
+            logger.info(
+                "删除 '%s' 后剩余数据不足（%d 类 / %d 样本），已删除模型文件: %s",
+                deleted_gesture_name,
+                len(remaining),
+                total_samples,
+                model_path,
+            )

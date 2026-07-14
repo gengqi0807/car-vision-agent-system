@@ -13,9 +13,11 @@ from app.schemas.custom_gesture import (
     CustomGestureCreate,
     CustomGestureListOut,
     CustomGestureOut,
+    CustomGestureSampleBatchOut,
     CustomGestureSampleCreate,
     CustomGestureSampleListOut,
     CustomGestureSampleOut,
+    CustomGestureSampleRejected,
     CustomGestureTrainOut,
     CustomGestureTrainRequest,
     KeypointItem,
@@ -25,6 +27,7 @@ from app.services.custom_gesture_service import (
     create_custom_gesture,
     delete_custom_gesture,
     delete_sample,
+    extract_keypoints_batch,
     extract_keypoints_from_image,
     get_custom_gesture_by_name,
     list_custom_gestures,
@@ -98,32 +101,68 @@ def get_samples(
     return CustomGestureSampleListOut(samples=samples, total=total)
 
 
-@router.post("/{gesture_name}/samples", response_model=CustomGestureSampleOut)
+@router.post("/{gesture_name}/samples", response_model=CustomGestureSampleBatchOut)
 async def create_sample(
     gesture_name: str,
-    file: UploadFile = File(...),
+    file: list[UploadFile] = File(...),
     db: Session = Depends(get_db),
     _current_user: User = Depends(get_current_user),
 ):
-    """上传手势图片，服务端自动抽取 21 个手部关键点并保存为样本。"""
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="请上传图片文件")
+    """上传手势图片（支持单张或多张），服务端自动抽取 21 个手部关键点并保存为样本。
+    不合规定的图片直接丢弃并在响应中返回原因。"""
+    # 确认手势存在
+    gesture = get_custom_gesture_by_name(db, gesture_name)
+    if not gesture:
+        raise HTTPException(status_code=404, detail=f"手势 '{gesture_name}' 不存在")
 
-    try:
-        image_bytes = await file.read()
-        kps = extract_keypoints_from_image(image_bytes)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    # 分离合规图片与非图片文件
+    image_list: list[tuple[str, bytes]] = []
+    rejected: list[CustomGestureSampleRejected] = []
 
-    try:
-        payload = CustomGestureSampleCreate(
-            keypoints=[KeypointItem(x=k["x"], y=k["y"], z=k.get("z", 0.0)) for k in kps],
-            source_type="upload",
-            filename=file.filename or "",
-        )
-        return add_sample(db, gesture_name, payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    for f in file:
+        filename = f.filename or "unknown"
+        if not f.content_type or not f.content_type.startswith("image/"):
+            rejected.append(CustomGestureSampleRejected(
+                filename=filename,
+                reason="非图片文件，已跳过",
+            ))
+            continue
+        try:
+            img_bytes = await f.read()
+            image_list.append((filename, img_bytes))
+        except Exception as exc:
+            rejected.append(CustomGestureSampleRejected(
+                filename=filename,
+                reason=f"读取文件失败: {str(exc)}",
+            ))
+
+    # 批量提取关键点
+    batch_results = extract_keypoints_batch(image_list)
+
+    samples: list[CustomGestureSampleOut] = []
+    for (filename, _), (kps, err) in zip(image_list, batch_results):
+        if err is not None:
+            rejected.append(CustomGestureSampleRejected(filename=filename, reason=err))
+            continue
+        try:
+            payload = CustomGestureSampleCreate(
+                keypoints=[KeypointItem(x=k["x"], y=k["y"], z=k.get("z", 0.0)) for k in kps],
+                source_type="upload",
+                filename=filename,
+            )
+            sample = add_sample(db, gesture_name, payload)
+            samples.append(sample)
+        except ValueError as exc:
+            rejected.append(CustomGestureSampleRejected(filename=filename, reason=str(exc)))
+
+    total_uploaded = len(file)
+    return CustomGestureSampleBatchOut(
+        samples=samples,
+        rejected=rejected,
+        total_uploaded=total_uploaded,
+        total_accepted=len(samples),
+        total_rejected=len(rejected),
+    )
 
 
 @router.delete("/samples/{sample_id}")

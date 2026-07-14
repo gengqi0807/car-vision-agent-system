@@ -69,6 +69,21 @@ class CustomGestureSampleListOut(BaseModel):
     total: int
 
 
+class CustomGestureSampleRejected(BaseModel):
+    """被拒绝的图片及其原因。"""
+    filename: str
+    reason: str
+
+
+class CustomGestureSampleBatchOut(BaseModel):
+    """批量上传样本的响应。"""
+    samples: list[CustomGestureSampleOut]
+    rejected: list[CustomGestureSampleRejected]
+    total_uploaded: int
+    total_accepted: int
+    total_rejected: int
+
+
 # ── 训练 ──────────────────────────────────────────────────────────
 
 class CustomGestureTrainRequest(BaseModel):

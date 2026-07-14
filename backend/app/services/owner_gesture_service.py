@@ -344,7 +344,7 @@ class OwnerGestureService:
         if self._stream_classifier is None:
             from app.models_infer.gesture_classifier import GestureClassifier
 
-            self._stream_classifier = GestureClassifier(domain="owner")
+            self._stream_classifier = GestureClassifier(domain="owner", load_custom=False)
         return self._stream_classifier
 
     @property
@@ -426,8 +426,15 @@ class OwnerGestureService:
         previous_record = recent_records[0] if recent_records else None
         if input_mode == "image":
             primary_hand = hands[0] if hands else []
-            image_gesture = None
-            image_confidence = None
+            # 图片模式：优先用自定义手势分类器，命中则直接用自定义手势
+            if primary_hand:
+                custom_result = self.classifier.classify_custom(primary_hand)
+                if custom_result is not None:
+                    image_gesture, image_confidence = custom_result
+                else:
+                    image_gesture, image_confidence = None, None
+            else:
+                image_gesture, image_confidence = None, None
         elif input_mode != "camera":
             primary_hand, image_gesture, image_confidence = self._select_primary_hand(
                 hands,
@@ -435,6 +442,7 @@ class OwnerGestureService:
             )
 
         if input_mode == "camera":
+            # ---- 相机模式：仅使用有动作映射的原有手势，不使用自定义手势 ----
             raw_gesture_label, cls_conf = self._lock_camera_result(
                 runtime_session,
                 gesture=raw_gesture_label,
@@ -453,17 +461,13 @@ class OwnerGestureService:
 
         control_command, _ = self._map_gesture_to_command(raw_gesture_label)
 
-        # ---- 优先使用有动作映射的原有手势，无映射时回退到自定义手势 ----
-        action = GESTURE_ACTION_MAP.get(raw_gesture_label, "idle")
-        if action == "idle":
-            custom_result = self.classifier.classify_custom(primary_hand)
-            if custom_result is not None and input_mode != "camera":
-                custom_name, custom_conf = custom_result
-                raw_gesture_label = custom_name
-                cls_conf = custom_conf
-            elif custom_result is not None and input_mode == "camera":
-                custom_name, custom_conf = self.stream_classifier.classify_custom(primary_hand) or (None, 0.0)
-                if custom_name and custom_conf >= 0.65:
+        # ---- 优先使用有动作映射的原有手势，无映射时回退到自定义手势（仅上传/图片模式） ----
+        if input_mode != "camera":
+            action = GESTURE_ACTION_MAP.get(raw_gesture_label, "idle")
+            if action == "idle":
+                custom_result = self.classifier.classify_custom(primary_hand)
+                if custom_result is not None:
+                    custom_name, custom_conf = custom_result
                     raw_gesture_label = custom_name
                     cls_conf = custom_conf
 
@@ -713,7 +717,7 @@ class OwnerGestureService:
             min_presence_confidence=settings.min_hand_presence_confidence,
             min_tracking_confidence=settings.min_hand_tracking_confidence,
         )
-        self._stream_classifier = GestureClassifier(domain="owner")
+        self._stream_classifier = GestureClassifier(domain="owner", load_custom=False)
 
     def _infer_camera_hands(self, frame: np.ndarray) -> list[list[dict]]:
         if not self._camera_runtime_ready:
@@ -769,6 +773,7 @@ class OwnerGestureService:
                     )
                     primary_hand = primary_hand or []  # 无手时兜底，避免下游 len(None) 异常
                     observed_gesture = raw_gesture
+                    # ---- 实时视频流：仅使用有动作映射的原有手势，不使用自定义手势 ----
                     raw_gesture, confidence = self._lock_camera_result(
                         self._stream_runtime_session,
                         gesture=raw_gesture,
@@ -776,15 +781,6 @@ class OwnerGestureService:
                         hand_present=bool(primary_hand),
                     )
                     control_command, _ = self._map_gesture_to_command(raw_gesture)
-
-                    # ---- 优先使用有动作映射的原有手势，无映射时回退到自定义手势 ----
-                    action = GESTURE_ACTION_MAP.get(raw_gesture, "idle")
-                    if action == "idle":
-                        custom_result = self.stream_classifier.classify_custom(primary_hand)
-                        if custom_result is not None:
-                            custom_name, custom_conf = custom_result
-                            raw_gesture = custom_name
-                            confidence = custom_conf
 
                     action = GESTURE_ACTION_MAP.get(raw_gesture, "idle")
                     gesture = self._normalize_public_gesture(raw_gesture)
