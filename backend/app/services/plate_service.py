@@ -91,6 +91,7 @@ class PlateProcessingState:
     working_width: int = 0
     working_height: int = 0
     stream_mode: bool = False
+    profiling_totals: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -789,14 +790,20 @@ class PlateService:
                     self._merge_best_detections(best_detections, active_detections, recognized=False)
                 if processed_frame_count == 1 or processed_frame_count % progress_log_interval == 0:
                     elapsed = max(time.monotonic() - started_at, 0.001)
+                    profile_totals = state.profiling_totals
                     logger.info(
-                        "Video processing progress: %s | frame=%d/%s detection_passes=%d fresh_hits=%d elapsed=%.1fs",
+                        "Video processing progress: %s | frame=%d/%s detection_passes=%d fresh_hits=%d elapsed=%.1fs profile={tracking=%.1fs recognize=%.1fs probe=%.1fs unread_ocr=%.1fs render=%.1fs}",
                         filename,
                         processed_frame_count,
                         total_frames if total_frames > 0 else "?",
                         detection_pass_count,
                         detection_hit_count,
                         elapsed,
+                        profile_totals.get("tracking", 0.0),
+                        profile_totals.get("recognize", 0.0),
+                        profile_totals.get("probe", 0.0),
+                        profile_totals.get("unread_ocr", 0.0),
+                        profile_totals.get("render", 0.0),
                     )
                 if should_publish_progress:
                     try:
@@ -832,12 +839,17 @@ class PlateService:
             self._save_history(detections, None)
 
         logger.info(
-            "Video detection stage finished: %s | processed_frames=%d detection_passes=%d unique_plates=%d elapsed=%.1fs",
+            "Video detection stage finished: %s | processed_frames=%d detection_passes=%d unique_plates=%d elapsed=%.1fs profile={tracking=%.1fs recognize=%.1fs probe=%.1fs unread_ocr=%.1fs render=%.1fs}",
             filename,
             processed_frame_count,
             detection_pass_count,
             len(detections),
             time.monotonic() - started_at,
+            state.profiling_totals.get("tracking", 0.0),
+            state.profiling_totals.get("recognize", 0.0),
+            state.profiling_totals.get("probe", 0.0),
+            state.profiling_totals.get("unread_ocr", 0.0),
+            state.profiling_totals.get("render", 0.0),
         )
 
         self._transcode_video_for_web(temp_output_path, output_path)
@@ -893,6 +905,7 @@ class PlateService:
             or state.frame_index - state.last_tracking_frame
             >= self._video_track_update_interval(
                 use_fast_large_plate_mode,
+                stream_mode=state.stream_mode,
                 prioritize_small_targets=prioritize_small_targets,
             )
         )
@@ -924,7 +937,14 @@ class PlateService:
         state.working_width = working_frame.shape[1]
         state.working_height = working_frame.shape[0]
         if should_update_tracks:
-            state.tracks = self._update_tracks(working_frame, state.tracks, state.frame_index)
+            tracking_started_at = time.perf_counter()
+            state.tracks = self._update_tracks(
+                working_frame,
+                state.tracks,
+                state.frame_index,
+                stream_mode=state.stream_mode,
+            )
+            self._record_video_profile_time(state, "tracking", time.perf_counter() - tracking_started_at)
             state.last_tracking_frame = state.frame_index
 
         fresh_working_detections: list[PlateDetection] = []
@@ -932,6 +952,7 @@ class PlateService:
         if should_rerecognize:
             ran_recognize = True
             use_heavy_scan = settings.plate_video_detector_full_frame_fallback and self._should_use_heavy_scan(state)
+            recognize_started_at = time.perf_counter()
             raw_working_detections = self._recognize_detections(
                 working_frame,
                 aggressive=False,
@@ -940,7 +961,9 @@ class PlateService:
                 fast_mode=True,
                 preserve_unread=not use_fast_large_plate_mode,
                 video_fast_detector=use_fast_large_plate_mode,
+                stream_mode=state.stream_mode,
             )
+            self._record_video_profile_time(state, "recognize", time.perf_counter() - recognize_started_at)
             fresh_working_detections = [item for item in raw_working_detections if item.plate_number]
             state.tracks = self._merge_recognized_tracks(
                 working_frame,
@@ -956,6 +979,7 @@ class PlateService:
             )
             state.last_recognition_frame = state.frame_index
         if should_probe_tracks:
+            probe_started_at = time.perf_counter()
             probe_hits = self._find_untracked_detector_hits(
                 working_frame,
                 state.tracks,
@@ -968,6 +992,7 @@ class PlateService:
                     fast_mode=True,
                     preserve_unread=not use_fast_large_plate_mode,
                     video_mode=True,
+                    stream_mode=state.stream_mode,
                 )
                 fresh_working_detections = [item for item in raw_probe_detections if item.plate_number]
                 state.tracks = self._merge_recognized_tracks(
@@ -991,15 +1016,18 @@ class PlateService:
                 if fresh_working_detections:
                     state.last_recognition_frame = state.frame_index
             state.last_probe_frame = state.frame_index
+            self._record_video_profile_time(state, "probe", time.perf_counter() - probe_started_at)
 
         unread_ocr_detections: list[PlateDetection] = []
         if self._should_attempt_active_unread_ocr(state=state, fresh_detections=fresh_working_detections):
+            unread_ocr_started_at = time.perf_counter()
             unread_ocr_detections = self._recover_active_unread_tracks(
                 source_frame=source_frame,
                 working_frame=working_frame,
                 state=state,
                 fresh_detections=fresh_working_detections,
             )
+            self._record_video_profile_time(state, "unread_ocr", time.perf_counter() - unread_ocr_started_at)
         if unread_ocr_detections:
             fresh_working_detections.extend(unread_ocr_detections)
             state.tracks = self._merge_recognized_tracks(
@@ -1034,6 +1062,7 @@ class PlateService:
         if not render:
             return None, active_detections, fresh_detections, active_detections
 
+        render_started_at = time.perf_counter()
         display_frame = self._resize_stream_frame(source_frame)
         scaled_detections = self._scale_detections(
             active_detections,
@@ -1043,6 +1072,7 @@ class PlateService:
             display_frame.shape[0],
         )
         annotated = self._annotate_frame(display_frame, scaled_detections)
+        self._record_video_profile_time(state, "render", time.perf_counter() - render_started_at)
         return annotated, active_detections, fresh_detections, active_detections
 
     def _resolve_video_output_fps_target(self, fps: float) -> int:
@@ -1055,10 +1085,12 @@ class PlateService:
         self,
         use_fast_large_plate_mode: bool,
         *,
+        stream_mode: bool = False,
         prioritize_small_targets: bool = False,
     ) -> int:
         return self._video_track_update_interval_for_mode(
             use_fast_large_plate_mode,
+            stream_mode=stream_mode,
             prioritize_small_targets=prioritize_small_targets,
         )
 
@@ -1066,8 +1098,13 @@ class PlateService:
         self,
         use_fast_large_plate_mode: bool,
         *,
+        stream_mode: bool,
         prioritize_small_targets: bool,
     ) -> int:
+        if not stream_mode:
+            if prioritize_small_targets:
+                return 6 if use_fast_large_plate_mode else 4
+            return 12 if use_fast_large_plate_mode else 6
         if prioritize_small_targets:
             return 6 if use_fast_large_plate_mode else 3
         return 8 if use_fast_large_plate_mode else 4
@@ -1126,8 +1163,14 @@ class PlateService:
     def _should_probe_new_video_tracks(self, state: PlateProcessingState) -> bool:
         if state.frame_index <= 1:
             return False
+        if not state.tracks:
+            return False
         unread_track_count = sum(1 for track in state.tracks if not track.plate_number and track.misses == 0)
         has_small_target_unread = self._has_active_small_target_unread_track(state.tracks)
+        if unread_track_count == 0:
+            since_last_recognition = state.frame_index - state.last_recognition_frame
+            if since_last_recognition < max(state.recognition_interval, 18):
+                return False
         if unread_track_count >= 2:
             if has_small_target_unread:
                 probe_interval = max(state.recognition_interval, 20)
@@ -1170,6 +1213,12 @@ class PlateService:
         )
 
     def _resolve_video_recognition_max_side(self, source_frame, state: PlateProcessingState) -> int:
+        if state.stream_mode:
+            configured_limit = int(settings.plate_stream_recognition_max_side)
+            if configured_limit <= 0:
+                configured_limit = max(int(settings.plate_stream_max_side), 1)
+            return configured_limit
+
         configured_limit = settings.plate_video_recognition_max_side
         if configured_limit <= 0:
             return configured_limit
@@ -1203,6 +1252,8 @@ class PlateService:
         state: PlateProcessingState,
         fresh_detections: list[PlateDetection],
     ) -> bool:
+        if state.stream_mode:
+            return False
         if self._should_use_fast_large_plate_mode(state):
             return False
         candidates = [
@@ -1219,6 +1270,8 @@ class PlateService:
         return not any(detection.plate_number for detection in fresh_detections)
 
     def _should_attempt_idle_unread_ocr(self, state: PlateProcessingState) -> bool:
+        if state.stream_mode:
+            return False
         if self._should_use_fast_large_plate_mode(state):
             return False
         for track in state.tracks:
@@ -1661,7 +1714,12 @@ class PlateService:
         state.frame_index += 1
         display_frame = self._resize_stream_frame(source_frame)
 
-        state.tracks = self._update_tracks(source_frame, state.tracks, state.frame_index)
+        state.tracks = self._update_tracks(
+            source_frame,
+            state.tracks,
+            state.frame_index,
+            stream_mode=True,
+        )
         fresh_detections: list[PlateDetection] = []
 
         if self._should_rerecognize(
@@ -1763,6 +1821,7 @@ class PlateService:
         fast_mode: bool = False,
         preserve_unread: bool = False,
         video_fast_detector: bool = False,
+        stream_mode: bool = False,
     ) -> list[PlateDetection]:
         merged_detections: list[PlateDetection] = []
         if self._should_use_detector():
@@ -1774,6 +1833,7 @@ class PlateService:
                     preserve_unread=preserve_unread,
                     video_mode=not isinstance(image_source, (bytes, bytearray)),
                     video_fast_detector=video_fast_detector,
+                    stream_mode=stream_mode,
                 )
                 if detector_detections:
                     merged_detections.extend(detector_detections)
@@ -1789,7 +1849,10 @@ class PlateService:
         if not allow_full_frame_fallback:
             return []
 
-        max_side_override = settings.plate_stream_recognition_max_side if not isinstance(image_source, (bytes, bytearray)) else None
+        max_side_override = self._resolve_full_frame_ocr_max_side_override(
+            image_source=image_source,
+            stream_mode=stream_mode,
+        )
         confidence_threshold = 0.26 if aggressive else None
         try:
             recognized_items = self.recognizer.recognize_all(
@@ -1816,6 +1879,14 @@ class PlateService:
             for item in recognized_items
         ]
         return full_frame_detections
+
+    def _resolve_full_frame_ocr_max_side_override(self, *, image_source, stream_mode: bool) -> int | None:
+        if isinstance(image_source, (bytes, bytearray)):
+            return None
+        if not stream_mode:
+            return None
+        configured_limit = int(settings.plate_stream_recognition_max_side)
+        return configured_limit if configured_limit > 0 else None
 
     def _should_use_detector(self) -> bool:
         return self.detector.is_available()
@@ -2199,6 +2270,7 @@ class PlateService:
         preserve_unread: bool = False,
         video_mode: bool = False,
         video_fast_detector: bool = False,
+        stream_mode: bool = False,
     ) -> list[PlateDetection]:
         image = self._decode_image_source(image_source)
         detector_hits = (
@@ -2231,6 +2303,8 @@ class PlateService:
                 max_candidates = min(max_candidates, 6)
             else:
                 max_candidates = min(max_candidates, 4)
+        if stream_mode and video_mode:
+            max_candidates = min(max_candidates, 3)
 
         if video_mode:
             plate_hits, vehicle_hits = self._count_detector_hit_kinds(detector_hits[:max_candidates])
@@ -2252,6 +2326,7 @@ class PlateService:
                     fast_mode=fast_mode,
                     preserve_unread=preserve_unread,
                     video_mode=video_mode,
+                    stream_mode=stream_mode,
                 )
             )
 
@@ -2278,6 +2353,7 @@ class PlateService:
         preserve_unread: bool = False,
         allow_ocr_fallback: bool = True,
         video_mode: bool = False,
+        stream_mode: bool = False,
     ) -> list[PlateDetection]:
         recognized: list[PlateDetection] = []
         for hit in hits:
@@ -2290,6 +2366,7 @@ class PlateService:
                     preserve_unread=preserve_unread,
                     allow_ocr_fallback=allow_ocr_fallback,
                     video_mode=video_mode,
+                    stream_mode=stream_mode,
                 )
             )
         return self._deduplicate_plate_detections(recognized)
@@ -2311,33 +2388,31 @@ class PlateService:
             logger.warning("Plate detector unavailable during video probe scan.", exc_info=True)
             return []
 
+        unmatched = self._collect_unmatched_probe_hits(
+            detector_hits,
+            tracks,
+            max_hits=max_hits,
+        )
+
         masked_detector_hits: list[dict] = []
-        if tracks and not use_fast_probe:
+        if (
+            len(unmatched) < max_hits
+            and tracks
+            and not use_fast_probe
+            and self._should_run_masked_video_probe(tracks)
+        ):
             masked_image = self._mask_video_track_regions(image, tracks)
             if masked_image is not None:
                 try:
                     masked_detector_hits = self._detect_video_detector_hits(masked_image)
+                    unmatched = self._collect_unmatched_probe_hits(
+                        masked_detector_hits,
+                        tracks,
+                        existing_hits=unmatched,
+                        max_hits=max_hits,
+                    )
                 except (InferenceConfigurationError, InferenceDependencyError):
                     logger.warning("Plate detector unavailable during masked video probe scan.", exc_info=True)
-
-        unmatched: list[dict] = []
-        for hit in self._merge_detector_hits_for_probe(detector_hits, masked_detector_hits):
-            bbox = list(hit.get("bbox", []))
-            if not self._is_reasonable_crop_bbox(bbox):
-                continue
-            if self._is_likely_side_shadow_bbox_for_recognized_track(bbox, tracks):
-                continue
-
-            matched = False
-            for track in tracks:
-                if self._is_same_unread_track_bbox(bbox, track.bbox):
-                    matched = True
-                    break
-
-            if not matched:
-                unmatched.append(hit)
-            if len(unmatched) >= max_hits:
-                break
 
         plate_hits, vehicle_hits = self._count_detector_hit_kinds(detector_hits)
         masked_plate_hits, masked_vehicle_hits = self._count_detector_hit_kinds(masked_detector_hits)
@@ -2357,6 +2432,45 @@ class PlateService:
 
         return unmatched
 
+    def _collect_unmatched_probe_hits(
+        self,
+        hits: list[dict],
+        tracks: list[PlateTrack],
+        *,
+        existing_hits: list[dict] | None = None,
+        max_hits: int,
+    ) -> list[dict]:
+        unmatched = list(existing_hits or [])
+        for hit in hits:
+            bbox = list(hit.get("bbox", []))
+            if not self._is_reasonable_crop_bbox(bbox):
+                continue
+            if self._is_likely_side_shadow_bbox_for_recognized_track(bbox, tracks):
+                continue
+            if any(self._compute_iou(bbox, list(existing.get("bbox", []))) >= 0.45 for existing in unmatched):
+                continue
+
+            matched = False
+            for track in tracks:
+                if self._is_same_unread_track_bbox(bbox, track.bbox):
+                    matched = True
+                    break
+
+            if not matched:
+                unmatched.append(hit)
+            if len(unmatched) >= max_hits:
+                break
+        return unmatched
+
+    def _should_run_masked_video_probe(self, tracks: list[PlateTrack]) -> bool:
+        active_tracks = [track for track in tracks if track.misses == 0]
+        if len(active_tracks) != 1:
+            return False
+        track = active_tracks[0]
+        if self._is_large_recognized_track(track):
+            return True
+        return not track.plate_number
+
     def _should_use_fast_video_probe(self, tracks: list[PlateTrack]) -> bool:
         if any(not track.plate_number and track.misses == 0 for track in tracks):
             return False
@@ -2371,6 +2485,7 @@ class PlateService:
         preserve_unread: bool = False,
         allow_ocr_fallback: bool = True,
         video_mode: bool = False,
+        stream_mode: bool = False,
     ) -> list[PlateDetection]:
         recognized: list[PlateDetection] = []
         candidate_bboxes = self._resolve_detector_crop_bboxes(image, hit, video_mode=video_mode)
@@ -2429,6 +2544,7 @@ class PlateService:
                         best_detection,
                         fast_mode=fast_mode,
                         video_mode=video_mode,
+                        stream_mode=stream_mode,
                     )
                 recognized.append(
                     best_detection.model_copy(
@@ -2470,6 +2586,7 @@ class PlateService:
         *,
         fast_mode: bool,
         video_mode: bool,
+        stream_mode: bool = False,
     ) -> str:
         vehicle_type = self._classify_vehicle_type_near_plate_bbox(
             image,
@@ -2484,6 +2601,9 @@ class PlateService:
             and vehicle_type in {VEHICLE_TYPE_BUS, VEHICLE_TYPE_TRUCK}
         ):
             vehicle_type = VEHICLE_TYPE_CAR
+
+        if stream_mode or (video_mode and fast_mode):
+            return vehicle_type
 
         refined_vehicle_type = self._classify_vehicle_type_with_classifier(
             image,
@@ -3269,6 +3389,11 @@ class PlateService:
             track_unread_count,
         )
 
+    def _record_video_profile_time(self, state: PlateProcessingState, phase: str, elapsed_seconds: float) -> None:
+        if state.stream_mode or elapsed_seconds <= 0:
+            return
+        state.profiling_totals[phase] = state.profiling_totals.get(phase, 0.0) + float(elapsed_seconds)
+
     def _clamp_bbox(
         self,
         image_width: int,
@@ -3444,14 +3569,21 @@ class PlateService:
         interval = max(state.heavy_scan_interval, 1)
         return state.frame_index == 1 or state.frame_index % interval == 0
 
-    def _update_tracks(self, frame, tracks: list[PlateTrack], frame_index: int) -> list[PlateTrack]:
+    def _update_tracks(
+        self,
+        frame,
+        tracks: list[PlateTrack],
+        frame_index: int,
+        *,
+        stream_mode: bool = False,
+    ) -> list[PlateTrack]:
         active_tracks: list[PlateTrack] = []
         gray_frame = None
         if tracks:
             cv2 = self._require_cv2()
             gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         for track in tracks:
-            tracked = self._track_plate(gray_frame, track) if gray_frame is not None else False
+            tracked = self._track_plate(gray_frame, track, stream_mode=stream_mode) if gray_frame is not None else False
             if tracked and self._should_reject_stale_tracked_plate(track, frame_index):
                 tracked = False
                 track.misses += 2
@@ -3461,11 +3593,11 @@ class PlateService:
             else:
                 track.misses += 1
 
-            if track.misses <= settings.plate_stream_tracking_max_misses:
+            if track.misses <= self._tracking_max_misses_for_mode(stream_mode=stream_mode):
                 active_tracks.append(track)
         return self._collapse_duplicate_recognized_tracks(active_tracks)
 
-    def _track_plate(self, gray_frame, track: PlateTrack) -> bool:
+    def _track_plate(self, gray_frame, track: PlateTrack, *, stream_mode: bool = False) -> bool:
         cv2 = self._require_cv2()
         x, y, width, height = track.bbox
         template_height, template_width = track.template.shape[:2]
@@ -3479,6 +3611,7 @@ class PlateService:
             y=y,
             width=width,
             height=height,
+            stream_mode=stream_mode,
         )
         sx, sy, sw, sh = search_rect
         search_region = gray_frame[sy : sy + sh, sx : sx + sw]
@@ -3487,7 +3620,7 @@ class PlateService:
 
         result = cv2.matchTemplate(search_region, track.template, cv2.TM_CCOEFF_NORMED)
         _, max_score, _, max_loc = cv2.minMaxLoc(result)
-        if max_score < settings.plate_stream_tracking_match_threshold:
+        if max_score < self._tracking_match_threshold_for_mode(stream_mode=stream_mode):
             return False
 
         next_x = sx + max_loc[0]
@@ -3498,7 +3631,7 @@ class PlateService:
             return False
 
         track.bbox = next_bbox
-        track.template = self._blend_template(track.template, next_template)
+        track.template = self._blend_template(track.template, next_template, stream_mode=stream_mode)
         track.last_tracking_score = float(max_score)
         return True
 
@@ -3572,9 +3705,16 @@ class PlateService:
     ) -> bool:
         if detections_version <= 0 or detections_updated_at <= 0:
             return False
-        if current_version - detections_version > 1:
+        version_gap = current_version - detections_version
+        if version_gap < 0:
             return False
-        max_age = max(submit_interval * 3.0, 0.8)
+        max_version_gap = max(
+            2,
+            int(round(max(settings.plate_stream_max_fps, 1) * max(settings.plate_stream_detection_hold_seconds, 0.25))),
+        )
+        if version_gap > max_version_gap:
+            return False
+        max_age = max(submit_interval * 3.0, settings.plate_stream_detection_hold_seconds)
         return current_time - detections_updated_at <= max_age
 
     def _merge_recognized_tracks(
@@ -4655,8 +4795,18 @@ class PlateService:
         resized_height = max(int(frame_height * scale_ratio), 1)
         return cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
 
-    def _build_search_rect(self, frame_width: int, frame_height: int, x: int, y: int, width: int, height: int) -> list[int]:
-        expand = max(settings.plate_stream_tracking_search_expand, 1.0)
+    def _build_search_rect(
+        self,
+        frame_width: int,
+        frame_height: int,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        *,
+        stream_mode: bool = False,
+    ) -> list[int]:
+        expand = max(self._tracking_search_expand_for_mode(stream_mode=stream_mode), 1.0)
         center_x = x + width / 2
         center_y = y + height / 2
         search_width = int(round(width * expand))
@@ -4689,7 +4839,7 @@ class PlateService:
             return None
         return patch.copy()
 
-    def _blend_template(self, previous_template, next_template):
+    def _blend_template(self, previous_template, next_template, *, stream_mode: bool = False):
         cv2 = self._require_cv2()
         if previous_template.shape != next_template.shape:
             next_template = cv2.resize(
@@ -4698,10 +4848,30 @@ class PlateService:
                 interpolation=cv2.INTER_LINEAR,
             )
 
-        alpha = max(0.0, min(settings.plate_stream_tracking_template_update_alpha, 1.0))
+        alpha = max(0.0, min(self._tracking_template_update_alpha_for_mode(stream_mode=stream_mode), 1.0))
         if alpha <= 0:
             return previous_template
         return cv2.addWeighted(previous_template, 1.0 - alpha, next_template, alpha, 0.0)
+
+    def _tracking_max_misses_for_mode(self, *, stream_mode: bool) -> int:
+        if stream_mode:
+            return max(int(settings.plate_stream_tracking_max_misses), 0)
+        return max(int(settings.plate_video_tracking_max_misses), 0)
+
+    def _tracking_match_threshold_for_mode(self, *, stream_mode: bool) -> float:
+        if stream_mode:
+            return float(settings.plate_stream_tracking_match_threshold)
+        return float(settings.plate_video_tracking_match_threshold)
+
+    def _tracking_search_expand_for_mode(self, *, stream_mode: bool) -> float:
+        if stream_mode:
+            return float(settings.plate_stream_tracking_search_expand)
+        return float(settings.plate_video_tracking_search_expand)
+
+    def _tracking_template_update_alpha_for_mode(self, *, stream_mode: bool) -> float:
+        if stream_mode:
+            return float(settings.plate_stream_tracking_template_update_alpha)
+        return float(settings.plate_video_tracking_template_update_alpha)
 
     def _compute_iou(self, bbox_a: list[int], bbox_b: list[int]) -> float:
         ax1, ay1, aw, ah = bbox_a
