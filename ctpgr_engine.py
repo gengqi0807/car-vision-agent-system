@@ -629,18 +629,20 @@ class CTPGREngine:
             rw_to_hip = np.linalg.norm(rw - mid_hip) / torso_len
             lw_to_hip = np.linalg.norm(lw - mid_hip) / torso_len
             left_idle = lw_to_hip < 0.50  # 左手贴近身体
-            # 强减速模式：右手抬起 + 左手低垂 + 右腕在肩附近
+            # 强减速模式：右手向右侧外展 + 左手低垂 + 右腕在肩附近
+            #   减速 = 右手向身体右侧外展（rw_outside > 0）
+            #   变道 = 右手向身体左侧摆动（rw_outside < 0），因此正数下限可直接区分
             slow_down_pat = (
                 right_active
                 and (not left_active or left_idle)   # 左手基本不动（允许微动）
-                and rw_outside > -0.005               # 右腕至少在肩附近
+                and rw_outside > 0.015                # 右手必须向右侧外展（排除变道的左摆）
                 and rw_above_rs < 0.04                # 右腕不高于肩
             )
-            # 弱减速模式：右手侧展幅度很小，但左手确实没动
+            # 弱减速模式：右手侧展幅度较小，但左手确实没动
             slow_down_weak_pat = (
                 right_active
                 and (not left_active or left_idle)    # 左手基本不动
-                and rw_outside > -0.015               # 侧展极弱也能匹配
+                and rw_outside > 0.010                # 微弱右侧外展即可
                 and rw_to_hip > 0.55                  # 右手离开身体一定距离
             )
 
@@ -660,11 +662,11 @@ class CTPGREngine:
             rw_to_hip = np.linalg.norm(rw - mid_hip) / torso_len
             lw_to_hip = np.linalg.norm(lw - mid_hip) / torso_len
             left_idle = lw_to_hip < 0.50
-            # 右手单臂 + 左手基本不动
+            # 右手单臂 + 左手基本不动 + 右手向右侧外展
             slow_down_pat = (
                 right_active
                 and (not left_active or left_idle)
-                and rw_outside > -0.010
+                and rw_outside > 0.015                # 右手必须向右侧外展（排除变道的左摆）
                 and rw_above_rs < 0.05
             )
             slow_down_prob = float(probs[7])
