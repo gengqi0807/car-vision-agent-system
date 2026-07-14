@@ -4,6 +4,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import inspect, text
 
 from app import models  # noqa: F401
 from app.api.router import api_router
@@ -18,9 +19,27 @@ media_root = (Path(__file__).resolve().parents[1] / settings.plate_upload_dir).r
 media_root.mkdir(parents=True, exist_ok=True)
 
 
+def _ensure_plate_record_vehicle_type_column() -> None:
+    try:
+        inspector = inspect(engine)
+        if "plate_records" not in inspector.get_table_names():
+            return
+        columns = {column["name"] for column in inspector.get_columns("plate_records")}
+        if "vehicle_type" in columns:
+            return
+        with engine.begin() as connection:
+            connection.execute(
+                text("ALTER TABLE plate_records ADD COLUMN vehicle_type VARCHAR(32) DEFAULT '未识别'")
+            )
+        logger.info("Database migration applied: added vehicle_type column to plate_records.")
+    except Exception:
+        logger.warning("Failed to ensure plate_records.vehicle_type exists.", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
+    _ensure_plate_record_vehicle_type_column()
     logger.info("Starting %s in %s mode", settings.app_name, settings.app_env)
     try:
         logger.info("Warming up OCR and detection models...")

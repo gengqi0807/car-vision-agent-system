@@ -526,6 +526,7 @@ class PlateService:
                     id=1,
                     plate_number="?A12345",
                     plate_color="??",
+                    vehicle_type=VEHICLE_TYPE_UNKNOWN,
                     created_at=datetime.utcnow(),
                 )
             ]
@@ -535,6 +536,9 @@ class PlateService:
                 id=record.id,
                 plate_number=record.plate_number,
                 plate_color=record.plate_color,
+                vehicle_type=self._normalize_vehicle_type_from_label(
+                    getattr(record, "vehicle_type", VEHICLE_TYPE_UNKNOWN)
+                ),
                 created_at=record.created_at,
             )
             for record in records
@@ -4719,6 +4723,7 @@ class PlateService:
             PlateRecord(
                 plate_number=detection.plate_number,
                 plate_color=detection.plate_color,
+                vehicle_type=self._normalize_vehicle_type_from_label(detection.vehicle_type),
                 confidence=detection.confidence,
                 source_path=source_path,
             )

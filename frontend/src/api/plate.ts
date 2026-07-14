@@ -45,6 +45,7 @@ export interface PlateRecordSummary {
   id: number;
   plate_number: string;
   plate_color: string;
+  vehicle_type: string;
   created_at: string;
 }
 

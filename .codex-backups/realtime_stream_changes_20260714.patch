@@ -1,0 +1,1252 @@
+﻿diff --git a/backend/app/main.py b/backend/app/main.py
+index b9dd491..4da4a6d 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -4,6 +4,7 @@ from pathlib import Path
+ from fastapi import FastAPI
+ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.staticfiles import StaticFiles
++from sqlalchemy import inspect, text
+ 
+ from app import models  # noqa: F401
+ from app.api.router import api_router
+@@ -18,9 +19,27 @@ media_root = (Path(__file__).resolve().parents[1] / settings.plate_upload_dir).r
+ media_root.mkdir(parents=True, exist_ok=True)
+ 
+ 
++def _ensure_plate_record_vehicle_type_column() -> None:
++    try:
++        inspector = inspect(engine)
++        if "plate_records" not in inspector.get_table_names():
++            return
++        columns = {column["name"] for column in inspector.get_columns("plate_records")}
++        if "vehicle_type" in columns:
++            return
++        with engine.begin() as connection:
++            connection.execute(
++                text("ALTER TABLE plate_records ADD COLUMN vehicle_type VARCHAR(32) DEFAULT '未识别'")
++            )
++        logger.info("Database migration applied: added vehicle_type column to plate_records.")
++    except Exception:
++        logger.warning("Failed to ensure plate_records.vehicle_type exists.", exc_info=True)
++
++
+ @asynccontextmanager
+ async def lifespan(_: FastAPI):
+     Base.metadata.create_all(bind=engine)
++    _ensure_plate_record_vehicle_type_column()
+     logger.info("Starting %s in %s mode", settings.app_name, settings.app_env)
+     try:
+         logger.info("Warming up OCR and detection models...")
+diff --git a/backend/app/models/plate_record.py b/backend/app/models/plate_record.py
+index fa2c0d7..8ef537e 100644
+--- a/backend/app/models/plate_record.py
++++ b/backend/app/models/plate_record.py
+@@ -10,5 +10,6 @@ class PlateRecord(BaseModel):
+     id: Mapped[int] = mapped_column(primary_key=True)
+     plate_number: Mapped[str] = mapped_column(String(32), index=True)
+     plate_color: Mapped[str] = mapped_column(String(32))
++    vehicle_type: Mapped[str] = mapped_column(String(32), default="未识别")
+     confidence: Mapped[float] = mapped_column(Float)
+     source_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
+diff --git a/backend/app/models_infer/paddleocr_recognizer.py b/backend/app/models_infer/paddleocr_recognizer.py
+index 91716db..b233ad3 100644
+--- a/backend/app/models_infer/paddleocr_recognizer.py
++++ b/backend/app/models_infer/paddleocr_recognizer.py
+@@ -6,6 +6,7 @@ import io
+ import numbers
+ import os
+ import re
++import time
+ from typing import Any
+ import warnings
+ 
+@@ -33,10 +34,32 @@ class PaddleOCRRecognizer:
+     def __init__(self) -> None:
+         self._ocr = None
+         self._text_recognizer = None
++        self._runtime_disabled_until = 0.0
++        self._runtime_reset_pending = False
++        self._runtime_consecutive_crashes = 0
+ 
+     def reset_runtime(self) -> None:
+         self._ocr = None
+         self._text_recognizer = None
++        self._runtime_reset_pending = False
++
++    def note_runtime_crash(self) -> None:
++        self._runtime_consecutive_crashes += 1
++        backoff_seconds = min(6.0 * max(1, self._runtime_consecutive_crashes), 20.0)
++        self._runtime_disabled_until = time.monotonic() + backoff_seconds
++        self._runtime_reset_pending = True
++
++    def _prepare_runtime_for_prediction(self) -> bool:
++        now = time.monotonic()
++        if now < self._runtime_disabled_until:
++            return False
++        if self._runtime_reset_pending:
++            self.reset_runtime()
++        return True
++
++    def _note_runtime_success(self) -> None:
++        self._runtime_consecutive_crashes = 0
++        self._runtime_disabled_until = 0.0
+ 
+     def is_available(self) -> bool:
+         if not settings.plate_ocr_enabled:
+@@ -76,20 +99,31 @@ class PaddleOCRRecognizer:
+         image = self._load_image_array(image_source)
+         if image is None or getattr(image, "size", 0) == 0:
+             return None
++        if not self._prepare_runtime_for_prediction():
++            return None
+ 
+         threshold = self._resolve_confidence_threshold(confidence_threshold)
+-        result = self._predict_text(image)
+-        best = self._pick_best_text_recognition_candidate(result, threshold)
+-        bbox: list[int] | None = None
+-        if best is None:
+-            if not allow_ocr_fallback:
+-                return None
+-            fallback = self._pick_best_text_candidate(self._predict(image), max(threshold * 0.92, 0.22))
+-            if fallback is None:
+-                return None
+-            plate_number, confidence, bbox = fallback
++        try:
++            result = self._predict_text(image)
++            best = self._pick_best_text_recognition_candidate(result, threshold)
++            bbox: list[int] | None = None
++            if best is None:
++                if not allow_ocr_fallback:
++                    return None
++                fallback = self._pick_best_text_candidate(self._predict(image), max(threshold * 0.92, 0.22))
++                if fallback is None:
++                    return None
++                plate_number, confidence, bbox = fallback
++            else:
++                plate_number, confidence = best
++        except RuntimeError:
++            self.note_runtime_crash()
++            raise
+         else:
+-            plate_number, confidence = best
++            self._note_runtime_success()
++
++        if best is None and bbox is None:
++                return None
+ 
+         height, width = image.shape[:2]
+         return PaddleOCRDetection(
+@@ -111,6 +145,8 @@ class PaddleOCRRecognizer:
+         source_image = self._load_image_array(image_source)
+         if source_image is None or getattr(source_image, "size", 0) == 0:
+             return []
++        if not self._prepare_runtime_for_prediction():
++            return []
+ 
+         limit = settings.plate_max_image_side if max_side_override is None else max_side_override
+         if isinstance(limit, int) and limit > 0:
+@@ -125,7 +161,13 @@ class PaddleOCRRecognizer:
+         if heavy_scan:
+             threshold = min(threshold, settings.plate_ocr_confidence_threshold * 0.8)
+ 
+-        result = self._predict(image)
++        try:
++            result = self._predict(image)
++        except RuntimeError:
++            self.note_runtime_crash()
++            raise
++        else:
++            self._note_runtime_success()
+         detections: list[PaddleOCRDetection] = []
+         for item in self._collect_detection_items(result, scale_ratio=scale_ratio):
+             bbox, raw_text, raw_confidence = item
+diff --git a/backend/app/schemas/plate.py b/backend/app/schemas/plate.py
+index 8871300..65cf524 100644
+--- a/backend/app/schemas/plate.py
++++ b/backend/app/schemas/plate.py
+@@ -49,6 +49,7 @@ class PlateRecordSummary(BaseModel):
+     id: int
+     plate_number: str
+     plate_color: str
++    vehicle_type: str = "未识别"
+     created_at: datetime
+ 
+ 
+diff --git a/backend/app/services/plate_push_service.py b/backend/app/services/plate_push_service.py
+index 5495ef4..1ad65e4 100644
+--- a/backend/app/services/plate_push_service.py
++++ b/backend/app/services/plate_push_service.py
+@@ -125,22 +125,6 @@ class PlatePushService:
+                 self._state.running = False
+                 self._state.published = False
+                 self._state.publisher_started = False
+-            should_probe = (
+-                self._state.running
+-                and self._state.publisher_started
+-                and not self._state.published
+-                and bool(self._state.publish_rtsp_url)
+-            )
+-            publish_rtsp_url = self._state.publish_rtsp_url
+-
+-        if should_probe and publish_rtsp_url:
+-            published = self._probe_publish_stream(publish_rtsp_url)
+-            if published:
+-                with self._lock:
+-                    if self._state.running and self._state.publish_rtsp_url == publish_rtsp_url:
+-                        self._state.published = True
+-
+-        with self._lock:
+             return self._to_response()
+ 
+     def _run_worker(
+@@ -180,6 +164,7 @@ class PlatePushService:
+                     ffmpeg_process.stdin.write(frame.tobytes())
+                     ffmpeg_process.stdin.flush()
+                     if not first_frame_written:
++                        self._mark_published(publish_url)
+                         logger.info("First annotated frame written to ffmpeg stdin for %s", publish_url)
+                         first_frame_written = True
+                 except BrokenPipeError as exc:
+@@ -198,6 +183,7 @@ class PlatePushService:
+             publish_url = self._build_publish_rtsp_url(stream_name)
+             ffmpeg_process = self._start_ffmpeg_passthrough(rtsp_url=rtsp_url, publish_url=publish_url)
+             self._mark_publisher_started(publish_url)
++            self._mark_published(publish_url)
+             logger.info("Started passthrough publisher for %s -> %s", rtsp_url, publish_url)
+ 
+             while not stop_event.is_set():
+@@ -220,6 +206,11 @@ class PlatePushService:
+             if self._state.running and self._state.publish_rtsp_url == publish_url:
+                 self._state.publisher_started = True
+ 
++    def _mark_published(self, publish_url: str) -> None:
++        with self._lock:
++            if self._state.running and self._state.publish_rtsp_url == publish_url:
++                self._state.published = True
++
+     def _reset_state_after_worker_exit(self) -> None:
+         with self._lock:
+             self._state.running = False
+diff --git a/backend/app/services/plate_service.py b/backend/app/services/plate_service.py
+index 0a31f38..d43177f 100644
+--- a/backend/app/services/plate_service.py
++++ b/backend/app/services/plate_service.py
+@@ -346,8 +346,8 @@ class PlateService:
+     def iter_annotated_stream(self, rtsp_url: str, stop_event=None):
+         capture, pending_frame = self._open_rtsp_capture(rtsp_url)
+         state = PlateProcessingState(
+-            recognition_interval=1,
+-            heavy_scan_interval=max(settings.plate_stream_process_every_n_frames, 4),
++            recognition_interval=2,
++            heavy_scan_interval=max(settings.plate_stream_process_every_n_frames * 2, 12),
+             stream_mode=True,
+         )
+         last_sent_at = 0.0
+@@ -526,6 +526,7 @@ class PlateService:
+                     id=1,
+                     plate_number="?A12345",
+                     plate_color="??",
++                    vehicle_type=VEHICLE_TYPE_UNKNOWN,
+                     created_at=datetime.utcnow(),
+                 )
+             ]
+@@ -535,6 +536,7 @@ class PlateService:
+                 id=record.id,
+                 plate_number=record.plate_number,
+                 plate_color=record.plate_color,
++                vehicle_type=self._normalize_vehicle_type_from_label(getattr(record, "vehicle_type", VEHICLE_TYPE_UNKNOWN)),
+                 created_at=record.created_at,
+             )
+             for record in records
+@@ -1648,8 +1650,13 @@ class PlateService:
+     ) -> tuple[object, list[PlateDetection], list[PlateDetection]]:
+         state.frame_index += 1
+         display_frame = self._resize_stream_frame(source_frame)
++        working_frame = source_frame
++        if state.stream_mode:
++            working_frame = self._prepare_stream_working_frame(source_frame)
++        state.working_width = working_frame.shape[1]
++        state.working_height = working_frame.shape[0]
+ 
+-        state.tracks = self._update_tracks(source_frame, state.tracks, state.frame_index)
++        state.tracks = self._update_tracks(working_frame, state.tracks, state.frame_index)
+         fresh_detections: list[PlateDetection] = []
+ 
+         if self._should_rerecognize(
+@@ -1662,12 +1669,39 @@ class PlateService:
+             should_use_heavy_scan = heavy_scan_detection or (
+                 aggressive_detection and self._should_use_heavy_scan(state)
+             )
+-            fresh_detections = self._recognize_detections(
+-                source_frame,
+-                aggressive=aggressive_detection,
+-                heavy_scan=should_use_heavy_scan,
+-            )
+-            state.tracks = self._merge_recognized_tracks(source_frame, state.tracks, fresh_detections, state.frame_index)
++            if state.stream_mode:
++                fresh_detections = self._recognize_stream_frame_detections(
++                    working_frame,
++                    state=state,
++                    aggressive_detection=aggressive_detection,
++                    heavy_scan_detection=should_use_heavy_scan,
++                )
++            else:
++                fresh_detections = self._recognize_detections(
++                    working_frame,
++                    aggressive=aggressive_detection,
++                    heavy_scan=should_use_heavy_scan,
++                )
++            state.tracks = self._merge_recognized_tracks(working_frame, state.tracks, fresh_detections, state.frame_index)
++
++            if state.stream_mode and self._should_attempt_stream_unread_ocr(
++                state=state,
++                fresh_detections=fresh_detections,
++            ):
++                unread_ocr_detections = self._recover_stream_unread_tracks(
++                    source_frame=source_frame,
++                    state=state,
++                    fresh_detections=fresh_detections,
++                )
++                if unread_ocr_detections:
++                    fresh_detections.extend(unread_ocr_detections)
++                    state.tracks = self._merge_recognized_tracks(
++                        working_frame,
++                        state.tracks,
++                        unread_ocr_detections,
++                        state.frame_index,
++                    )
++
+             state.last_recognition_frame = state.frame_index
+ 
+             if save_history and fresh_detections:
+@@ -1679,14 +1713,234 @@ class PlateService:
+         active_detections = self._tracks_to_detections(state.tracks)
+         scaled_detections = self._scale_detections(
+             active_detections,
+-            source_frame.shape[1],
+-            source_frame.shape[0],
++            working_frame.shape[1],
++            working_frame.shape[0],
+             display_frame.shape[1],
+             display_frame.shape[0],
+         )
+         annotated = self._annotate_frame(display_frame, scaled_detections)
+         return annotated, scaled_detections, fresh_detections
+ 
++    def _prepare_stream_working_frame(self, source_frame):
++        return self._resize_frame_to_limit(source_frame, self._resolve_stream_recognition_max_side())
++
++    def _resolve_stream_recognition_max_side(self) -> int:
++        configured_limit = settings.plate_stream_recognition_max_side
++        if configured_limit and configured_limit > 0:
++            return configured_limit
++        display_limit = max(settings.plate_stream_max_side, 1)
++        return min(display_limit, 768)
++
++    def _recognize_stream_frame_detections(
++        self,
++        source_frame,
++        *,
++        state: PlateProcessingState,
++        aggressive_detection: bool,
++        heavy_scan_detection: bool,
++    ) -> list[PlateDetection]:
++        if not self._should_use_detector():
++            return self._recognize_detections(
++                source_frame,
++                aggressive=aggressive_detection,
++                heavy_scan=heavy_scan_detection,
++            )
++
++        if self._should_use_stream_unread_only_detector(state):
++            unread_only_detections = self._detect_stream_unread_only_detections(source_frame)
++            if unread_only_detections:
++                return unread_only_detections
++
++        use_fast_detector = self._should_use_fast_stream_detector(state)
++        return self._recognize_detections(
++            source_frame,
++            aggressive=aggressive_detection,
++            heavy_scan=heavy_scan_detection,
++            allow_full_frame_fallback=False,
++            fast_mode=use_fast_detector,
++            preserve_unread=True,
++            video_fast_detector=use_fast_detector,
++        )
++
++    def _should_use_stream_unread_only_detector(self, state: PlateProcessingState) -> bool:
++        if not state.tracks:
++            return True
++        if not any(track.plate_number for track in state.tracks):
++            return True
++        return any(
++            not track.plate_number
++            and track.misses == 0
++            and self._is_small_target_track_bbox(track.bbox)
++            for track in state.tracks
++        )
++
++    def _detect_stream_unread_only_detections(self, source_frame) -> list[PlateDetection]:
++        try:
++            detector_hits = self._detect_video_detector_hits(source_frame, fast_mode=True)
++        except (InferenceConfigurationError, InferenceDependencyError):
++            logger.warning("Plate detector unavailable during fast stream unread pass.", exc_info=True)
++            return []
++
++        if not detector_hits:
++            return []
++
++        detector_hits = self._attach_vehicle_type_context_to_hits(detector_hits)
++        detector_hits = self._select_video_detector_hits_for_recognition(
++            detector_hits,
++            preserve_unread=True,
++        )
++        if not detector_hits:
++            return []
++
++        unread_detections: list[PlateDetection] = []
++        max_candidates = min(settings.plate_detector_max_candidates, 4)
++        for hit in detector_hits[:max_candidates]:
++            confidence = float(hit.get("confidence", 0.0))
++            if confidence < 0.28:
++                continue
++
++            candidate_bboxes = self._resolve_detector_crop_bboxes(source_frame, hit, video_mode=True)
++            if not candidate_bboxes:
++                continue
++
++            hit_kind = str(hit.get("kind", "plate"))
++            if hit_kind == "vehicle":
++                bbox = self._pick_video_vehicle_unread_bbox(candidate_bboxes, list(candidate_bboxes[0]))
++            else:
++                bbox = list(candidate_bboxes[0])
++                if not self._is_plausible_plate_bbox(bbox):
++                    continue
++
++            if not self._is_reasonable_crop_bbox(bbox):
++                continue
++
++            unread_detections.append(
++                PlateDetection(
++                    plate_number="",
++                    plate_color="??",
++                    vehicle_type=self._vehicle_type_from_hit(hit),
++                    confidence=confidence,
++                    bbox=bbox,
++                )
++            )
++
++        return self._deduplicate_plate_detections(unread_detections)
++
++    def _should_use_fast_stream_detector(self, state: PlateProcessingState) -> bool:
++        if not state.tracks:
++            return False
++        if any(track.misses > 0 for track in state.tracks):
++            return False
++        if any(
++            not track.plate_number and self._is_small_target_track_bbox(track.bbox)
++            for track in state.tracks
++        ):
++            return False
++        if any(not track.plate_number for track in state.tracks):
++            return True
++        return True
++
++    def _should_attempt_stream_unread_ocr(
++        self,
++        *,
++        state: PlateProcessingState,
++        fresh_detections: list[PlateDetection],
++    ) -> bool:
++        if not self.recognizer.is_available():
++            return False
++        if any(detection.plate_number for detection in fresh_detections):
++            return False
++        candidates = [
++            track
++            for track in state.tracks
++            if not track.plate_number
++            and track.misses == 0
++            and self._is_active_unread_ocr_candidate(track)
++        ]
++        if not candidates:
++            return False
++        return any(
++            self._should_prioritize_unread_ocr_track(track)
++            or (track.unread_observations >= 2 and track.confidence >= 0.50)
++            for track in candidates
++        )
++
++    def _recover_stream_unread_tracks(
++        self,
++        *,
++        source_frame,
++        state: PlateProcessingState,
++        fresh_detections: list[PlateDetection],
++    ) -> list[PlateDetection]:
++        candidates: list[PlateTrack] = []
++        for track in state.tracks:
++            if track.plate_number or track.misses > 0:
++                continue
++            if not self._is_active_unread_ocr_candidate(track):
++                continue
++            if (
++                track.last_unread_ocr_frame > 0
++                and state.frame_index - track.last_unread_ocr_frame < 8
++            ):
++                continue
++            if self._is_likely_side_shadow_bbox_for_recognized_track(track.bbox, state.tracks):
++                continue
++            if any(
++                detection.plate_number and self._compute_iou(track.bbox, detection.bbox) >= 0.35
++                for detection in fresh_detections
++            ):
++                continue
++            candidates.append(track)
++
++        if not candidates:
++            return []
++
++        candidates.sort(
++            key=lambda item: (
++                self._should_prioritize_unread_ocr_track(item),
++                item.unread_observations,
++                item.bbox[2] * item.bbox[3],
++                item.confidence,
++                item.last_seen_frame,
++            ),
++            reverse=True,
++        )
++
++        source_height, source_width = source_frame.shape[:2]
++        recovered: list[PlateDetection] = []
++        for track in candidates[:1]:
++            track.last_unread_ocr_frame = state.frame_index
++            source_bbox = self._scale_bbox(
++                track.bbox,
++                state.working_width,
++                state.working_height,
++                source_width,
++                source_height,
++            )
++            source_bbox = self._expand_active_unread_source_bbox(
++                source_bbox,
++                image_width=source_width,
++                image_height=source_height,
++            )
++            detection = self._recognize_active_unread_track(
++                source_frame=source_frame,
++                track=track,
++                source_bbox=source_bbox,
++            )
++            if detection is None:
++                continue
++            recovered.append(
++                PlateDetection(
++                    plate_number=detection.plate_number,
++                    plate_color=detection.plate_color,
++                    vehicle_type=track.vehicle_type,
++                    confidence=detection.confidence,
++                    bbox=list(detection.bbox),
++                )
++            )
++
++        return self._deduplicate_plate_detections(recovered)
++
+     def _open_rtsp_capture(self, rtsp_url: str):
+         cv2 = self._require_cv2()
+         attempts: list[tuple[str, int | None, str | None]] = [
+@@ -1792,6 +2046,15 @@ class PlateService:
+                 raise
+             logger.warning("Skipping full-frame OCR for the current frame because PaddleOCR raised ValueError.", exc_info=True)
+             return []
++        except RuntimeError:
++            logger.warning("Skipping full-frame OCR because PaddleOCR runtime crashed on this frame.", exc_info=True)
++            note_runtime_crash = getattr(self.recognizer, "note_runtime_crash", None)
++            if callable(note_runtime_crash):
++                try:
++                    note_runtime_crash()
++                except Exception:
++                    logger.debug("Failed to mark PaddleOCR runtime as unstable after full-frame crash.", exc_info=True)
++            return []
+ 
+         full_frame_detections = [
+             PlateDetection(
+@@ -2881,12 +3144,19 @@ class PlateService:
+             return None
+         except RuntimeError:
+             logger.warning("Skipping detector crop because PaddleOCR runtime crashed on this crop.", exc_info=True)
+-            reset_runtime = getattr(self.recognizer, "reset_runtime", None)
+-            if callable(reset_runtime):
++            note_runtime_crash = getattr(self.recognizer, "note_runtime_crash", None)
++            if callable(note_runtime_crash):
+                 try:
+-                    reset_runtime()
++                    note_runtime_crash()
+                 except Exception:
+-                    logger.debug("Failed to reset PaddleOCR runtime after crop crash.", exc_info=True)
++                    logger.debug("Failed to mark PaddleOCR runtime as unstable after crop crash.", exc_info=True)
++            else:
++                reset_runtime = getattr(self.recognizer, "reset_runtime", None)
++                if callable(reset_runtime):
++                    try:
++                        reset_runtime()
++                    except Exception:
++                        logger.debug("Failed to reset PaddleOCR runtime after crop crash.", exc_info=True)
+             return None
+ 
+         if result is None or not result.plate_number:
+@@ -4719,6 +4989,7 @@ class PlateService:
+             PlateRecord(
+                 plate_number=detection.plate_number,
+                 plate_color=detection.plate_color,
++                vehicle_type=self._normalize_vehicle_type_from_label(detection.vehicle_type),
+                 confidence=detection.confidence,
+                 source_path=source_path,
+             )
+diff --git a/backend/tests/test_plate_service.py b/backend/tests/test_plate_service.py
+index 376d60a..d532361 100644
+--- a/backend/tests/test_plate_service.py
++++ b/backend/tests/test_plate_service.py
+@@ -1,5 +1,6 @@
+ from dataclasses import dataclass
+ 
++import pytest
+ from sqlalchemy import create_engine
+ from sqlalchemy.orm import sessionmaker
+ 
+@@ -59,6 +60,7 @@ class ValueErrorCropRecognizer(FakeRecognizer):
+ class RuntimeErrorCropRecognizer(FakeRecognizer):
+     def __init__(self) -> None:
+         self.reset_called = False
++        self.runtime_crash_noted = False
+ 
+     def recognize(self, _image_source, **_kwargs):
+         raise RuntimeError("paddle crashed")
+@@ -66,6 +68,9 @@ class RuntimeErrorCropRecognizer(FakeRecognizer):
+     def reset_runtime(self):
+         self.reset_called = True
+ 
++    def note_runtime_crash(self):
++        self.runtime_crash_noted = True
++
+ 
+ class FakeDetector:
+     def detect(self, _source):
+@@ -114,6 +119,7 @@ def test_recognize_image_bytes_persists_history(tmp_path, monkeypatch):
+     history = service.list_history()
+     assert history
+     assert history[0].plate_number == FAKE_PLATE
++    assert history[0].vehicle_type == "\u672a\u8bc6\u522b"
+ 
+ 
+ def test_recognize_image_bytes_handles_empty_input():
+@@ -1087,7 +1093,33 @@ def test_recognize_crop_with_paddleocr_skips_runtime_error(monkeypatch):
+     )
+ 
+     assert result is None
+-    assert recognizer.reset_called is True
++    assert recognizer.runtime_crash_noted is True
++    assert recognizer.reset_called is False
++
++
++def test_paddleocr_recognizer_skips_prediction_during_runtime_cooldown(monkeypatch):
++    recognizer = PaddleOCRRecognizer()
++    fake_image = object()
++    prediction_calls = {"count": 0}
++    clock = {"value": 10.0}
++
++    monkeypatch.setattr(plate_service_module.time, "monotonic", lambda: clock["value"])
++    monkeypatch.setattr("app.models_infer.paddleocr_recognizer.time.monotonic", lambda: clock["value"])
++    monkeypatch.setattr(recognizer, "_load_image_array", lambda _source: fake_image)
++    monkeypatch.setattr(recognizer, "_resolve_confidence_threshold", lambda _threshold: 0.35)
++
++    def raise_runtime_error(_image):
++        prediction_calls["count"] += 1
++        raise RuntimeError("paddle crashed")
++
++    monkeypatch.setattr(recognizer, "_predict_text", raise_runtime_error)
++
++    with pytest.raises(RuntimeError):
++        recognizer.recognize(b"unused")
++
++    assert prediction_calls["count"] == 1
++    assert recognizer.recognize(b"unused") is None
++    assert prediction_calls["count"] == 1
+ 
+ 
+ def test_paddleocr_recognize_skips_heavy_fallback_when_disabled(monkeypatch):
+@@ -1458,6 +1490,145 @@ def test_stream_recognition_submit_interval_seconds_respects_frame_stride():
+     assert service._stream_recognition_submit_interval_seconds(1.0) == 0.3
+ 
+ 
++def test_recognize_stream_frame_detections_disables_full_frame_fallback_and_preserves_unread(monkeypatch):
++    service = PlateService()
++    captured: dict[str, object] = {}
++    state = plate_service_module.PlateProcessingState(stream_mode=True)
++
++    monkeypatch.setattr(service, "_should_use_detector", lambda: True)
++    monkeypatch.setattr(service, "_should_use_fast_stream_detector", lambda _state: False)
++    monkeypatch.setattr(
++        service,
++        "_recognize_detections",
++        lambda source_frame, **kwargs: captured.update(
++            {"source_frame": source_frame, "kwargs": kwargs}
++        )
++        or [],
++    )
++
++    frame = object()
++    result = service._recognize_stream_frame_detections(
++        frame,
++        state=state,
++        aggressive_detection=False,
++        heavy_scan_detection=False,
++    )
++
++    assert result == []
++    assert captured["source_frame"] is frame
++    assert captured["kwargs"] == {
++        "aggressive": False,
++        "heavy_scan": False,
++        "allow_full_frame_fallback": False,
++        "fast_mode": False,
++        "preserve_unread": True,
++        "video_fast_detector": False,
++    }
++
++
++def test_should_use_fast_stream_detector_only_for_stable_large_recognized_tracks():
++    service = PlateService()
++
++    stable_large_track = plate_service_module.PlateTrack(
++        track_id="stable",
++        plate_number="ABC1234",
++        plate_color="blue",
++        confidence=0.9,
++        bbox=[20, 20, 90, 24],
++        template=object(),
++        last_seen_frame=10,
++        last_recognized_frame=10,
++        misses=0,
++    )
++    unread_track = plate_service_module.PlateTrack(
++        track_id="unread",
++        plate_number="",
++        plate_color="??",
++        confidence=0.55,
++        bbox=[10, 10, 38, 12],
++        template=object(),
++        last_seen_frame=10,
++        last_recognized_frame=10,
++        misses=0,
++    )
++
++    assert service._should_use_fast_stream_detector(
++        plate_service_module.PlateProcessingState(tracks=[stable_large_track], stream_mode=True)
++    ) is True
++    assert service._should_use_fast_stream_detector(
++        plate_service_module.PlateProcessingState(tracks=[unread_track], stream_mode=True)
++    ) is False
++
++
++def test_resolve_stream_recognition_max_side_prefers_stream_specific_limit(monkeypatch):
++    service = PlateService()
++
++    monkeypatch.setattr(plate_service_module.settings, "plate_stream_recognition_max_side", 640)
++    monkeypatch.setattr(plate_service_module.settings, "plate_stream_max_side", 960)
++
++    assert service._resolve_stream_recognition_max_side() == 640
++
++
++def test_should_attempt_stream_unread_ocr_requires_stronger_unread_signal():
++    service = PlateService()
++    service.recognizer = FakeRecognizer()
++
++    weak_track = plate_service_module.PlateTrack(
++        track_id="weak",
++        plate_number="",
++        plate_color="??",
++        confidence=0.48,
++        bbox=[10, 10, 36, 12],
++        template=object(),
++        last_seen_frame=8,
++        last_recognized_frame=8,
++        misses=0,
++        unread_observations=1,
++    )
++    strong_track = plate_service_module.PlateTrack(
++        track_id="strong",
++        plate_number="",
++        plate_color="??",
++        confidence=0.58,
++        bbox=[10, 10, 36, 12],
++        template=object(),
++        last_seen_frame=8,
++        last_recognized_frame=8,
++        misses=0,
++        unread_observations=2,
++    )
++
++    assert service._should_attempt_stream_unread_ocr(
++        state=plate_service_module.PlateProcessingState(tracks=[weak_track], stream_mode=True),
++        fresh_detections=[],
++    ) is False
++    assert service._should_attempt_stream_unread_ocr(
++        state=plate_service_module.PlateProcessingState(tracks=[strong_track], stream_mode=True),
++        fresh_detections=[],
++    ) is True
++
++
++def test_detect_stream_unread_only_detections_returns_fast_unread_plate(monkeypatch):
++    service = PlateService()
++
++    monkeypatch.setattr(
++        service,
++        "_detect_video_detector_hits",
++        lambda _frame, fast_mode=False: [
++            {"label": "plate", "kind": "plate", "bbox": [20, 18, 42, 12], "confidence": 0.62}
++        ],
++    )
++    monkeypatch.setattr(service, "_attach_vehicle_type_context_to_hits", lambda hits: hits)
++    monkeypatch.setattr(service, "_select_video_detector_hits_for_recognition", lambda hits, preserve_unread: hits)
++    monkeypatch.setattr(service, "_resolve_detector_crop_bboxes", lambda image, hit, video_mode=False: [hit["bbox"]])
++
++    detections = service._detect_stream_unread_only_detections(object())
++
++    assert len(detections) == 1
++    assert detections[0].plate_number == ""
++    assert detections[0].bbox == [20, 18, 42, 12]
++
++
+ def test_should_display_stream_cached_detections_rejects_stale_results():
+     service = PlateService()
+ 
+diff --git a/frontend/src/api/plate.ts b/frontend/src/api/plate.ts
+index 4deee9a..16bee94 100644
+--- a/frontend/src/api/plate.ts
++++ b/frontend/src/api/plate.ts
+@@ -45,6 +45,7 @@ export interface PlateRecordSummary {
+   id: number;
+   plate_number: string;
+   plate_color: string;
++  vehicle_type: string;
+   created_at: string;
+ }
+ 
+diff --git a/frontend/src/views/PlateRecognition.vue b/frontend/src/views/PlateRecognition.vue
+index 2ae2151..28dab7a 100644
+--- a/frontend/src/views/PlateRecognition.vue
++++ b/frontend/src/views/PlateRecognition.vue
+@@ -19,9 +19,9 @@
+         </article>
+ 
+         <label v-if="mode === 'image'" class="upload-zone">
+-          <input class="hidden-input" accept="image/*" type="file" @change="handleImageFileChange" />
++          <input class="hidden-input" accept="image/*" type="file" multiple @change="handleImageFileChange" />
+           <div class="main">点击上传道路场景图片</div>
+-          <div class="sub">支持 JPG、PNG、WEBP</div>
++          <div class="sub">支持一次选择多张 JPG、PNG、WEBP</div>
+         </label>
+ 
+         <label v-else-if="mode === 'video'" class="upload-zone">
+@@ -168,6 +168,24 @@
+             </div>
+           </div>
+ 
++          <div v-if="mode === 'image' && imageBatchResults.length > 0" class="image-batch-list">
++            <button
++              v-for="item in imageBatchResults"
++              :key="item.id"
++              type="button"
++              class="image-batch-item"
++              :class="{ active: item.id === activeImageResultId }"
++              @click="showImageBatchResult(item)"
++            >
++              <div class="image-batch-head">
++                <span class="image-batch-name">{{ item.filename }}</span>
++                <span class="image-batch-state">{{ formatImageBatchStatus(item) }}</span>
++              </div>
++              <div class="image-batch-summary">{{ formatImageBatchPlateSummary(item) }}</div>
++              <div v-if="item.errorMessage" class="image-batch-error">{{ item.errorMessage }}</div>
++            </button>
++          </div>
++
+           <div class="result-meta">{{ resultMeta }}</div>
+           <div v-if="requestError" class="request-error">{{ requestError }}</div>
+         </article>
+@@ -249,6 +267,15 @@ interface OverlayDetection extends PlateDetection {
+   height: number;
+ }
+ 
++interface ImageBatchResult {
++  id: string;
++  filename: string;
++  previewUrl: string;
++  detections: PlateDetection[];
++  status: "pending" | "processing" | "completed" | "failed";
++  errorMessage: string;
++}
++
+ const PLATE_MODE_STORAGE_KEY = "plate-recognition-mode";
+ const PLATE_STREAM_INPUT_STORAGE_KEY = "plate-stream-input";
+ const PLATE_STREAM_PRESET_STORAGE_KEY = "plate-stream-preset";
+@@ -304,6 +331,8 @@ const isLoading = ref(false);
+ const imagePreviewUrl = ref("");
+ const previewImageRef = ref<HTMLImageElement | null>(null);
+ const imageDetections = ref<PlateDetection[]>([]);
++const imageBatchResults = ref<ImageBatchResult[]>([]);
++const activeImageResultId = ref("");
+ const sourceFrameSize = ref({ width: 0, height: 0 });
+ 
+ const videoResult = ref<PlateVideoRecognitionResponse | null>(null);
+@@ -320,12 +349,13 @@ const streamControl = ref<PlateStreamControlResponse | null>(null);
+ const streamStatus = ref<"idle" | "starting" | "running">("idle");
+ const playbackRefreshKey = ref(Date.now());
+ let statusTimer: number | null = null;
++let statusPollTick = 0;
+ 
+ const historyPageSize = 6;
+ 
+ const fallbackRecords: HistoryRecordView[] = [
+-  { id: 1, plate: "沪A12345", color: "蓝牌", vehicleType: "识别记录", time: "14:23" },
+-  { id: 2, plate: "沪B67890", color: "绿牌", vehicleType: "识别记录", time: "14:15" }
++  { id: 1, plate: "沪A12345", color: "蓝牌", vehicleType: "未识别", time: "14:23" },
++  { id: 2, plate: "沪B67890", color: "绿牌", vehicleType: "未识别", time: "14:15" }
+ ];
+ 
+ const processedVideoUrl = computed(() => videoResult.value?.processed_video_url ?? "");
+@@ -355,6 +385,14 @@ const currentDetections = computed(() => {
+   return [];
+ });
+ 
++const totalImageDetections = computed(() =>
++  imageBatchResults.value.reduce((total, item) => total + item.detections.length, 0)
++);
++
++const finishedImageCount = computed(
++  () => imageBatchResults.value.filter((item) => item.status === "completed" || item.status === "failed").length
++);
++
+ const displayHistory = computed<HistoryRecordView[]>(() => {
+   if (historyRecords.value.length === 0) {
+     return fallbackRecords;
+@@ -364,7 +402,7 @@ const displayHistory = computed<HistoryRecordView[]>(() => {
+     id: record.id,
+     plate: record.plate_number,
+     color: record.plate_color,
+-    vehicleType: "识别记录",
++    vehicleType: record.vehicle_type || "未识别",
+     time: new Date(record.created_at).toLocaleTimeString("zh-CN", { hour12: false })
+   }));
+ });
+@@ -389,7 +427,7 @@ const detectionRows = computed(() =>
+     plate: item.plate_number || "未识别",
+     color: item.plate_color,
+     confidence: formatConfidence(item.confidence),
+-    meta: `${item.plate_color} · ${item.vehicle_type || "未识别"} · 识别成功`
++    meta: `${item.plate_color} · ${item.vehicle_type || "未识别"} · ${formatConfidence(item.confidence)}`
+   }))
+ );
+ 
+@@ -416,7 +454,11 @@ const overlayDetections = computed<OverlayDetection[]>(() => {
+ });
+ 
+ const streamPlaybackUrl = computed(() => {
+-  if (streamStatus.value !== "running" || !streamControl.value?.published || !streamControl.value?.playback_url) {
++  if (
++    streamStatus.value === "idle" ||
++    !streamControl.value?.playback_url ||
++    (!streamControl.value.published && !streamControl.value.publisher_started)
++  ) {
+     return "";
+   }
+   const separator = streamControl.value.playback_url.includes("?") ? "&" : "?";
+@@ -528,10 +570,13 @@ const resultMeta = computed(() => {
+   if (isLoading.value) {
+     return "正在处理图片...";
+   }
+-  if (!imagePreviewUrl.value) {
++  if (!imageBatchResults.value.length) {
+     return "上传图片后，会在这里显示识别结果。";
+   }
+-  return `共识别到 ${imageDetections.value.length} 个车牌。`;
++  if (imageBatchResults.value.length === 1) {
++    return `共识别到 ${imageDetections.value.length} 个车牌。`;
++  }
++  return `已完成 ${finishedImageCount.value} / ${imageBatchResults.value.length} 张图片，共识别到 ${totalImageDetections.value} 个车牌。`;
+ });
+ 
+ function clampToPercent(value: number) {
+@@ -565,16 +610,74 @@ function boxStyle(item: OverlayDetection) {
+   };
+ }
+ 
+-function resetImagePreviewUrl() {
+-  if (imagePreviewUrl.value) {
+-    URL.revokeObjectURL(imagePreviewUrl.value);
+-    imagePreviewUrl.value = "";
++function clearStreamPlaybackFrame() {
++  playbackRefreshKey.value = Date.now();
++  if (!streamControl.value) {
++    return;
++  }
++  streamControl.value = {
++    ...streamControl.value,
++    published: false,
++    publisher_started: false,
++    playback_url: null
++  };
++}
++
++function revokeImageBatchPreviewUrls() {
++  if (typeof URL === "undefined") {
++    return;
++  }
++  const revoked = new Set<string>();
++  for (const item of imageBatchResults.value) {
++    if (!item.previewUrl || revoked.has(item.previewUrl)) {
++      continue;
++    }
++    URL.revokeObjectURL(item.previewUrl);
++    revoked.add(item.previewUrl);
+   }
+ }
+ 
++function showImageBatchResult(item: ImageBatchResult) {
++  activeImageResultId.value = item.id;
++  imagePreviewUrl.value = item.previewUrl;
++  imageDetections.value = item.detections;
++  sourceFrameSize.value = { width: 0, height: 0 };
++}
++
++function formatImageBatchStatus(item: ImageBatchResult) {
++  if (item.status === "processing") {
++    return "识别中";
++  }
++  if (item.status === "completed") {
++    return `已完成 · ${item.detections.length} 个结果`;
++  }
++  if (item.status === "failed") {
++    return "识别失败";
++  }
++  return "等待中";
++}
++
++function formatImageBatchPlateSummary(item: ImageBatchResult) {
++  if (item.status === "failed") {
++    return "这张图片识别失败。";
++  }
++  if (item.status === "pending" || item.status === "processing") {
++    return "正在等待当前图片识别完成。";
++  }
++  if (item.detections.length === 0) {
++    return "未识别到车牌。";
++  }
++  return item.detections
++    .map((detection) => detection.plate_number || "未识别")
++    .join("、");
++}
++
+ function resetImageState() {
+-  resetImagePreviewUrl();
++  revokeImageBatchPreviewUrls();
++  imagePreviewUrl.value = "";
+   imageDetections.value = [];
++  imageBatchResults.value = [];
++  activeImageResultId.value = "";
+   sourceFrameSize.value = { width: 0, height: 0 };
+ }
+ 
+@@ -735,29 +838,75 @@ async function refreshStreamStatus() {
+ 
+ async function handleImageFileChange(event: Event) {
+   const input = event.target as HTMLInputElement;
+-  const file = input.files?.[0];
++  const files = Array.from(input.files ?? []);
+ 
+   resetImageState();
+   requestError.value = "";
+ 
+-  if (!file) {
++  if (files.length === 0) {
+     return;
+   }
+ 
+-  imagePreviewUrl.value = URL.createObjectURL(file);
++  imageBatchResults.value = files.map((file, index) => ({
++    id: `${Date.now()}-${index}-${file.name}`,
++    filename: file.name,
++    previewUrl: URL.createObjectURL(file),
++    detections: [],
++    status: "pending",
++    errorMessage: ""
++  }));
++  showImageBatchResult(imageBatchResults.value[0]);
+   isLoading.value = true;
+-  loadingText.value = "正在识别图片，请稍候...";
++  loadingText.value = `正在识别图片 1/${files.length}，请稍候...`;
+ 
+   try {
+-    await nextTick();
+-    const { data } = await recognizePlateImageApi(file);
+-    imageDetections.value = data.detections;
++    for (const [index, file] of files.entries()) {
++      const imageResult = imageBatchResults.value[index];
++      if (!imageResult) {
++        continue;
++      }
++
++      imageResult.status = "processing";
++      imageResult.errorMessage = "";
++      showImageBatchResult(imageResult);
++      loadingText.value = `正在识别图片 ${index + 1}/${files.length}：${file.name}`;
++
++      await nextTick();
++
++      try {
++        const { data } = await recognizePlateImageApi(file);
++        imageResult.detections = data.detections;
++        imageResult.status = "completed";
++        if (activeImageResultId.value === imageResult.id) {
++          imageDetections.value = data.detections;
++        }
++      } catch (error) {
++        imageResult.detections = [];
++        imageResult.status = "failed";
++        imageResult.errorMessage = extractErrorMessage(
++          error,
++          "图片识别失败，请确认后端服务已启动后重试。"
++        );
++        if (activeImageResultId.value === imageResult.id) {
++          imageDetections.value = [];
++        }
++      }
++    }
++
++    const firstCompletedResult =
++      imageBatchResults.value.find((item) => item.status === "completed") ?? imageBatchResults.value[0];
++    if (firstCompletedResult) {
++      showImageBatchResult(firstCompletedResult);
++    }
+     await loadHistory();
+-  } catch (error) {
+-    imageDetections.value = [];
+-    requestError.value = extractErrorMessage(error, "图片识别失败，请确认后端服务已启动后重试。");
+   } finally {
+     isLoading.value = false;
++    loadingText.value = "";
++    const failedCount = imageBatchResults.value.filter((item) => item.status === "failed").length;
++    requestError.value =
++      failedCount > 0 && failedCount === imageBatchResults.value.length
++        ? imageBatchResults.value[0]?.errorMessage || "图片识别失败，请稍后重试。"
++        : "";
+     input.value = "";
+   }
+ }
+@@ -810,6 +959,7 @@ async function startStream() {
+ 
+   setMode("stream");
+   requestError.value = "";
++  clearStreamPlaybackFrame();
+   streamStatus.value = "starting";
+ 
+   try {
+@@ -832,6 +982,7 @@ async function startStream() {
+ }
+ 
+ async function stopStream() {
++  clearStreamPlaybackFrame();
+   try {
+     const { data } = await stopPlatePushStreamApi();
+     streamControl.value = data;
+@@ -856,11 +1007,12 @@ function extractErrorMessage(error: unknown, fallback: string) {
+ function startStatusPolling() {
+   stopStatusPolling();
+   statusTimer = window.setInterval(async () => {
++    statusPollTick += 1;
+     await refreshStreamStatus();
+-    if (mode.value === "stream") {
++    if (mode.value === "stream" && statusPollTick % 3 === 0) {
+       await loadHistory();
+     }
+-  }, 3000);
++  }, 1000);
+ }
+ 
+ function stopStatusPolling() {
+@@ -868,6 +1020,7 @@ function stopStatusPolling() {
+     window.clearInterval(statusTimer);
+     statusTimer = null;
+   }
++  statusPollTick = 0;
+ }
+ 
+ onMounted(async () => {
+@@ -907,7 +1060,7 @@ watch(totalPages, (value) => {
+ onBeforeUnmount(() => {
+   stopStatusPolling();
+   stopVideoJobPolling();
+-  resetImagePreviewUrl();
++  resetImageState();
+ });
+ </script>
+ 
+@@ -1151,6 +1304,56 @@ onBeforeUnmount(() => {
+   color: var(--text-soft);
+ }
+ 
++.image-batch-list {
++  display: grid;
++  gap: 10px;
++}
++
++.image-batch-item {
++  display: grid;
++  gap: 6px;
++  width: 100%;
++  padding: 12px 14px;
++  text-align: left;
++  color: var(--text);
++  background: var(--surface-muted);
++  border: 1px solid var(--line);
++  border-radius: 12px;
++  cursor: pointer;
++  transition: 0.2s ease;
++}
++
++.image-batch-item.active {
++  border-color: rgba(25, 148, 129, 0.45);
++  box-shadow: 0 0 0 1px rgba(25, 148, 129, 0.16);
++}
++
++.image-batch-head {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 10px;
++}
++
++.image-batch-name {
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++  font-weight: 600;
++}
++
++.image-batch-state,
++.image-batch-summary {
++  font-size: 13px;
++  color: var(--text-soft);
++}
++
++.image-batch-error {
++  font-size: 12px;
++  color: #b27f75;
++}
++
+ .history-panel {
+   position: sticky;
+   top: 0;

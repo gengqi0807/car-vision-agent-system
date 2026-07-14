@@ -19,7 +19,7 @@
         </article>
 
         <label v-if="mode === 'image'" class="upload-zone">
-          <input class="hidden-input" accept="image/*" type="file" @change="handleImageFileChange" />
+          <input class="hidden-input" accept="image/*" type="file" multiple @change="handleImageFileChange" />
           <div class="main">点击上传道路场景图片</div>
           <div class="sub">支持 JPG、PNG、WEBP</div>
         </label>
@@ -168,6 +168,24 @@
             </div>
           </div>
 
+          <div v-if="mode === 'image' && imageBatchResults.length > 0" class="image-batch-list">
+            <button
+              v-for="item in imageBatchResults"
+              :key="item.id"
+              type="button"
+              class="image-batch-item"
+              :class="{ active: item.id === activeImageResultId }"
+              @click="showImageBatchResult(item)"
+            >
+              <div class="image-batch-head">
+                <span class="image-batch-name">{{ item.filename }}</span>
+                <span class="image-batch-state">{{ formatImageBatchStatus(item) }}</span>
+              </div>
+              <div class="image-batch-summary">{{ formatImageBatchPlateSummary(item) }}</div>
+              <div v-if="item.errorMessage" class="image-batch-error">{{ item.errorMessage }}</div>
+            </button>
+          </div>
+
           <div class="result-meta">{{ resultMeta }}</div>
           <div v-if="requestError" class="request-error">{{ requestError }}</div>
         </article>
@@ -249,6 +267,15 @@ interface OverlayDetection extends PlateDetection {
   height: number;
 }
 
+interface ImageBatchResult {
+  id: string;
+  filename: string;
+  previewUrl: string;
+  detections: PlateDetection[];
+  status: "pending" | "processing" | "completed" | "failed";
+  errorMessage: string;
+}
+
 const PLATE_MODE_STORAGE_KEY = "plate-recognition-mode";
 const PLATE_STREAM_INPUT_STORAGE_KEY = "plate-stream-input";
 const PLATE_STREAM_PRESET_STORAGE_KEY = "plate-stream-preset";
@@ -304,6 +331,8 @@ const isLoading = ref(false);
 const imagePreviewUrl = ref("");
 const previewImageRef = ref<HTMLImageElement | null>(null);
 const imageDetections = ref<PlateDetection[]>([]);
+const imageBatchResults = ref<ImageBatchResult[]>([]);
+const activeImageResultId = ref("");
 const sourceFrameSize = ref({ width: 0, height: 0 });
 
 const videoResult = ref<PlateVideoRecognitionResponse | null>(null);
@@ -324,8 +353,8 @@ let statusTimer: number | null = null;
 const historyPageSize = 6;
 
 const fallbackRecords: HistoryRecordView[] = [
-  { id: 1, plate: "沪A12345", color: "蓝牌", vehicleType: "识别记录", time: "14:23" },
-  { id: 2, plate: "沪B67890", color: "绿牌", vehicleType: "识别记录", time: "14:15" }
+  { id: 1, plate: "沪A12345", color: "蓝牌", vehicleType: "未识别", time: "14:23" },
+  { id: 2, plate: "沪B67890", color: "绿牌", vehicleType: "未识别", time: "14:15" }
 ];
 
 const processedVideoUrl = computed(() => videoResult.value?.processed_video_url ?? "");
@@ -355,6 +384,14 @@ const currentDetections = computed(() => {
   return [];
 });
 
+const totalImageDetections = computed(() =>
+  imageBatchResults.value.reduce((total, item) => total + item.detections.length, 0)
+);
+
+const finishedImageCount = computed(
+  () => imageBatchResults.value.filter((item) => item.status === "completed" || item.status === "failed").length
+);
+
 const displayHistory = computed<HistoryRecordView[]>(() => {
   if (historyRecords.value.length === 0) {
     return fallbackRecords;
@@ -364,7 +401,7 @@ const displayHistory = computed<HistoryRecordView[]>(() => {
     id: record.id,
     plate: record.plate_number,
     color: record.plate_color,
-    vehicleType: "识别记录",
+    vehicleType: record.vehicle_type || "未识别",
     time: new Date(record.created_at).toLocaleTimeString("zh-CN", { hour12: false })
   }));
 });
@@ -389,7 +426,7 @@ const detectionRows = computed(() =>
     plate: item.plate_number || "未识别",
     color: item.plate_color,
     confidence: formatConfidence(item.confidence),
-    meta: `${item.plate_color} · ${item.vehicle_type || "未识别"} · 识别成功`
+    meta: `${item.plate_color} · ${item.vehicle_type || "未识别"} · ${formatConfidence(item.confidence)}`
   }))
 );
 
@@ -528,10 +565,13 @@ const resultMeta = computed(() => {
   if (isLoading.value) {
     return "正在处理图片...";
   }
-  if (!imagePreviewUrl.value) {
+  if (!imageBatchResults.value.length) {
     return "上传图片后，会在这里显示识别结果。";
   }
-  return `共识别到 ${imageDetections.value.length} 个车牌。`;
+  if (imageBatchResults.value.length === 1) {
+    return `共识别到 ${imageDetections.value.length} 个车牌。`;
+  }
+  return `已完成 ${finishedImageCount.value} / ${imageBatchResults.value.length} 张图片，共识别到 ${totalImageDetections.value} 个车牌。`;
 });
 
 function clampToPercent(value: number) {
@@ -565,16 +605,61 @@ function boxStyle(item: OverlayDetection) {
   };
 }
 
-function resetImagePreviewUrl() {
-  if (imagePreviewUrl.value) {
-    URL.revokeObjectURL(imagePreviewUrl.value);
-    imagePreviewUrl.value = "";
+function revokeImageBatchPreviewUrls() {
+  if (typeof URL === "undefined") {
+    return;
+  }
+  const revoked = new Set<string>();
+  for (const item of imageBatchResults.value) {
+    if (!item.previewUrl || revoked.has(item.previewUrl)) {
+      continue;
+    }
+    URL.revokeObjectURL(item.previewUrl);
+    revoked.add(item.previewUrl);
   }
 }
 
+function showImageBatchResult(item: ImageBatchResult) {
+  activeImageResultId.value = item.id;
+  imagePreviewUrl.value = item.previewUrl;
+  imageDetections.value = item.detections;
+  sourceFrameSize.value = { width: 0, height: 0 };
+}
+
+function formatImageBatchStatus(item: ImageBatchResult) {
+  if (item.status === "processing") {
+    return "识别中";
+  }
+  if (item.status === "completed") {
+    return `已完成 · ${item.detections.length} 个结果`;
+  }
+  if (item.status === "failed") {
+    return "识别失败";
+  }
+  return "等待中";
+}
+
+function formatImageBatchPlateSummary(item: ImageBatchResult) {
+  if (item.status === "failed") {
+    return "这张图片识别失败。";
+  }
+  if (item.status === "pending" || item.status === "processing") {
+    return "正在等待当前图片识别完成。";
+  }
+  if (item.detections.length === 0) {
+    return "未识别到车牌。";
+  }
+  return item.detections
+    .map((detection) => detection.plate_number || "未识别")
+    .join("、");
+}
+
 function resetImageState() {
-  resetImagePreviewUrl();
+  revokeImageBatchPreviewUrls();
+  imagePreviewUrl.value = "";
   imageDetections.value = [];
+  imageBatchResults.value = [];
+  activeImageResultId.value = "";
   sourceFrameSize.value = { width: 0, height: 0 };
 }
 
@@ -735,29 +820,75 @@ async function refreshStreamStatus() {
 
 async function handleImageFileChange(event: Event) {
   const input = event.target as HTMLInputElement;
-  const file = input.files?.[0];
+  const files = Array.from(input.files ?? []);
 
   resetImageState();
   requestError.value = "";
 
-  if (!file) {
+  if (files.length === 0) {
     return;
   }
 
-  imagePreviewUrl.value = URL.createObjectURL(file);
+  imageBatchResults.value = files.map((file, index) => ({
+    id: `${Date.now()}-${index}-${file.name}`,
+    filename: file.name,
+    previewUrl: URL.createObjectURL(file),
+    detections: [],
+    status: "pending",
+    errorMessage: ""
+  }));
+  showImageBatchResult(imageBatchResults.value[0]);
   isLoading.value = true;
-  loadingText.value = "正在识别图片，请稍候...";
+  loadingText.value = `正在识别图片 1/${files.length}，请稍候...`;
 
   try {
-    await nextTick();
-    const { data } = await recognizePlateImageApi(file);
-    imageDetections.value = data.detections;
+    for (const [index, file] of files.entries()) {
+      const imageResult = imageBatchResults.value[index];
+      if (!imageResult) {
+        continue;
+      }
+
+      imageResult.status = "processing";
+      imageResult.errorMessage = "";
+      showImageBatchResult(imageResult);
+      loadingText.value = `正在识别图片 ${index + 1}/${files.length}：${file.name}`;
+
+      await nextTick();
+
+      try {
+        const { data } = await recognizePlateImageApi(file);
+        imageResult.detections = data.detections;
+        imageResult.status = "completed";
+        if (activeImageResultId.value === imageResult.id) {
+          imageDetections.value = data.detections;
+        }
+      } catch (error) {
+        imageResult.detections = [];
+        imageResult.status = "failed";
+        imageResult.errorMessage = extractErrorMessage(
+          error,
+          "图片识别失败，请确认后端服务已启动后重试。"
+        );
+        if (activeImageResultId.value === imageResult.id) {
+          imageDetections.value = [];
+        }
+      }
+    }
+
+    const firstCompletedResult =
+      imageBatchResults.value.find((item) => item.status === "completed") ?? imageBatchResults.value[0];
+    if (firstCompletedResult) {
+      showImageBatchResult(firstCompletedResult);
+    }
     await loadHistory();
-  } catch (error) {
-    imageDetections.value = [];
-    requestError.value = extractErrorMessage(error, "图片识别失败，请确认后端服务已启动后重试。");
   } finally {
     isLoading.value = false;
+    loadingText.value = "";
+    const failedCount = imageBatchResults.value.filter((item) => item.status === "failed").length;
+    requestError.value =
+      failedCount > 0 && failedCount === imageBatchResults.value.length
+        ? imageBatchResults.value[0]?.errorMessage || "图片识别失败，请稍后重试。"
+        : "";
     input.value = "";
   }
 }
@@ -907,7 +1038,7 @@ watch(totalPages, (value) => {
 onBeforeUnmount(() => {
   stopStatusPolling();
   stopVideoJobPolling();
-  resetImagePreviewUrl();
+  resetImageState();
 });
 </script>
 
@@ -1149,6 +1280,56 @@ onBeforeUnmount(() => {
   margin-left: 8px;
   font-size: 13px;
   color: var(--text-soft);
+}
+
+.image-batch-list {
+  display: grid;
+  gap: 10px;
+}
+
+.image-batch-item {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  padding: 12px 14px;
+  text-align: left;
+  color: var(--text);
+  background: var(--surface-muted);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: 0.2s ease;
+}
+
+.image-batch-item.active {
+  border-color: rgba(25, 148, 129, 0.45);
+  box-shadow: 0 0 0 1px rgba(25, 148, 129, 0.16);
+}
+
+.image-batch-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.image-batch-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.image-batch-state,
+.image-batch-summary {
+  font-size: 13px;
+  color: var(--text-soft);
+}
+
+.image-batch-error {
+  font-size: 12px;
+  color: #b27f75;
 }
 
 .history-panel {
