@@ -109,16 +109,19 @@ class PoliceGestureVideoSession:
         self.dl_warmed_up = not realtime
         self.warmup_started_at = time.time()
         self.warmup_seconds = 2.0
-        self.dl_persist_gesture = "无手势"
-        self.dl_persist_confidence = 0.0
-        self.dl_persist_counter = 0
-        self.dl_persist_max = 8
-        self.locked_gesture: str | None = None
-        self.locked_confidence = 0.0
-        self.lock_candidate: str | None = None
-        self.lock_candidate_confidence = 0.0
-        self.lock_consecutive_count = 0
-        self.was_active = False
+        self.action_state = "idle"
+        self.action_frame_count = 0
+        self.hip_both_frames = 0
+        self.hip_stop_threshold = 8
+        self.dl_window: list[tuple[str, float]] = []
+        self.dl_filtered_gesture = "无手势"
+        self.dl_filtered_confidence = 0.0
+        self.gesture_min_confidence = 0.60
+        self.gesture_min_run = 3
+        self.first_guess_frames = 5
+        self.action_flash_text = ""
+        self.action_flash_remaining = 0
+        self.action_flash_frames = 30
 
     def __enter__(self) -> PoliceGestureVideoSession:
         return self
@@ -282,16 +285,14 @@ class PoliceGestureVideoSession:
             right_palm_ori = classify_palm_orientation(self.last_hand_right, body_right_2d, body_up_2d)
 
             if feat is not None:
-                result = self.state_machine.update(
+                self.state_machine.update(
                     feat,
                     left_palm_ori,
                     right_palm_ori,
                     self.global_frame,
                     feat.get("shoulder_width", 0.35),
                 )
-                if result is not None:
-                    self.display_result, self.display_confidence = result
-                    self.result_display_timer = police_cfg.RESULT_DISPLAY_FRAMES
+                self._update_action_state(feat)
         elif should_infer:
             self.state_machine.cancel_action(self.global_frame)
             self.last_landmarks = None
@@ -299,9 +300,9 @@ class PoliceGestureVideoSession:
             self.last_feat = None
             self.last_hand_left = None
             self.last_hand_right = None
-            self.dl_persist_counter = 0
+            self._reset_action_state()
 
-        if self.dl_engine is not None and self.frame_counter % self.dl_skip == 0:
+        if self.dl_engine is not None and should_infer:
             if self.realtime and not self.dl_warmed_up and (time.time() - self.warmup_started_at) >= self.warmup_seconds:
                 self.dl_warmed_up = True
                 self.dl_engine.reset_state()
@@ -325,26 +326,10 @@ class PoliceGestureVideoSession:
                     raw_confidence = 0.0
                     self.dl_keypoints = []
 
-                if self.realtime:
-                    if raw_gesture not in {"无手势", "DL error", "预热中..."}:
-                        self.dl_persist_gesture = raw_gesture
-                        self.dl_persist_confidence = raw_confidence
-                        self.dl_persist_counter = self.dl_persist_max
-                        self.dl_gesture = raw_gesture
-                        self.dl_confidence = raw_confidence
-                    elif self.dl_persist_counter > 0:
-                        decay = self.dl_persist_counter / self.dl_persist_max
-                        self.dl_gesture = self.dl_persist_gesture
-                        self.dl_confidence = self.dl_persist_confidence * max(0.55, decay)
-                        self.dl_persist_counter -= 1
-                    else:
-                        self.dl_gesture = raw_gesture
-                        self.dl_confidence = raw_confidence
-                else:
-                    self.dl_gesture = raw_gesture
-                    self.dl_confidence = raw_confidence
+                self._update_filtered_dl_result(raw_gesture, raw_confidence)
 
-        show_gesture, show_confidence = self._update_locked_dl_result()
+        show_gesture = self.dl_gesture
+        show_confidence = self.dl_confidence
 
         if not should_infer and self.last_landmarks is not None:
             draw_pose_landmarks(annotated, self.last_landmarks, height, width)
@@ -386,17 +371,25 @@ class PoliceGestureVideoSession:
                     ),
                 ])
 
-        state_text = self.state_machine.display_text
         if self.last_landmarks is None:
             text_lines.append(("未检测到人体", (10, 110), (0, 0, 255), 36))
-        elif state_text == "动作中":
-            text_lines.append(("动作识别中...", (10, 110), (0, 255, 255), 30))
-        elif state_text == "无动作":
-            text_lines.append(("无动作", (10, 110), (128, 128, 128), 28))
-        elif self.dl_engine is None and self.display_result and self.display_result != FILTERED_GESTURE:
-            text_lines.append((f"交警手势: {self.display_result}", (10, 110), (0, 255, 0), 34))
-        else:
-            text_lines.append(("等待动作...", (10, 110), (255, 255, 255), 30))
+
+        if self.action_flash_remaining > 0:
+            banner_width, banner_height = 300, 50
+            banner_x = (width - banner_width) // 2
+            banner_y = height // 8
+            overlay = annotated.copy()
+            cv2.rectangle(
+                overlay,
+                (banner_x, banner_y),
+                (banner_x + banner_width, banner_y + banner_height),
+                (0, 0, 0),
+                -1,
+            )
+            annotated = cv2.addWeighted(overlay, 0.55, annotated, 0.45, 0)
+            flash_color = (0, 255, 0) if self.action_flash_text == "动作开始" else (0, 140, 255)
+            text_lines.append((self.action_flash_text, (banner_x + 65, banner_y + 8), flash_color, 32))
+            self.action_flash_remaining -= 1
 
         if self.last_feat is not None:
             info_x = width - 200
@@ -452,69 +445,93 @@ class PoliceGestureVideoSession:
             display_label=display_label,
         )
 
-    def _update_locked_dl_result(self) -> tuple[str, float]:
-        """Mirror the new run_recognition.py action-gated DL result locking."""
-        if self.dl_engine is None:
-            return self.dl_gesture, self.dl_confidence
-        if self.realtime and not self.dl_warmed_up:
-            return self.dl_gesture, self.dl_confidence
+    def _update_action_state(self, feat: dict[str, Any]) -> None:
+        both_hip = feat.get("left_region") == "hip" and feat.get("right_region") == "hip"
+        if self.action_state == "idle":
+            if not both_hip:
+                self.action_state = "active"
+                self.action_frame_count = 0
+                self.dl_window.clear()
+                self.dl_filtered_gesture = "无手势"
+                self.dl_filtered_confidence = 0.0
+                self.hip_both_frames = 0
+                if self.dl_engine is not None:
+                    self.dl_engine.reset_state()
+                self.action_flash_text = "动作开始"
+                self.action_flash_remaining = self.action_flash_frames
+            return
 
-        is_active = self.state_machine.state == police_cfg.STATE_ACTIVE
-        if is_active:
-            if not self.was_active:
-                self.locked_gesture = None
-                self.locked_confidence = 0.0
-                self.lock_candidate = None
-                self.lock_candidate_confidence = 0.0
-                self.lock_consecutive_count = 0
-
-            dl_valid = not (
-                self.dl_gesture in {"右转弯", "右转弯信号", "靠边停车", "靠边停车信号"}
-                and self.last_feat
-                and self.last_feat.get("left_region") == "hip"
-            )
-            if dl_valid and self.dl_gesture in {"停止", "停止信号"} and self.last_feat:
-                dl_valid = self.last_feat.get("right_region") == "hip"
-
-            if dl_valid and self.dl_gesture not in {
-                "无动作",
-                "无手势",
-                "DL error",
-                "loading...",
-                "预热中...",
-            }:
-                if self.dl_gesture == self.lock_candidate:
-                    self.lock_consecutive_count += 1
-                else:
-                    self.lock_candidate = self.dl_gesture
-                    self.lock_candidate_confidence = self.dl_confidence
-                    self.lock_consecutive_count = 1
-                    self.locked_gesture = None
-                    self.locked_confidence = 0.0
-
-                self.lock_candidate_confidence = self.dl_confidence
-                if self.lock_consecutive_count >= police_cfg.LOCK_EARLY_SHOW:
-                    self.locked_gesture = self.lock_candidate
-                    self.locked_confidence = self.lock_candidate_confidence
-
-            result = (
-                (self.locked_gesture, self.locked_confidence)
-                if self.locked_gesture
-                else ("识别中...", 0.0)
-            )
+        self.action_frame_count += 1
+        if both_hip:
+            self.hip_both_frames += 1
+            if self.hip_both_frames >= self.hip_stop_threshold:
+                self._reset_action_state(show_flash=True)
         else:
-            if self.was_active and self.locked_gesture is None and self.lock_candidate is not None:
-                result = (self.lock_candidate, self.lock_candidate_confidence)
-            else:
-                result = ("无手势", 0.0)
-            self.locked_gesture = None
-            self.locked_confidence = 0.0
-            self.lock_candidate = None
-            self.lock_candidate_confidence = 0.0
-            self.lock_consecutive_count = 0
+            self.hip_both_frames = 0
 
-        self.was_active = is_active
-        return result
+    def _reset_action_state(self, *, show_flash: bool = False) -> None:
+        was_active = self.action_state == "active"
+        self.action_state = "idle"
+        self.action_frame_count = 0
+        self.hip_both_frames = 0
+        self.dl_window.clear()
+        self.dl_filtered_gesture = "无手势"
+        self.dl_filtered_confidence = 0.0
+        self.dl_gesture = "无手势"
+        self.dl_confidence = 0.0
+        if self.dl_engine is not None:
+            self.dl_engine.reset_state()
+        if show_flash and was_active:
+            self.action_flash_text = "动作结束"
+            self.action_flash_remaining = self.action_flash_frames
+
+    def _update_filtered_dl_result(self, raw_gesture: str, raw_confidence: float) -> None:
+        if self.action_state != "active":
+            self.dl_gesture = "无手势"
+            self.dl_confidence = 0.0
+            self.dl_window.clear()
+            return
+
+        self.dl_window.append((raw_gesture, raw_confidence))
+        if len(self.dl_window) > 60:
+            self.dl_window = self.dl_window[-40:]
+
+        if self.action_frame_count <= self.first_guess_frames:
+            candidates = [
+                (gesture, confidence)
+                for gesture, confidence in self.dl_window
+                if gesture not in {"无手势", "DL error", "loading...", "预热中..."} and confidence > 0
+            ]
+            if candidates:
+                self.dl_filtered_gesture, self.dl_filtered_confidence = max(candidates, key=lambda item: item[1])
+        else:
+            runs: list[tuple[str, int, float]] = []
+            recent = self.dl_window[-15:]
+            if recent:
+                current_gesture = recent[0][0]
+                confidences = [recent[0][1]]
+                for gesture, confidence in recent[1:]:
+                    if gesture == current_gesture:
+                        confidences.append(confidence)
+                    else:
+                        runs.append((current_gesture, len(confidences), sum(confidences) / len(confidences)))
+                        current_gesture = gesture
+                        confidences = [confidence]
+                runs.append((current_gesture, len(confidences), sum(confidences) / len(confidences)))
+            valid = [
+                item
+                for item in runs
+                if item[0] not in {"无手势", "DL error", "loading...", "预热中..."}
+                and item[2] >= self.gesture_min_confidence
+                and item[1] >= self.gesture_min_run
+            ]
+            if valid:
+                gesture, _, confidence = valid[-1]
+                self.dl_filtered_gesture = gesture
+                self.dl_filtered_confidence = confidence
+
+        self.dl_gesture = self.dl_filtered_gesture
+        self.dl_confidence = self.dl_filtered_confidence
 
 
 class PoliceGestureLocalRuntime:
