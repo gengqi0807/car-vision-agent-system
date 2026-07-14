@@ -310,6 +310,8 @@ class OwnerGestureService:
             updated_at=None,
         )
         self._camera_runtime_ready = False
+        self._warmup_lock = threading.Lock()
+        self._runtime_warmed = False
 
     @classmethod
     def instance(cls) -> "OwnerGestureService":
@@ -376,6 +378,30 @@ class OwnerGestureService:
 
     def register_alert_callback(self, callback: Any) -> None:
         self._alert_callbacks.append(callback)
+
+    def warmup_runtime(self) -> None:
+        if self._runtime_warmed:
+            return
+        with self._warmup_lock:
+            if self._runtime_warmed:
+                return
+
+            from app.models_infer.mediapipe_hands import MediaPipeHands
+
+            _ = self.classifier
+            _ = self.stream_classifier
+            _ = self._verify_owner_runtime()
+            _ = self.hands.infer(np.zeros((256, 256, 3), dtype=np.uint8))
+            MediaPipeHands.configure(
+                settings.resolved_hand_model_path,
+                num_hands=settings.num_hands,
+                min_detection_confidence=settings.min_hand_detection_confidence,
+                min_presence_confidence=settings.min_hand_presence_confidence,
+                min_tracking_confidence=settings.min_hand_tracking_confidence,
+            )
+            MediaPipeHands.infer_video(np.zeros((256, 256, 3), dtype=np.uint8), timestamp_ms=1)
+            self._runtime_warmed = True
+            logger.info("Owner gesture recognition runtime warmup finished")
 
     async def process_frame(
         self,
@@ -612,7 +638,8 @@ class OwnerGestureService:
             if self._stream_running:
                 return self._stream_state
 
-            self._configure_stream_runtime()
+            with self._warmup_lock:
+                self._configure_stream_runtime()
             self._stream_running = True
             self._stream_source = source
             self._latest_stream_result = None
@@ -711,7 +738,6 @@ class OwnerGestureService:
         from app.models_infer.gesture_classifier import GestureClassifier
         from app.models_infer.mediapipe_hands import MediaPipeHands
 
-        MediaPipeHands.reset()
         MediaPipeHands.configure(
             settings.resolved_hand_model_path,
             num_hands=settings.num_hands,

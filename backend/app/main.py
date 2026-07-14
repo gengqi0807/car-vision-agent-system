@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from app import models  # noqa: F401
 from app.api.router import api_router
 from app.api.v1.plate import service as plate_service
+from app.api.v1.owner_gesture import service as owner_gesture_service
 from app.core.config import settings
 from app.core.database import init_database
 from app.core.logger import configure_logging, get_logger
@@ -31,6 +32,16 @@ async def lifespan(_: FastAPI):
             logger.warning("Plate model warmup failed; lazy initialization will be used.", exc_info=True)
     else:
         logger.info("Plate model startup warmup disabled; lazy initialization will be used.")
+    if settings.owner_gesture_startup_warmup_enabled:
+        def warmup_owner_gesture() -> None:
+            try:
+                logger.info("Warming up owner gesture recognition models...")
+                owner_gesture_service.warmup_runtime()
+            except Exception:
+                logger.warning("Owner gesture warmup failed; lazy initialization will be used.", exc_info=True)
+
+        from threading import Thread
+        Thread(target=warmup_owner_gesture, daemon=True, name="owner-gesture-warmup").start()
     yield
     logger.info("Shutting down %s", settings.app_name)
 
