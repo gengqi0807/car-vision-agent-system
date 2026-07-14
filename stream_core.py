@@ -1,22 +1,46 @@
+import os
 import subprocess
 import time
-import os
+from pathlib import Path
+
 import cv2
 
 
 class StreamManager:
-    def __init__(self):
-        self.mediamtx_path = r"D:\py_projects\mediamtx\mediamtx.exe"
-        self.ffmpeg_path = r"D:\py_projects\ffmpeg\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe"
-        if not os.path.exists(self.ffmpeg_path):
-            raise FileNotFoundError(f"FFmpeg 路径不存在，请修改 self.ffmpeg_path: {self.ffmpeg_path}")
+    def __init__(self, mediamtx_path: str | None = None, ffmpeg_path: str | None = None):
+        self.mediamtx_path = self._resolve_tool_path(
+            mediamtx_path or os.environ.get("MEDIAMTX_BIN"),
+            [
+                r"D:\py_projects\mediamtx\mediamtx.exe",
+                r"F:\programming projiect\SmallTerm\sophomore\MediaMIX\mediamtx.exe",
+            ],
+        )
+        self.ffmpeg_path = self._resolve_tool_path(
+            ffmpeg_path or os.environ.get("FFMPEG_BIN"),
+            [
+                r"D:\py_projects\ffmpeg\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe",
+                r"F:\programming projiect\SmallTerm\sophomore\ffmpeg\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe",
+            ],
+        )
+        if not self.mediamtx_path:
+            raise FileNotFoundError("未找到可用的 MediaMTX 可执行文件，请通过 MEDIAMTX_BIN 指定路径。")
+        if not self.ffmpeg_path:
+            raise FileNotFoundError("未找到可用的 FFmpeg 可执行文件，请通过 FFMPEG_BIN 指定路径。")
+
+    def _resolve_tool_path(self, preferred: str | None, candidates: list[str]) -> str | None:
+        ordered_candidates = [preferred] if preferred else []
+        ordered_candidates.extend(candidates)
+        for item in ordered_candidates:
+            if item and Path(item).exists():
+                return item
+        return preferred or None
 
     def start_mediamtx(self):
         self.mediamtx_process = subprocess.Popen(
             self.mediamtx_path,
             cwd=os.path.dirname(self.mediamtx_path),
             stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         time.sleep(1.5)
         if self.mediamtx_process.poll() is None:
@@ -30,15 +54,15 @@ class StreamManager:
         ffmpeg_cmd = [
             self.ffmpeg_path,
             "-re",
-            "-i", video_source,
-            "-c", "copy",
-            "-f", "rtsp",
-            rtsp_url
+            "-i",
+            video_source,
+            "-c",
+            "copy",
+            "-f",
+            "rtsp",
+            rtsp_url,
         ]
-        self.ffmpeg_process = subprocess.Popen(
-            ffmpeg_cmd,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
+        self.ffmpeg_process = subprocess.Popen(ffmpeg_cmd, creationflags=subprocess.CREATE_NO_WINDOW)
         print(f"✅ FFmpeg 开始推流，地址: {rtsp_url}")
 
     def test_pull_stream(self, stream_name="test"):

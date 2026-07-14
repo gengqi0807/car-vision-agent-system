@@ -34,27 +34,58 @@ sys.path.insert(0, str(backend_dir))
 from app.core.config import settings
 from app.models_infer.gesture_classifier import GestureClassifier
 from app.models_infer.mediapipe_hands import MediaPipeHands
+from police.visualization import draw_chinese_text, draw_chinese_text_lines
 
 # ----------------------------------------------------------------
 # 手势 → 动作映射（与服务端一致）
 # ----------------------------------------------------------------
 
 GESTURE_ACTION = {
-    "palm":        "wake         ← 唤醒",
-    "fist":        "confirm      ← 确认",
-    "circle_ccw":  "volume_down  ← 音量-",
-    "circle_cw":   "volume_up    ← 音量+",
-    "swipe_left":  "prev_func    ← 上一个功能",
-    "swipe_right": "next_func    ← 下一个功能",
-    "thumb_up":    "call_answer  ← 接听",
-    "thumb_down":  "call_hangup  ← 挂断",
-    "wave":        "home         ← 主页",
-    "pointing":    "idle         ← 食指追踪中",
-    "unknown":     "idle",
+    "palm": "唤醒",
+    "open_palm": "唤醒",
+    "fist": "确认",
+    "circle_ccw": "降低音量",
+    "circle_cw": "升高音量",
+    "swipe_left": "上一个功能",
+    "swipe_right": "下一个功能",
+    "thumb_up": "接听电话",
+    "thumbs_up": "接听电话",
+    "thumb_down": "挂断电话",
+    "thumbs_down": "挂断电话",
+    "thunb_index": "返回主页",
+    "thumb_index": "返回主页",
+    "wave": "等待动作",
+    "pointing": "追踪中",
+    "point": "追踪中",
+    "idle": "等待动作",
+    "unknown": "等待识别",
+}
+
+GESTURE_NAME = {
+    "palm": "张开手掌",
+    "open_palm": "张开手掌",
+    "fist": "握拳",
+    "circle_ccw": "逆时针画圈",
+    "circle_cw": "顺时针画圈",
+    "swipe_left": "张开拳头",
+    "swipe_right": "收回拳头",
+    "thumb_up": "拇指向上",
+    "thumbs_up": "拇指向上",
+    "thumb_down": "拇指向下",
+    "thumbs_down": "拇指向下",
+    "thunb_index": "捏指",
+    "thumb_index": "捏指",
+    "wave": "挥手",
+    "pointing": "食指指向",
+    "point": "食指指向",
+    "idle": "识别中",
+    "unknown": "未识别",
 }
 
 # 音量类手势：允许在手未离开屏幕时连续 +/- 切换（连续调音）
 VOLUME_GESTURES = {"circle_cw", "circle_ccw"}
+SWITCH_GESTURES = {"swipe_left", "swipe_right"}
+SWITCH_ENDPOINT_GESTURES = {"fist", "palm", "open_palm"}
 
 
 def gesture_label(gesture: str) -> str:
@@ -67,19 +98,33 @@ def gesture_label(gesture: str) -> str:
 
 
 def draw_result(frame: np.ndarray, gesture: str, action: str, conf: float,
-                hand_count: int, kp: list | None = None) -> np.ndarray:
+                hand_count: int, kp: list | None = None, *, locked: bool = False) -> np.ndarray:
     h, w = frame.shape[:2]
 
     # 半透明背景
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 95), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (w, 104), (0, 0, 0), -1)
     frame = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
 
-    # 手势 + 动作
-    cv2.putText(frame, f"Gesture: {gesture}  |  Action: {action}",
-                (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
-    cv2.putText(frame, f"Confidence: {conf:.3f}  |  Hands: {hand_count}",
-                (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1)
+    text_lines = [
+        (
+            f"手势：{GESTURE_NAME.get(gesture, gesture)}  |  动作：{action}",
+            (10, 12),
+            (0, 255, 0),
+            28,
+        ),
+        (
+            f"置信度：{conf:.3f}  |  检测手数：{hand_count}",
+            (10, 57),
+            (210, 210, 210),
+            23,
+        ),
+    ]
+    if locked:
+        text_lines.append(
+            ("已锁定", (max(10, w - 110), 15), (0, 165, 255), 24)
+        )
+    frame = draw_chinese_text_lines(frame, text_lines)
 
     # 关键点
     if kp and len(kp) == 21:
@@ -106,13 +151,23 @@ def draw_result(frame: np.ndarray, gesture: str, action: str, conf: float,
     return frame
 
 
+def draw_locked_marker(frame: np.ndarray) -> np.ndarray:
+    return draw_chinese_text(
+        frame,
+        "已锁定",
+        (max(10, frame.shape[1] - 110), 15),
+        (0, 165, 255),
+        24,
+    )
+
+
 # ----------------------------------------------------------------
 # 推理核心
 # ----------------------------------------------------------------
 
 
 def process_frame(frame_bgr: np.ndarray, classifier: GestureClassifier):
-    hands = MediaPipeHands.infer(frame_bgr)
+    hands = MediaPipeHands.infer_video(frame_bgr)
     hand_kp = hands[0] if hands else None
 
     gesture, conf = classifier.classify_frame(hand_kp)
@@ -122,7 +177,7 @@ def process_frame(frame_bgr: np.ndarray, classifier: GestureClassifier):
 
 def process_image(frame_bgr: np.ndarray, classifier: GestureClassifier):
     """单张图片推理，绕过 classify_frame 的时序去抖逻辑，直接调用静态分类。"""
-    hands = MediaPipeHands.infer(frame_bgr)
+    hands = MediaPipeHands.infer_video(frame_bgr)
     hand_kp = hands[0] if hands else None
 
     if hand_kp:
@@ -143,7 +198,7 @@ def main():
     args = parser.parse_args()
 
     # 初始化模型
-    model_path = os.path.join(settings.models_dir, settings.hand_landmarker_model)
+    model_path = settings.resolved_hand_model_path
     if not os.path.exists(model_path):
         print(f"❌ 模型未找到: {model_path}")
         return
@@ -164,6 +219,7 @@ def main():
         print("按任意键退出...")
         cv2.waitKey(0)
         cv2.destroyAllWindows()
+        MediaPipeHands.reset()
         return
 
     # ---- 视频 / RTSP / 摄像头模式 ----
@@ -220,6 +276,12 @@ def main():
         elif hand_present:
             # 稳定有手：正常识别 + 锁定
             if result_locked:
+                # 已锁定起点手势后，允许张开/收回的切换结果完成本轮动作。
+                if (locked_gesture in SWITCH_ENDPOINT_GESTURES
+                        and gesture in SWITCH_GESTURES):
+                    locked_gesture = gesture
+                    locked_action = action
+                    locked_conf = conf
                 # 音量手势：允许 +/- 方向切换（连续调音），仅稳定态生效
                 if (locked_gesture in VOLUME_GESTURES
                         and gesture in VOLUME_GESTURES
@@ -240,10 +302,7 @@ def main():
             out_g, out_a, out_c = "idle", "idle", 0.0
 
         # 文字用锁定结果（不再变化），关键点/手数用当前帧（手的位置仍跟随）
-        frame = draw_result(frame, out_g, out_a, out_c, hc, kp)
-        if result_locked:
-            cv2.putText(frame, "[LOCKED]", (frame.shape[1] - 130, 35),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+        frame = draw_result(frame, out_g, out_a, out_c, hc, kp, locked=result_locked)
 
         # FPS 显示
         frame_count += 1
@@ -259,6 +318,7 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+    MediaPipeHands.reset()
     print("🛑 识别结束")
 
 

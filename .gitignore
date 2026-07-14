@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -26,27 +25,3 @@ backend/models/*.tflite
 owner_gesture_dataset_
 .DS_Store
 Thumbs.db
-=======
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.venv/
-venv/
-env/
-
-node_modules/
-dist/
-.vite/
-
-.env
-.env.local
-.env.*.local
-
-backend/uploads/
-backend/logs/
-
-.DS_Store
-Thumbs.db
->>>>>>> a1e996b8f6908ab5b123273c6f378c9f83c67d1e
