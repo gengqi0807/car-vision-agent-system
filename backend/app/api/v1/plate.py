@@ -33,6 +33,7 @@ def _absolutize_video_job_response(
     return response.model_copy(
         update={
             "preview_image_url": _absolutize_media_url(request, response.preview_image_url),
+            "playback_url": response.playback_url,
             "processed_video_url": _absolutize_media_url(request, response.processed_video_url),
             "unread_samples": [
                 _absolutize_media_url(request, item) if item.startswith("/") else item for item in response.unread_samples

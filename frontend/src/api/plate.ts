@@ -35,6 +35,7 @@ export interface PlateVideoJobStatusResponse {
   total_frames: number;
   detections: PlateDetection[];
   preview_image_url?: string | null;
+  playback_url?: string | null;
   processed_video_url?: string | null;
   unread_samples: string[];
   duration_seconds?: number | null;

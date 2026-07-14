@@ -135,6 +135,8 @@ class Settings(BaseSettings):
     plate_video_process_every_n_frames: int = Field(default=10)
     plate_video_recognition_max_side: int = Field(default=1280)
     plate_video_output_fps: int = Field(default=8)
+    plate_video_preview_fps: int = Field(default=8, ge=1, le=30)
+    plate_video_preview_max_side: int = Field(default=960, ge=320)
     plate_video_small_target_detector_enabled: bool = Field(default=False)
     plate_video_detector_full_frame_fallback: bool = Field(default=False)
     plate_save_uploads: bool = Field(default=False)

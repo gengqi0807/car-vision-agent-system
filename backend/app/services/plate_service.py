@@ -133,6 +133,7 @@ class VideoProcessingJob:
     duration_seconds: float | None = None
     processed_video_url: str | None = None
     preview_image_url: str | None = None
+    playback_url: str | None = None
     error_message: str | None = None
     updated_at: int = 0
 
@@ -333,6 +334,7 @@ class PlateService:
                 total_frames=job.total_frames,
                 detections=[item.model_copy(deep=True) for item in job.detections],
                 preview_image_url=self._build_cache_busted_media_url(job.preview_image_url, job.updated_at),
+                playback_url=job.playback_url,
                 processed_video_url=job.processed_video_url,
                 unread_samples=list(job.unread_samples),
                 duration_seconds=job.duration_seconds,
@@ -555,6 +557,8 @@ class PlateService:
         return f"{media_url}{separator}ts={updated_at}"
 
     def _run_video_job(self, job_id: str) -> None:
+        from app.services.plate_video_preview_publisher import PlateVideoPreviewPublisher
+
         with self._video_jobs_lock:
             job = self._video_jobs.get(job_id)
         if job is None:
@@ -569,12 +573,23 @@ class PlateService:
             error_message=None,
         )
 
+        preview_publisher = PlateVideoPreviewPublisher(
+            job_id,
+            on_ready=lambda playback_url: self._update_video_job(job_id, playback_url=playback_url),
+        )
+        preview_enabled = False
         try:
+            try:
+                preview_publisher.start()
+                preview_enabled = True
+            except Exception:
+                logger.warning("Plate video preview stream is unavailable; recognition will continue.", exc_info=True)
             result = self._process_video_file(
                 job.source_path,
                 job.output_path,
                 job.source_filename,
                 progress_callback=lambda **payload: self._handle_video_job_progress(job_id, **payload),
+                preview_callback=preview_publisher.submit if preview_enabled else None,
             )
             self._update_video_job(
                 job_id,
@@ -594,6 +609,8 @@ class PlateService:
                 error_message=str(exc),
             )
         finally:
+            if preview_enabled:
+                preview_publisher.close()
             if not settings.plate_save_uploads:
                 try:
                     job.source_path.unlink(missing_ok=True)
@@ -656,6 +673,7 @@ class PlateService:
         unread_samples: list[str] | None = None,
         duration_seconds: float | None = None,
         processed_video_url: str | None = None,
+        playback_url: str | None = None,
         error_message: str | None = None,
         updated_at: int | None = None,
     ) -> None:
@@ -681,6 +699,8 @@ class PlateService:
                 job.duration_seconds = duration_seconds
             if processed_video_url is not None:
                 job.processed_video_url = processed_video_url
+            if playback_url is not None:
+                job.playback_url = playback_url
             if error_message is not None or status == "failed":
                 job.error_message = error_message
             if updated_at is not None:
@@ -694,6 +714,7 @@ class PlateService:
         output_path: Path,
         filename: str,
         progress_callback=None,
+        preview_callback=None,
     ) -> PlateVideoRecognitionResponse:
         cv2 = self._require_cv2()
         capture, pending_frame = self._open_local_video_capture(source_path)
@@ -753,6 +774,12 @@ class PlateService:
                     break
 
                 processed_frame_count += 1
+                if processed_frame_count == 1 and callable(preview_callback):
+                    preview_callback(source_frame)
+                    logger.info(
+                        "Plate video first frame submitted to MediaMTX preview before recognition: %s",
+                        filename,
+                    )
                 should_publish_progress = callable(progress_callback) and (
                     processed_frame_count == 1
                     or processed_frame_count % preview_update_interval == 0
@@ -810,6 +837,8 @@ class PlateService:
                             raise InferenceConfigurationError("Failed to create annotated video output file.")
 
                     writer.write(annotated)
+                    if callable(preview_callback):
+                        preview_callback(annotated)
         finally:
             capture.release()
             if writer is not None:

@@ -39,6 +39,7 @@ class PlateVideoJobStatusResponse(BaseModel):
     total_frames: int = 0
     detections: list[PlateDetection] = Field(default_factory=list)
     preview_image_url: str | None = None
+    playback_url: str | None = None
     processed_video_url: str | None = None
     unread_samples: list[str] = Field(default_factory=list)
     duration_seconds: float | None = None

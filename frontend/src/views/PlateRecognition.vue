@@ -98,6 +98,10 @@
               <video class="preview-video" :src="processedVideoUrl" controls playsinline />
             </div>
 
+            <div v-else-if="mode === 'video' && videoPreviewStreamUrl" class="preview-stage stream-viewer-shell">
+              <iframe :src="videoPreviewStreamUrl" class="stream-viewer" title="车牌视频标注预览" allowfullscreen />
+            </div>
+
             <div v-else-if="mode === 'video' && videoPreviewImageUrl" class="preview-stage">
               <img :src="videoPreviewImageUrl" alt="视频识别处理中预览" class="preview-video preview-image" />
             </div>
@@ -329,6 +333,10 @@ const fallbackRecords: HistoryRecordView[] = [
 ];
 
 const processedVideoUrl = computed(() => videoResult.value?.processed_video_url ?? "");
+const videoPreviewStreamUrl = computed(() => {
+  if (processedVideoUrl.value || videoJob.value?.status !== "processing" || !videoJob.value?.playback_url) return "";
+  return `${videoJob.value.playback_url}?job=${encodeURIComponent(videoJob.value.job_id)}`;
+});
 const videoPreviewImageUrl = computed(() => {
   if (processedVideoUrl.value) {
     return "";
