@@ -67,7 +67,7 @@ export const fetchOwnerGestureApi = (formData: FormData) =>
 
 export const fetchOwnerPanelApi = () => request.get<OwnerControlPanelState>("/owner-gesture/panel");
 
-export const startOwnerGestureStreamApi = (source = "0", fps = 15) =>
+export const startOwnerGestureStreamApi = (source = "auto", fps = 15) =>
   request.post<OwnerGestureStreamState>("/owner-gesture/stream/start", { command: "start", source, fps });
 
 export const stopOwnerGestureStreamApi = () => request.post("/owner-gesture/stream/stop");

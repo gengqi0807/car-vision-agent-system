@@ -155,6 +155,8 @@ class Settings(BaseSettings):
     owner_gesture_rtsp_base_url: str = Field(default="rtsp://127.0.0.1:8554")
     owner_gesture_playback_base_url: str = Field(default="http://127.0.0.1:8889")
     owner_gesture_push_bitrate: str = Field(default="2M")
+    external_camera_index: int = Field(default=1, ge=0)
+    local_camera_index: int = Field(default=0, ge=0)
 
     models_dir: str = Field(
         default=str(BACKEND_DIR / "models"),

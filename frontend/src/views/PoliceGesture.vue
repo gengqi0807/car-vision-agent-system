@@ -463,7 +463,7 @@ async function startCamera() {
   cameraResult.value = null;
   try {
     await stopPoliceGestureStreamApi().catch(() => undefined);
-    const { data } = await startPoliceGestureStreamApi("0", 15);
+    const { data } = await startPoliceGestureStreamApi("auto", 15);
     if (!data.playback_url) throw new Error("后端未返回 MediaMTX 播放地址");
     cameraActive.value = true;
     startStreamResultPolling();

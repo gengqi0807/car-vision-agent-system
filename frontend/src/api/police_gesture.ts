@@ -89,7 +89,7 @@ export const fetchPoliceGestureVideoProgressApi = (taskId: string) =>
 export const fetchPoliceGestureHistoryApi = () =>
   request.get<PoliceGestureHistoryItem[]>("/police-gesture/history");
 
-export const startPoliceGestureStreamApi = (source = "0", fps = 15) =>
+export const startPoliceGestureStreamApi = (source = "auto", fps = 15) =>
   request.post<PoliceGestureStreamState>("/police-gesture/stream/start", { command: "start", source, fps });
 
 export const stopPoliceGestureStreamApi = () =>

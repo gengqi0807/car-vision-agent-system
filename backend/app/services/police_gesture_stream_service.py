@@ -9,6 +9,7 @@ import cv2
 from app.core.config import settings
 from app.schemas.gesture import GestureFrameResult, Keypoint, StreamState
 from app.services.mediamtx_runtime import MediaMTXRuntime
+from app.services.camera_source import open_camera_source
 from app.services.police_gesture_local_runtime import PoliceGestureVideoSession
 
 
@@ -68,11 +69,13 @@ class PoliceGestureStreamService:
         return GestureFrameResult(gesture="no_gesture", confidence=0.0, keypoints=[], updated_at=datetime.now(timezone.utc))
 
     def _worker(self, source: str, fps: int) -> None:
-        capture = cv2.VideoCapture(int(source) if source.isdigit() else source)
+        capture, resolved_source = open_camera_source(source)
         ffmpeg: subprocess.Popen[bytes] | None = None
         try:
             if not capture.isOpened():
                 raise RuntimeError(f"无法打开视频源：{source}")
+            with self._lock:
+                self._state = self._state.model_copy(update={"source": resolved_source})
             with PoliceGestureVideoSession(realtime=True) as session:
                 while self._is_running():
                     ok, frame = capture.read()

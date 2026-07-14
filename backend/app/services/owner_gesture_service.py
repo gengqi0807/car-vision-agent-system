@@ -711,13 +711,18 @@ class OwnerGestureService:
         from app.models_infer.mediapipe_hands import MediaPipeHands
         verify_process_frame, verify_draw_result, verify_gesture_label, _ = self._verify_owner_runtime()
 
-        capture = cv2.VideoCapture(self._resolve_stream_source(source))
+        from app.services.camera_source import open_camera_source
+
+        capture, resolved_source = open_camera_source(source)
         if not capture.isOpened():
             logger.warning("Failed to open owner-gesture stream source: %s", source)
             with self._stream_lock:
                 self._stream_running = False
                 self._stream_state = StreamState(running=False)
             return
+
+        with self._stream_lock:
+            self._stream_state = self._stream_state.model_copy(update={"source": resolved_source})
 
         capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, 960)

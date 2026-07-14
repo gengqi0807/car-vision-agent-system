@@ -715,9 +715,9 @@ async function startCamera() {
 
   try {
     await stopOwnerGestureStreamApi().catch(() => undefined);
-    const { data } = await startOwnerGestureStreamApi("0", 15);
+    const { data } = await startOwnerGestureStreamApi("auto", 15);
     if (!data.playback_url) throw new Error("后端未返回 MediaMTX 播放地址");
-    cameraDeviceLabel.value = "后端摄像头 0";
+    cameraDeviceLabel.value = "4K USB Camera（断开时自动使用内置摄像头）";
     cameraActive.value = true;
     streamStarting = true;
     startStreamResultPolling();
