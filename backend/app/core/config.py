@@ -172,6 +172,18 @@ class Settings(BaseSettings):
         default="gesture_classifier_svm.joblib",
         description="Relative or absolute path to the owner-gesture classifier model.",
     )
+    custom_gesture_classifier_model: str = Field(
+        default="custom_gesture_classifier_svm.joblib",
+        description="自定义手势 SVM 分类器模型文件名（相对于 models_dir）。",
+    )
+    custom_gesture_confidence_threshold: float = Field(
+        default=0.65,
+        description="自定义手势分类置信度阈值，低于此值回退到现有手势识别链。",
+    )
+    custom_gesture_dataset_dir: str = Field(
+        default="",
+        description="自定义手势数据集目录（可选，为空则从数据库样本训练）。",
+    )
     num_hands: int = Field(default=2)
     min_hand_detection_confidence: float = Field(default=0.5)
     min_hand_presence_confidence: float = Field(default=0.5)
@@ -221,6 +233,13 @@ class Settings(BaseSettings):
     @property
     def resolved_gesture_classifier_model_path(self) -> str:
         classifier_path = self.gesture_classifier_model
+        if os.path.isabs(classifier_path):
+            return classifier_path
+        return os.path.join(self.models_dir, classifier_path)
+
+    @property
+    def resolved_custom_gesture_classifier_model_path(self) -> str:
+        classifier_path = self.custom_gesture_classifier_model
         if os.path.isabs(classifier_path):
             return classifier_path
         return os.path.join(self.models_dir, classifier_path)

@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from "vue-router";
 
 import AppLayout from "../layouts/AppLayout.vue";
 import AlertMonitor from "../views/AlertMonitor.vue";
+import CustomGesture from "../views/CustomGesture.vue";
 import Dashboard from "../views/Dashboard.vue";
 import Login from "../views/Login.vue";
 import OwnerGesture from "../views/OwnerGesture.vue";
@@ -48,6 +49,11 @@ const router = createRouter({
           path: "owner-gesture",
           name: "owner-gesture",
           component: OwnerGesture
+        },
+        {
+          path: "custom-gesture",
+          name: "custom-gesture",
+          component: CustomGesture
         },
         {
           path: "alert-monitor",

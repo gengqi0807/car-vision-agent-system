@@ -5,7 +5,27 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="d266786f-ee78-41ea-9080-d512dbeddab5" name="更改" comment="">
+      <change afterPath="$PROJECT_DIR$/changes-lty-mediapipe-compat.md" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/.env.example" beforeDir="false" afterPath="$PROJECT_DIR$/backend/.env.example" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/app/api/router.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/api/router.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/app/core/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/core/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/app/models/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/models/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/app/models_infer/gesture_classifier.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/models_infer/gesture_classifier.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/app/models_infer/mediapipe_compat.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/models_infer/mediapipe_compat.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/backend/app/services/owner_gesture_service.py" beforeDir="false" afterPath="$PROJECT_DIR$/backend/app/services/owner_gesture_service.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/.vite-cache/deps/_metadata.json" beforeDir="false" afterPath="$PROJECT_DIR$/frontend/.vite-cache/deps/_metadata.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/api/owner_gesture.ts" beforeDir="false" afterPath="$PROJECT_DIR$/frontend/src/api/owner_gesture.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/layouts/AppLayout.vue" beforeDir="false" afterPath="$PROJECT_DIR$/frontend/src/layouts/AppLayout.vue" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/router/index.ts" beforeDir="false" afterPath="$PROJECT_DIR$/frontend/src/router/index.ts" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/frontend/src/views/OwnerGesture.vue" beforeDir="false" afterPath="$PROJECT_DIR$/frontend/src/views/OwnerGesture.vue" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/local_stream_config.py" beforeDir="false" afterPath="$PROJECT_DIR$/local_stream_config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/police/models.py" beforeDir="false" afterPath="$PROJECT_DIR$/police/models.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/微信图片_20260713225401_158_76.jpg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/微信图片_20260713225408_159_76.jpg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/微信图片_20260713225421_160_76.jpg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/微信图片_20260713225434_161_76.jpg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/微信视频2026-07-13_230137_164.mp4" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -44,18 +64,18 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;ASKED_ADD_EXTERNAL_FILES&quot;: &quot;true&quot;,
-    &quot;Python.dataset_test.executor&quot;: &quot;Run&quot;,
-    &quot;Python.police_local.executor&quot;: &quot;Run&quot;,
-    &quot;Python.verify_owner_gesture.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;liutianyue__A__Hagrid&quot;,
-    &quot;last_opened_file_path&quot;: &quot;D:/car-vision-agent-system&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;preferences.pluginManager&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ASKED_ADD_EXTERNAL_FILES": "true",
+    "Python.dataset_test.executor": "Run",
+    "Python.police_local.executor": "Run",
+    "Python.verify_owner_gesture.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "git-widget-placeholder": "pull__from__merge__test",
+    "last_opened_file_path": "C:/Users/Lenovo/Desktop",
+    "settings.editor.selected.configurable": "preferences.pluginManager"
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="D:\car-vision-agent-system" />

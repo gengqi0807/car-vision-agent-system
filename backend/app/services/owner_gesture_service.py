@@ -452,6 +452,21 @@ class OwnerGestureService:
             )
 
         control_command, _ = self._map_gesture_to_command(raw_gesture_label)
+
+        # ---- 优先使用有动作映射的原有手势，无映射时回退到自定义手势 ----
+        action = GESTURE_ACTION_MAP.get(raw_gesture_label, "idle")
+        if action == "idle":
+            custom_result = self.classifier.classify_custom(primary_hand)
+            if custom_result is not None and input_mode != "camera":
+                custom_name, custom_conf = custom_result
+                raw_gesture_label = custom_name
+                cls_conf = custom_conf
+            elif custom_result is not None and input_mode == "camera":
+                custom_name, custom_conf = self.stream_classifier.classify_custom(primary_hand) or (None, 0.0)
+                if custom_name and custom_conf >= 0.65:
+                    raw_gesture_label = custom_name
+                    cls_conf = custom_conf
+
         action = GESTURE_ACTION_MAP.get(raw_gesture_label, "idle")
         gesture_label = self._normalize_public_gesture(raw_gesture_label)
         if input_mode == "camera" and runtime_session is not None:
@@ -752,6 +767,7 @@ class OwnerGestureService:
                         inference_frame,
                         self.stream_classifier,
                     )
+                    primary_hand = primary_hand or []  # 无手时兜底，避免下游 len(None) 异常
                     observed_gesture = raw_gesture
                     raw_gesture, confidence = self._lock_camera_result(
                         self._stream_runtime_session,
@@ -760,6 +776,16 @@ class OwnerGestureService:
                         hand_present=bool(primary_hand),
                     )
                     control_command, _ = self._map_gesture_to_command(raw_gesture)
+
+                    # ---- 优先使用有动作映射的原有手势，无映射时回退到自定义手势 ----
+                    action = GESTURE_ACTION_MAP.get(raw_gesture, "idle")
+                    if action == "idle":
+                        custom_result = self.stream_classifier.classify_custom(primary_hand)
+                        if custom_result is not None:
+                            custom_name, custom_conf = custom_result
+                            raw_gesture = custom_name
+                            confidence = custom_conf
+
                     action = GESTURE_ACTION_MAP.get(raw_gesture, "idle")
                     gesture = self._normalize_public_gesture(raw_gesture)
                     keypoints = (
@@ -806,6 +832,12 @@ class OwnerGestureService:
                     ffmpeg_process.stdin.write(annotated_frame.tobytes())
                     ffmpeg_process.stdin.flush()
                     published_frame_count += 1
+                    # 同步输出 MJPEG 帧，供前端 <img> 直连低延迟显示
+                    stream_jpeg = self._encode_frame_to_jpeg(annotated_frame)
+                    if stream_jpeg is not None:
+                        with self._frame_condition:
+                            self._latest_stream_jpeg = stream_jpeg
+                            self._frame_condition.notify_all()
                     result = OwnerGestureResult(
                         gesture=gesture,
                         action=action,
@@ -968,8 +1000,8 @@ class OwnerGestureService:
                     "-preset", "ultrafast",
                     "-tune", "zerolatency",
                     "-x264-params",
-                    "bframes=0:sync-lookahead=0:rc-lookahead=0:sliced-threads=1:force-cfr=0",
-                    "-threads", "1",
+                    "bframes=0:sync-lookahead=0:rc-lookahead=0:sliced-threads=2:force-cfr=0",
+                    "-threads", "2",
                 ]
             )
         command.extend(

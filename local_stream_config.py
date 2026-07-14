@@ -42,6 +42,6 @@ def _resolve_executable(base_path: Path, executable_name: str) -> Path:
 
 
 STREAM_RUNTIME = StreamRuntimeConfig(
-    mediamtx_home=Path(r"D:\tool\mediamtx\mediamtx_v1.19.2_windows_amd64"),
-    ffmpeg_bin_home=Path(r"D:\tool\ffmpeg\ffmpeg-master-latest-win64-gpl-shared\bin"),
+    mediamtx_home=Path(r"D:\py_projects\mediamtx"),
+    ffmpeg_bin_home=Path(r"D:\py_projects\ffmpeg\ffmpeg-master-latest-win64-gpl-shared\bin"),
 )

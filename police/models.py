@@ -10,64 +10,13 @@ models.py — MediaPipe Pose/Hand 模型加载与推理
 使用 mediapipe.tasks API（新版），返回世界坐标和归一化关键点。
 """
 
-import ctypes
-import os
-import platform
-from importlib import resources
-
 import cv2
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from mediapipe.tasks.python.core import mediapipe_c_bindings
 
 from . import config
-
-
-def _patch_mediapipe_windows_free() -> None:
-    """Patch MediaPipe Tasks on Windows when libmediapipe.dll lacks free()."""
-    if os.name != "nt":
-        return
-    if getattr(mediapipe_c_bindings, "_windows_free_patch_applied", False):
-        return
-
-    def load_raw_library_compat(signatures=()):
-        shared_lib = mediapipe_c_bindings._shared_lib
-        if shared_lib is None:
-            if os.name == "posix":
-                if platform.system() == "Darwin":
-                    lib_filename = "libmediapipe.dylib"
-                else:
-                    lib_filename = "libmediapipe.so"
-            else:
-                lib_filename = "libmediapipe.dll"
-            lib_path_context = resources.files("mediapipe.tasks.c")
-            absolute_lib_path = str(lib_path_context / lib_filename)
-            shared_lib = ctypes.CDLL(absolute_lib_path)
-            mediapipe_c_bindings._shared_lib = shared_lib
-
-        for signature in signatures:
-            c_func = getattr(shared_lib, signature.func_name)
-            c_func.argtypes = signature.argtypes
-            c_func.restype = signature.restype
-
-        try:
-            free_func = shared_lib.free
-        except AttributeError:
-            # MediaPipe 0.10.30 on Windows may not export free from libmediapipe.dll.
-            free_func = ctypes.CDLL("ucrtbase.dll").free
-            shared_lib.free = free_func
-
-        free_func.argtypes = [ctypes.c_void_p]
-        free_func.restype = None
-        return shared_lib
-
-    mediapipe_c_bindings.load_raw_library = load_raw_library_compat
-    mediapipe_c_bindings._windows_free_patch_applied = True
-
-
-_patch_mediapipe_windows_free()
 
 
 # ============================================================

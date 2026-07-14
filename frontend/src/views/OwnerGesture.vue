@@ -71,13 +71,11 @@
 
         <div class="preview-canvas-wrap">
           <div v-if="inputMode === 'camera'" class="preview-stage">
-            <iframe
+            <img
               v-if="cameraActive && cameraDisplayUrl"
               class="preview-image stream-player"
               :src="cameraDisplayUrl"
-              title="手势实时识别标注画面"
-              allow="autoplay; fullscreen"
-              allowfullscreen
+              alt="手势实时识别标注画面"
             />
             <div v-else-if="cameraActive" class="image-placeholder gesture-frame">
               后端正在生成标注画面
@@ -309,6 +307,7 @@ import {
   fetchOwnerGestureStreamResultApi,
   startOwnerGestureStreamApi,
   stopOwnerGestureStreamApi,
+  ownerGestureVideoFeedUrl,
   type OwnerControlPanelState,
   type OwnerGestureFrameResult,
 } from "@/api/owner_gesture";
@@ -467,7 +466,7 @@ const recognitionConfidence = computed(() => `${((result.value?.confidence ?? 0)
 
 const cameraDisplayUrl = computed(() => {
   if (inputMode.value !== "camera") return "";
-  return streamVideoUrl.value;
+  return streamVideoUrl.value || ownerGestureVideoFeedUrl();
 });
 
 const imageDisplayUrl = computed(() => result.value?.annotated_image || sourcePreviewUrl.value || "");
@@ -716,12 +715,11 @@ async function startCamera() {
   try {
     await stopOwnerGestureStreamApi().catch(() => undefined);
     const { data } = await startOwnerGestureStreamApi("0", 15);
-    if (!data.playback_url) throw new Error("后端未返回 MediaMTX 播放地址");
     cameraDeviceLabel.value = "后端摄像头 0";
     cameraActive.value = true;
     streamStarting = true;
     startStreamResultPolling();
-    await waitForOwnerGestureStreamPublished(data.playback_url);
+    await waitForOwnerGestureStreamPublished();
   } catch (err: any) {
     stopCamera();
     error.value = axios.isAxiosError(err)
@@ -768,29 +766,27 @@ function startStreamResultPolling() {
     } catch {
       if (cameraActive.value && !streamStarting) error.value = "无法获取后端手势识别结果";
     } finally {
-      if (cameraActive.value) streamResultTimer = window.setTimeout(poll, 200);
+      if (cameraActive.value) streamResultTimer = window.setTimeout(poll, 500);
     }
   };
   void poll();
 }
 
-async function waitForOwnerGestureStreamPublished(playbackUrl: string) {
+async function waitForOwnerGestureStreamPublished() {
   const deadline = Date.now() + 12_000;
   while (cameraActive.value && Date.now() < deadline) {
     const { data } = await fetchOwnerGestureStreamStateApi();
     if (data.last_error) throw new Error(data.last_error);
     if (!data.running) throw new Error("后端手势推流已停止");
     if (data.published) {
-      await new Promise((resolve) => window.setTimeout(resolve, 900));
-      if (!cameraActive.value) return;
-      streamVideoUrl.value = `${playbackUrl}?t=${Date.now()}`;
+      streamVideoUrl.value = `${ownerGestureVideoFeedUrl()}?t=${Date.now()}`;
       streamStarting = false;
       error.value = "";
       return;
     }
-    await new Promise((resolve) => window.setTimeout(resolve, 150));
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
   }
-  throw new Error("等待 MediaMTX 手势流就绪超时");
+  throw new Error("等待后端手势推流就绪超时");
 }
 
 function stopStreamResultPolling() {
@@ -1302,7 +1298,7 @@ onMounted(() => {
   window.addEventListener("resize", handleViewportResize);
   uiClockTimer = window.setInterval(() => {
     uiNow.value = Date.now();
-  }, 1000);
+  }, 5000);
 });
 
 onBeforeUnmount(() => {
