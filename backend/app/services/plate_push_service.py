@@ -36,6 +36,7 @@ class PlatePushService:
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
         self._state = PlatePushState()
+        self._worker_token = 0
 
     def start(
         self,
@@ -43,8 +44,6 @@ class PlatePushService:
         stream_name: str | None = None,
         process_frames: bool = True,
     ) -> PlateStreamControlResponse:
-        worker_to_stop: threading.Thread | None = None
-        previous_rtsp_url: str | None = None
         rtsp_url = rtsp_url.strip()
 
         with self._lock:
@@ -60,20 +59,12 @@ class PlatePushService:
                 ):
                     return self._to_response()
 
-                previous_rtsp_url = self._state.rtsp_url
-                worker_to_stop = self._worker
                 self._stop_event.set()
 
-        if worker_to_stop is not None:
-            logger.info("Switching plate push worker from %s to %s", previous_rtsp_url, rtsp_url)
-            worker_to_stop.join(timeout=6)
-
         with self._lock:
-            if self._worker is not None and self._worker.is_alive():
-                raise InferenceConfigurationError("The previous stream is still shutting down. Please retry shortly.")
-
-            self._worker = None
             self._stop_event = threading.Event()
+            self._worker_token += 1
+            worker_token = self._worker_token
             self._state = PlatePushState(
                 running=True,
                 published=False,
@@ -88,7 +79,7 @@ class PlatePushService:
             )
             self._worker = threading.Thread(
                 target=self._run_worker,
-                args=(rtsp_url, stream_name, process_frames, self._stop_event),
+                args=(rtsp_url, stream_name, process_frames, self._stop_event, worker_token),
                 daemon=True,
             )
             self._worker.start()
@@ -101,21 +92,11 @@ class PlatePushService:
             return self._to_response()
 
     def stop(self) -> PlateStreamControlResponse:
-        worker: threading.Thread | None
         with self._lock:
-            worker = self._worker
             self._stop_event.set()
-
-        if worker is not None:
-            worker.join(timeout=6)
-
-        with self._lock:
-            running = self._worker is not None and self._worker.is_alive()
-            if not running:
-                self._worker = None
-                self._state.running = False
-                self._state.published = False
-                self._state.publisher_started = False
+            self._state.running = False
+            self._state.published = False
+            self._state.publisher_started = False
             return self._to_response()
 
     def status(self) -> PlateStreamControlResponse:
@@ -149,13 +130,20 @@ class PlatePushService:
         stream_name: str,
         process_frames: bool,
         stop_event: threading.Event,
+        worker_token: int,
     ) -> None:
         if process_frames:
-            self._run_processed_worker(rtsp_url, stream_name, stop_event)
+            self._run_processed_worker(rtsp_url, stream_name, stop_event, worker_token)
         else:
-            self._run_passthrough_worker(rtsp_url, stream_name, stop_event)
+            self._run_passthrough_worker(rtsp_url, stream_name, stop_event, worker_token)
 
-    def _run_processed_worker(self, rtsp_url: str, stream_name: str, stop_event: threading.Event) -> None:
+    def _run_processed_worker(
+        self,
+        rtsp_url: str,
+        stream_name: str,
+        stop_event: threading.Event,
+        worker_token: int,
+    ) -> None:
         ffmpeg_process: subprocess.Popen[bytes] | None = None
         first_frame_written = False
         try:
@@ -167,7 +155,7 @@ class PlatePushService:
                 if ffmpeg_process is None:
                     height, width = frame.shape[:2]
                     ffmpeg_process = self._start_ffmpeg(width=width, height=height, publish_url=publish_url)
-                    self._mark_publisher_started(publish_url)
+                    self._mark_publisher_started(publish_url, worker_token)
 
                 if ffmpeg_process.poll() is not None:
                     stderr_output = self._read_process_error(ffmpeg_process)
@@ -187,17 +175,24 @@ class PlatePushService:
         except Exception as exc:
             logger.exception("Plate push worker failed")
             with self._lock:
-                self._state.last_error = str(exc)
+                if self._worker_token == worker_token:
+                    self._state.last_error = str(exc)
         finally:
             self._shutdown_ffmpeg(ffmpeg_process)
-            self._reset_state_after_worker_exit()
+            self._reset_state_after_worker_exit(worker_token)
 
-    def _run_passthrough_worker(self, rtsp_url: str, stream_name: str, stop_event: threading.Event) -> None:
+    def _run_passthrough_worker(
+        self,
+        rtsp_url: str,
+        stream_name: str,
+        stop_event: threading.Event,
+        worker_token: int,
+    ) -> None:
         ffmpeg_process: subprocess.Popen[bytes] | None = None
         try:
             publish_url = self._build_publish_rtsp_url(stream_name)
             ffmpeg_process = self._start_ffmpeg_passthrough(rtsp_url=rtsp_url, publish_url=publish_url)
-            self._mark_publisher_started(publish_url)
+            self._mark_publisher_started(publish_url, worker_token)
             logger.info("Started passthrough publisher for %s -> %s", rtsp_url, publish_url)
 
             while not stop_event.is_set():
@@ -210,22 +205,65 @@ class PlatePushService:
         except Exception as exc:
             logger.exception("Plate passthrough worker failed")
             with self._lock:
-                self._state.last_error = str(exc)
+                if self._worker_token == worker_token:
+                    self._state.last_error = str(exc)
         finally:
             self._shutdown_ffmpeg(ffmpeg_process)
-            self._reset_state_after_worker_exit()
+            self._reset_state_after_worker_exit(worker_token)
 
-    def _mark_publisher_started(self, publish_url: str) -> None:
+    def _mark_publisher_started(self, publish_url: str, worker_token: int) -> None:
         with self._lock:
-            if self._state.running and self._state.publish_rtsp_url == publish_url:
+            if (
+                self._worker_token == worker_token
+                and self._state.running
+                and self._state.publish_rtsp_url == publish_url
+            ):
                 self._state.publisher_started = True
 
-    def _reset_state_after_worker_exit(self) -> None:
+    def _reset_state_after_worker_exit(self, worker_token: int) -> None:
         with self._lock:
+            if self._worker_token != worker_token:
+                return
             self._state.running = False
             self._state.published = False
             self._state.publisher_started = False
             self._worker = None
+
+    def _probe_publish_stream(self, publish_rtsp_url: str) -> bool:
+        cv2 = self._plate_service._require_cv2()
+        old_capture_options = None
+        try:
+            import os
+
+            old_capture_options = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+            capture = cv2.VideoCapture(publish_rtsp_url, cv2.CAP_FFMPEG)
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if not capture.isOpened():
+                capture.release()
+                return False
+
+            deadline = time.monotonic() + 0.4
+            while time.monotonic() < deadline:
+                ok, frame = capture.read()
+                if ok and frame is not None:
+                    capture.release()
+                    return True
+                time.sleep(0.04)
+            capture.release()
+            return False
+        except Exception:
+            return False
+        finally:
+            try:
+                import os
+
+                if old_capture_options is None:
+                    os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+                else:
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = old_capture_options
+            except Exception:
+                pass
 
     def _start_ffmpeg(self, width: int, height: int, publish_url: str) -> subprocess.Popen[bytes]:
         command = [
@@ -320,42 +358,6 @@ class PlatePushService:
             raise InferenceConfigurationError(
                 f"ffmpeg was not found. Set PLATE_PUSH_FFMPEG_BIN in .env. Current value: {settings.plate_push_ffmpeg_bin!r}."
             ) from exc
-
-    def _probe_publish_stream(self, publish_rtsp_url: str) -> bool:
-        cv2 = self._plate_service._require_cv2()
-        old_capture_options = None
-        try:
-            import os
-
-            old_capture_options = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-            capture = cv2.VideoCapture(publish_rtsp_url, cv2.CAP_FFMPEG)
-            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            if not capture.isOpened():
-                capture.release()
-                return False
-
-            deadline = time.monotonic() + 0.6
-            while time.monotonic() < deadline:
-                ok, frame = capture.read()
-                if ok and frame is not None:
-                    capture.release()
-                    return True
-                time.sleep(0.05)
-            capture.release()
-            return False
-        except Exception:
-            return False
-        finally:
-            try:
-                import os
-
-                if old_capture_options is None:
-                    os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
-                else:
-                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = old_capture_options
-            except Exception:
-                pass
 
     def _shutdown_ffmpeg(self, process: subprocess.Popen[bytes] | None) -> None:
         if process is None:

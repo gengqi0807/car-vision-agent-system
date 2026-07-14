@@ -363,8 +363,8 @@ class PlateService:
             "detections": [],
             "detections_version": 0,
             "detections_updated_at": 0.0,
-            "display_width": 0,
-            "display_height": 0,
+            "frame_width": 0,
+            "frame_height": 0,
         }
         recognition_submit_interval = self._stream_recognition_submit_interval_seconds(min_interval)
         last_recognition_submit_at = 0.0
@@ -385,19 +385,27 @@ class PlateService:
                     continue
 
                 try:
-                    _, scaled_detections, _ = self._process_frame(
+                    (
+                        _,
+                        source_detections,
+                        fresh_detections,
+                        _,
+                    ) = self._process_video_frame_with_tracking(
                         local_frame,
-                        state,
-                        save_history=True,
-                        force_detect_when_empty=True,
+                        state=state,
+                        render=False,
                     )
-                    display_frame = self._resize_stream_frame(local_frame)
+                    if fresh_detections:
+                        now = time.monotonic()
+                        if now - state.last_history_saved_at >= settings.plate_stream_history_interval_seconds:
+                            self._save_history(fresh_detections, None)
+                            state.last_history_saved_at = now
                     with recognition_lock:
-                        recognition_state["detections"] = [item.model_copy() for item in scaled_detections]
+                        recognition_state["detections"] = [item.model_copy() for item in source_detections]
                         recognition_state["detections_version"] = local_version
                         recognition_state["detections_updated_at"] = time.monotonic()
-                        recognition_state["display_width"] = display_frame.shape[1]
-                        recognition_state["display_height"] = display_frame.shape[0]
+                        recognition_state["frame_width"] = local_frame.shape[1]
+                        recognition_state["frame_height"] = local_frame.shape[0]
                         recognition_state["processed_version"] = local_version
                 except Exception:
                     logger.warning("Async stream recognition step failed; keeping the latest published frame alive.", exc_info=True)
@@ -470,14 +478,14 @@ class PlateService:
                     cached_detections = [item.model_copy() for item in recognition_state["detections"]]
                     cached_detections_version = int(recognition_state["detections_version"])
                     cached_detections_updated_at = float(recognition_state["detections_updated_at"])
-                    cached_display_width = int(recognition_state["display_width"])
-                    cached_display_height = int(recognition_state["display_height"])
+                    cached_frame_width = int(recognition_state["frame_width"])
+                    cached_frame_height = int(recognition_state["frame_height"])
                     current_version = int(recognition_state["version"])
 
                 if (
                     cached_detections
-                    and cached_display_width > 0
-                    and cached_display_height > 0
+                    and cached_frame_width > 0
+                    and cached_frame_height > 0
                     and self._should_display_stream_cached_detections(
                         current_version=current_version,
                         detections_version=cached_detections_version,
@@ -488,8 +496,8 @@ class PlateService:
                 ):
                     scaled_detections = self._scale_detections(
                         cached_detections,
-                        cached_display_width,
-                        cached_display_height,
+                        cached_frame_width,
+                        cached_frame_height,
                         display_frame.shape[1],
                         display_frame.shape[0],
                     )

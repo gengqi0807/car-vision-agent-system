@@ -49,6 +49,7 @@ class PlateRecordSummary(BaseModel):
     id: int
     plate_number: str
     plate_color: str
+    vehicle_type: str = "未识别"
     created_at: datetime
 
 

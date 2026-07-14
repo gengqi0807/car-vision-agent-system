@@ -91,7 +91,19 @@
 
           <div class="preview-shell">
             <div v-if="mode === 'stream' && streamPlaybackUrl" class="preview-stage stream-viewer-shell">
-              <iframe :src="streamPlaybackUrl" class="stream-viewer" title="实时推流识别画面" allowfullscreen />
+              <iframe
+                :src="streamPlaybackUrl"
+                class="stream-viewer"
+                :class="{ 'stream-viewer-hidden': streamPlaybackOverlayVisible }"
+                title="实时推流识别画面"
+                allowfullscreen
+              />
+              <div v-if="streamPlaybackOverlayVisible" class="stream-playback-overlay">
+                <div class="stream-playback-overlay-card">
+                  <div class="stream-playback-overlay-title">正在连接视频流</div>
+                  <div class="stream-playback-overlay-text">{{ streamPlaybackOverlayText }}</div>
+                </div>
+              </div>
             </div>
 
             <div v-else-if="mode === 'video' && processedVideoUrl" class="preview-stage">
@@ -349,6 +361,7 @@ const streamControl = ref<PlateStreamControlResponse | null>(null);
 const streamStatus = ref<"idle" | "starting" | "running">("idle");
 const playbackRefreshKey = ref(Date.now());
 let statusTimer: number | null = null;
+let statusPollTick = 0;
 
 const historyPageSize = 6;
 
@@ -453,7 +466,11 @@ const overlayDetections = computed<OverlayDetection[]>(() => {
 });
 
 const streamPlaybackUrl = computed(() => {
-  if (streamStatus.value !== "running" || !streamControl.value?.published || !streamControl.value?.playback_url) {
+  if (
+    streamStatus.value === "idle" ||
+    !streamControl.value?.playback_url ||
+    (!streamControl.value.published && !streamControl.value.publisher_started)
+  ) {
     return "";
   }
   const separator = streamControl.value.playback_url.includes("?") ? "&" : "?";
@@ -536,6 +553,24 @@ const streamMetaText = computed(() => {
     return "实时推流中断，请检查源 RTSP、mediamtx 和 ffmpeg。";
   }
   return "选择摄像头并启动后，系统会拉取 RTSP 流、识别标注并重新推送到本地流媒体服务。";
+});
+
+const streamPlaybackOverlayVisible = computed(
+  () =>
+    mode.value === "stream" &&
+    !!streamPlaybackUrl.value &&
+    streamStatus.value !== "idle" &&
+    !streamControl.value?.published
+);
+
+const streamPlaybackOverlayText = computed(() => {
+  if (streamPhase.value === "connecting_source") {
+    return "正在等待源 RTSP 的首帧。";
+  }
+  if (streamPhase.value === "waiting_publish") {
+    return "本地播放器已打开，正在等待识别后的视频帧推上来。";
+  }
+  return "播放器正在建立连接，请稍候。";
 });
 
 const resultMeta = computed(() => {
@@ -652,6 +687,19 @@ function formatImageBatchPlateSummary(item: ImageBatchResult) {
   return item.detections
     .map((detection) => detection.plate_number || "未识别")
     .join("、");
+}
+
+function clearStreamPlaybackFrame() {
+  playbackRefreshKey.value = Date.now();
+  if (!streamControl.value) {
+    return;
+  }
+  streamControl.value = {
+    ...streamControl.value,
+    published: false,
+    publisher_started: false,
+    playback_url: null
+  };
 }
 
 function resetImageState() {
@@ -792,6 +840,7 @@ async function refreshStreamStatus() {
   try {
     const previousRunning = streamControl.value?.running ?? false;
     const previousPlaybackUrl = streamControl.value?.playback_url ?? "";
+    const previousPublished = streamControl.value?.published ?? false;
     const { data } = await fetchPlatePushStreamStatusApi();
     streamControl.value = data;
     streamStatus.value = data.running ? (data.published ? "running" : "starting") : "idle";
@@ -801,7 +850,12 @@ async function refreshStreamStatus() {
       }
       requestError.value = "";
     }
-    if (data.running && data.published && data.playback_url && (!previousRunning || previousPlaybackUrl !== data.playback_url)) {
+    if (
+      data.running &&
+      (data.published || data.publisher_started) &&
+      data.playback_url &&
+      (!previousRunning || previousPlaybackUrl !== data.playback_url || (!previousPublished && data.published))
+    ) {
       playbackRefreshKey.value = Date.now();
     }
     if (data.phase === "source_unavailable" || data.phase === "interrupted") {
@@ -941,6 +995,7 @@ async function startStream() {
 
   setMode("stream");
   requestError.value = "";
+  clearStreamPlaybackFrame();
   streamStatus.value = "starting";
 
   try {
@@ -963,6 +1018,7 @@ async function startStream() {
 }
 
 async function stopStream() {
+  clearStreamPlaybackFrame();
   try {
     const { data } = await stopPlatePushStreamApi();
     streamControl.value = data;
@@ -987,11 +1043,12 @@ function extractErrorMessage(error: unknown, fallback: string) {
 function startStatusPolling() {
   stopStatusPolling();
   statusTimer = window.setInterval(async () => {
+    statusPollTick += 1;
     await refreshStreamStatus();
-    if (mode.value === "stream") {
+    if (mode.value === "stream" && statusPollTick % 3 === 0) {
       await loadHistory();
     }
-  }, 3000);
+  }, 1000);
 }
 
 function stopStatusPolling() {
@@ -999,6 +1056,7 @@ function stopStatusPolling() {
     window.clearInterval(statusTimer);
     statusTimer = null;
   }
+  statusPollTick = 0;
 }
 
 onMounted(async () => {
@@ -1210,6 +1268,7 @@ onBeforeUnmount(() => {
 }
 
 .stream-viewer-shell {
+  position: relative;
   min-height: 720px;
 }
 
@@ -1220,6 +1279,45 @@ onBeforeUnmount(() => {
   border: 0;
   border-radius: 10px;
   background: #0b1020;
+}
+
+.stream-viewer-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.stream-playback-overlay {
+  position: absolute;
+  inset: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  background: rgba(11, 16, 32, 0.88);
+  z-index: 2;
+}
+
+.stream-playback-overlay-card {
+  display: grid;
+  gap: 8px;
+  max-width: 360px;
+  padding: 18px 20px;
+  text-align: center;
+  border: 1px solid rgba(45, 212, 191, 0.18);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.92);
+  color: #ecfeff;
+}
+
+.stream-playback-overlay-title {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.stream-playback-overlay-text {
+  font-size: 13px;
+  line-height: 1.5;
+  color: rgba(236, 254, 255, 0.78);
 }
 
 .image-frame {
