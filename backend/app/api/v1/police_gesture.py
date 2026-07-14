@@ -13,12 +13,16 @@ from app.schemas.gesture import (
     GestureHistoryItem,
     PoliceGestureVideoProgress,
     PoliceGestureVideoResult,
+    StreamControlRequest,
+    StreamState,
 )
 from app.services.police_gesture_service import PoliceGestureService
+from app.services.police_gesture_stream_service import PoliceGestureStreamService
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 service = PoliceGestureService()
+stream_service = PoliceGestureStreamService.instance()
 
 
 def _get_current_user_from_query_token(token: str | None) -> User:
@@ -149,3 +153,26 @@ async def police_gesture_video_preview(
 )
 async def police_gesture_history(current_user: User = Depends(get_current_user)) -> list[GestureHistoryItem]:
     return service.history(current_user.id)
+
+
+@router.get("/stream", response_model=StreamState)
+async def police_gesture_stream_state() -> StreamState:
+    return stream_service.status()
+
+
+@router.post("/stream/start", response_model=StreamState)
+async def start_police_gesture_stream(payload: StreamControlRequest) -> StreamState:
+    try:
+        return stream_service.start(source=payload.source or "0", fps=payload.fps)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.post("/stream/stop", response_model=StreamState)
+async def stop_police_gesture_stream() -> StreamState:
+    return stream_service.stop()
+
+
+@router.get("/stream/result", response_model=GestureFrameResult)
+async def current_police_gesture_stream_result() -> GestureFrameResult:
+    return stream_service.current()

@@ -55,7 +55,6 @@ def _patch_mediapipe_windows_free() -> None:
         try:
             free_func = shared_lib.free
         except AttributeError:
-            # MediaPipe 0.10.30 on Windows may not export free from libmediapipe.dll.
             free_func = ctypes.CDLL("ucrtbase.dll").free
             shared_lib.free = free_func
 

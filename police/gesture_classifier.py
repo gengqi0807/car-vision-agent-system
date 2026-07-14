@@ -4,14 +4,15 @@ gesture_classifier.py — 状态机 + 8 种交警手势分类决策树
 核心组件：
   - GestureStateMachine : 状态机（IDLE → ACTIVE → IDLE）
   - reset_action_data   : 创建动作数据容器
-  - classify_action     : 8 种手势的严格判定
+  - classify_action     : 8 种手势的严格判定（含人体移动检测）
   - mode_str / mode_list : 众数工具
 
 状态机规则：
-  - 进入 ACTIVE : 至少一只手离开胯部，且至少一只手在肩/头/腰区域，
-                  连续 START_CONFIRM 帧满足
-  - 在 ACTIVE 中: 持续记录特征；主动手回落胯部或超时则结束
-  - 结束后冷却  : COOLDOWN_FRAMES 帧内不触发新动作
+  - 进入 ACTIVE : 至少一只手离开胯部，且至少一只手在肩/头/腰区域
+  - 在 ACTIVE 中: 持续记录特征；双手都回到hip则立即结束
+  - 稳定识别   : ACTIVE期间每N帧做中间判定，取众数作为最终结果
+  - 人体移动   : 动作期间身体位移超阈值 → 判定为"无动作"
+  - 结束后     : 进入"无动作"显示，冷却期不触发新动作
 """
 
 import math
@@ -157,6 +158,12 @@ def reset_action_data(shoulder_width: float,
         "hip_hold_count": 1 if (
             f["left_region"] == "hip" and f["right_region"] == "hip"
         ) else 0,
+        # --- 人体位移追踪（行走检测） ---
+        "body_start_cx": f.get("body_cx", 0.0),
+        "body_start_cz": f.get("body_cz", 0.0),
+        "body_max_disp": 0.0,  # 动作期间最大位移（米）
+        # --- 稳定识别 ---
+        "stable_results": [],   # 中间判定的累积结果
         # --- 可见性标记 ---
         "left_visible": True,
         "right_visible": True,
@@ -183,23 +190,22 @@ def _update_action_data(action_data: dict, feat: dict,
     left_region_cur  = feat["left_region"]
     right_region_cur = feat["right_region"]
 
-    # ---- 主动手回落检测 ----
-    active_arm = action_data.get("active_arm", "both")
-    if active_arm == "left":
-        if left_region_cur == "hip" and right_region_cur != "head":
-            action_data["hip_hold_count"] += 1
-        else:
-            action_data["hip_hold_count"] = 0
-    elif active_arm == "right":
-        if right_region_cur == "hip" and left_region_cur != "head":
-            action_data["hip_hold_count"] += 1
-        else:
-            action_data["hip_hold_count"] = 0
-    else:  # both
-        if left_region_cur == "hip" and right_region_cur == "hip":
-            action_data["hip_hold_count"] += 1
-        else:
-            action_data["hip_hold_count"] = 0
+    # ---- 双手回落检测（必须双手都在hip才计数） ----
+    if left_region_cur == "hip" and right_region_cur == "hip":
+        action_data["hip_hold_count"] += 1
+    else:
+        action_data["hip_hold_count"] = 0
+
+    # ---- 人体位移追踪（行走检测） ----
+    if "body_start_cx" in action_data:
+        cx = feat.get("body_cx", action_data["body_start_cx"])
+        cz = feat.get("body_cz", action_data["body_start_cz"])
+        d = math.sqrt(
+            (cx - action_data["body_start_cx"])**2 +
+            (cz - action_data["body_start_cz"])**2
+        )
+        if d > action_data.get("body_max_disp", 0.0):
+            action_data["body_max_disp"] = d
 
     # ---- 极值更新 ----
     # raise
@@ -371,25 +377,44 @@ def classify_action(action_data: dict, verbose: bool = True) -> tuple[str, float
     L_always_hip = all(r == "hip" for r in left_regions) if left_regions else False
     R_always_hip = all(r == "hip" for r in right_regions) if right_regions else False
 
+    # 是否"多数"在 hip（≥70%帧，容忍短暂离开，用于变道等放宽判定）
+    L_mostly_hip = (left_regions.count("hip") >= max(1, len(left_regions) * 0.7)
+                    if left_regions else False)
+
     # >=N 帧停留的快捷判断
     def stayed(regions, target, n=1):
         return regions.count(target) >= n
 
     fc = action_data.get("frame_count", 0)
 
+    # 左臂侧展检测（基于横向投影 lat，不依赖高度）
+    # 用于区分右转弯（左臂侧展） vs 变道（左臂无动作/仅下垂）
+    left_poses = action_data.get("left_poses", [])
+    left_side_count = sum(1 for p in left_poses if p.get("is_side", False))
+
     # 调试
     if verbose:
         region_str = lambda lst: ",".join(r[0].upper() for r in lst) if lst else "?"
         print(f"  [classify] frames={fc}  L={L_Region}({region_str(left_regions)})  R={R_Region}({region_str(right_regions)})")
-        print(f"  [classify] L_always_hip={L_always_hip}  R_always_hip={R_always_hip}")
+        print(f"  [classify] L_always_hip={L_always_hip}  L_mostly_hip={L_mostly_hip}  R_always_hip={R_always_hip}")
+        print(f"  [classify] body_max_disp={action_data.get('body_max_disp', 0):.3f}m")
+        print(f"  [classify] left_side_count={left_side_count}/{fc}")
+
+    # ================================================================
+    # 0. 人体移动检测（行走/转身 → 无动作）
+    #    动作期间髋部中心位移超过阈值，说明人在移动，手势不可靠
+    # ================================================================
+    if action_data.get("body_max_disp", 0.0) > config.BODY_MOVE_THRESHOLD:
+        if verbose:
+            print(f"  ⚠ 人体移动中 (位移={action_data['body_max_disp']:.3f}m > {config.BODY_MOVE_THRESHOLD}m) → 无动作")
+        return ("无动作", 0.0)
 
     # ================================================================
     # 1. 停止信号
-    #    一手在头部(≥1帧)  +  另一手在胯部(始终)
-    #    双侧排查以兼容摄像头镜像（交警左手=画面右手）
+    #    左手在头部(≥1帧)  +  右手在胯部(始终)
+    #    ★ 右手必须是hip，排除右手在头部的镜像误判
     # ================================================================
-    if ((L_Region == "head" and stayed(left_regions, "head") and R_always_hip)
-            or (R_Region == "head" and stayed(right_regions, "head") and L_always_hip)):
+    if (L_Region == "head" and stayed(left_regions, "head") and R_always_hip):
         if verbose:
             print("  ✅ 命中 → 停止信号")
         return ("停止信号", 0.85)
@@ -435,22 +460,25 @@ def classify_action(action_data: dict, verbose: bool = True) -> tuple[str, float
 
     # ================================================================
     # 5. 右转弯信号
-    #    L=肩部(≥1帧, 前伸)  +  R=腰部或肩部(≥1帧waist)
+    #    L=肩部(≥1帧)  +  R=腰部或肩部(≥1帧waist)
+    #    ★★★ 左臂必须有侧展 (is_side, 基于横向投影 lat, 不依赖高度)
+    #         变道左臂无动作 → left_side_count=0 → 不会被误判为右转弯 ★★★
     #    右手在 shoulder/waist 边界抖动时宽容处理
     # ================================================================
     if (L_Region == "shoulder" and stayed(left_regions, "shoulder")
-            and R_Region in ("waist", "shoulder") and stayed(right_regions, "waist")):
+            and R_Region in ("waist", "shoulder") and stayed(right_regions, "waist")
+            and left_side_count >= 1):
         if verbose:
             print("  ✅ 命中 → 右转弯信号")
         return ("右转弯信号", 0.85)
 
     # ================================================================
     # 6. 变道信号 / 7. 减速慢行信号
-    #    两者按当前区域规则条件一致（L=hip始终 + R=waist≥1帧）,
+    #    L=hip多数(≥70%帧, 容忍偶尔离开) + R=waist/shoulder(≥1帧waist)
     #    优先输出变道；如需区分可后续加入手臂方位判断
     # ================================================================
-    if (L_always_hip
-            and R_Region == "waist" and stayed(right_regions, "waist")):
+    if (L_mostly_hip
+            and R_Region in ("waist", "shoulder") and stayed(right_regions, "waist")):
         if verbose:
             print("  ✅ 命中 → 变道信号/减速慢行 (区域条件一致)")
         return ("变道信号", 0.80)
@@ -477,13 +505,15 @@ def classify_action(action_data: dict, verbose: bool = True) -> tuple[str, float
 
 class GestureStateMachine:
     """
-    交警手势识别状态机。
+    交警手势识别状态机（基于滑动窗口的动作开始/停止检测 + 全身移动过滤）。
 
-    状态流转：
-      IDLE ──(连续触发)──▶ ACTIVE ──(回落/超时)──▶ IDLE ──(冷却)──▶ IDLE
+    三态模型：
+      MOVING  — 整个人在移动（下半身骨架关键点位移超阈值）→ "无动作"
+      STOPPED — 站定且双手在hip（窗口内>50%帧）        → "动作停止"
+      ACTIVE  — 站定且至少一只手离开hip                 → "动作中"
 
-    在 ACTIVE 状态中累计动作数据，结束后调用 classify_action 判定手势。
-    外部主循环每帧调用 update()，当手势完成时返回判定结果。
+    动作区间 = STOPPED → ACTIVE → STOPPED。
+    区间内每 N 帧做中间判定，结束后取众数 → 稳定去噪结果。
 
     Usage:
         sm = GestureStateMachine()
@@ -491,67 +521,71 @@ class GestureStateMachine:
             result = sm.update(feat, left_palm_ori, right_palm_ori, frame_num)
             if result:
                 print(result)
+            print(sm.display_text)  # 当前状态文字: "无动作" / "动作停止" / "动作中"
     """
 
     def __init__(self, verbose: bool = True):
-        """初始化状态机（IDLE 状态）。
-
+        """
         Args:
-            verbose: 是否在终端输出调试信息（默认开启）
+            verbose: 是否输出调试信息
         """
         self._verbose = verbose
-        self._state = config.STATE_IDLE
-        self._action_data = None
-        self._last_result = None
-        self._last_confidence = 0.0
-        self._idle_trigger_count = 0
-        self._cooldown_counter = 0
 
-    # ---- 属性（供外部 UI 读取） ----
+        # ---- 三态 ----
+        # "stopped" / "active" / "moving"
+        self._logical_state = "stopped"
+
+        # ---- 下半身骨架关键点历史（用于全身移动检测） ----
+        self._lower_body_history = []  # [ {kps}, {kps}, ... ]
+
+        # ---- hip 连续帧计数器（仅用于动作停止判定） ----
+        self._hip_consecutive = 0  # 连续双手在hip的帧数
+
+        # ---- 动作区间追踪 ----
+        self._action_data = None       # 当前动作累积数据
+        self._last_result = None       # 最近一次识别结果
+        self._last_confidence = 0.0
+        self._display_text = "动作停止"  # UI 显示文本
+
+        # ---- 结果持久化 ----
+        self._result_display_timer = 0
+
+    # ---- 属性 ----
 
     @property
     def state(self) -> int:
-        """当前状态：STATE_IDLE 或 STATE_ACTIVE。"""
-        return self._state
+        """兼容旧接口：STATE_ACTIVE / STATE_IDLE。"""
+        return config.STATE_ACTIVE if self._logical_state == "active" else config.STATE_IDLE
 
     @property
     def state_name(self) -> str:
-        """状态的人类可读描述。"""
-        if self._cooldown_counter > 0:
-            return "COOLDOWN"
-        return "ACTIVE" if self._state == config.STATE_ACTIVE else "IDLE"
+        """人类可读的状态名。"""
+        return self._logical_state.upper()
 
     @property
     def action_data(self) -> dict | None:
-        """当前动作的累积数据（ACTIVE 期间有效）。"""
         return self._action_data
 
     @property
     def last_result(self) -> str | None:
-        """最近一次识别的手势名称，初始为 None。"""
         return self._last_result
 
     @property
     def last_confidence(self) -> float:
-        """最近一次识别的置信度。"""
         return self._last_confidence
 
     @property
-    def cooldown_counter(self) -> int:
-        """冷却剩余帧数。"""
-        return self._cooldown_counter
+    def display_text(self) -> str:
+        """当前 UI 显示文本。"""
+        if self._logical_state == "moving":
+            return "无动作"
+        elif self._logical_state == "stopped":
+            return "动作停止"
+        elif self._logical_state == "active":
+            return "动作中"
+        return "—"
 
-    @property
-    def trigger_count(self) -> int:
-        """IDLE 下触发计数器（用于 UI 显示进度）。"""
-        return self._idle_trigger_count
-
-    @property
-    def trigger_target(self) -> int:
-        """触发目标帧数。"""
-        return config.START_CONFIRM
-
-    # ---- 核心逻辑 ----
+    # ---- 核心方法 ----
 
     def update(self,
                feat: dict,
@@ -562,138 +596,229 @@ class GestureStateMachine:
         """
         处理一帧特征，维护状态机。
 
-        Args:
-            feat:           extract_features 返回的特征字典
-            left_palm_ori:  左手掌朝向标签
-            right_palm_ori: 右手掌朝向标签
-            global_frame:   全局帧号（仅用于日志）
-            shoulder_width: 肩宽（用于自适应阈值）
-
-        Returns:
-            (gesture_name, confidence) 当手势判定完成时；
-            None 当状态机仍在等待或动作进行中。
+        返回:
+            (手势名, 置信度)  →  动作区间结束时
+            None              →  状态仍在等待或动作进行中
         """
         left_region_cur  = feat["left_region"]
         right_region_cur = feat["right_region"]
+        both_at_hip = (left_region_cur == "hip" and right_region_cur == "hip")
 
-        # 当前帧的触发条件
-        any_leave_hip = (left_region_cur != "hip" or right_region_cur != "hip")
-        at_least_one_raised = (
-            left_region_cur in ("shoulder", "head", "waist")
-            or right_region_cur in ("shoulder", "head", "waist")
-        )
+        # ---- 1) 更新下半身骨架历史 ----
+        self._update_lower_body_history(feat)
 
-        # ---- 冷却期倒计时 ----
-        if self._cooldown_counter > 0:
-            self._cooldown_counter -= 1
+        # ---- 2) 更新 hip 连续帧计数器 ----
+        if both_at_hip:
+            self._hip_consecutive += 1
+        else:
+            self._hip_consecutive = 0
 
-        # ================================================================
-        # IDLE 状态
-        # ================================================================
-        if self._state == config.STATE_IDLE:
-            if self._cooldown_counter > 0:
-                self._idle_trigger_count = 0
-            elif any_leave_hip and at_least_one_raised:
-                self._idle_trigger_count += 1
-            else:
-                self._idle_trigger_count = 0
+        # ---- 3) 判定是否为全身移动 ----
+        is_body_moving = self._check_whole_body_moving(shoulder_width)
 
-            if self._idle_trigger_count >= config.START_CONFIRM:
-                self._idle_trigger_count = 0
-                self._state = config.STATE_ACTIVE
+        # ---- 4) 状态决策 ----
+        new_state = self._logical_state
 
-                # ---- 创建并初始化 action_data ----
-                self._action_data = reset_action_data(
-                    shoulder_width, feat, left_palm_ori, right_palm_ori
-                )
-                self._action_data["_verbose"] = self._verbose
+        if is_body_moving:
+            new_state = "moving"
+        elif self._logical_state == "stopped":
+            # 停止 → 动作中：只要有一只手离开hip，单帧立即触发
+            if not both_at_hip:
+                new_state = "active"
+        elif self._logical_state == "active":
+            # 动作中 → 停止：双手必须连续在hip达到阈值（短暂回落不中断动作）
+            if self._hip_consecutive >= config.HIP_CONSECUTIVE_STOP:
+                new_state = "stopped"
+        elif self._logical_state == "moving":
+            # 不再移动 → 回到停止
+            new_state = "stopped"
 
-                if self._verbose:
-                    print(f"\n▶ [帧 {global_frame}] 动作开始！"
-                          f"  L_Raise={feat['left_raise']:.2f} R_Raise={feat['right_raise']:.2f}"
-                          f"  L_Angle={feat['left_arm_angle']:.0f}° R_Angle={feat['right_arm_angle']:.0f}°"
-                          f"  L_Region={left_region_cur} R_Region={right_region_cur}"
-                          f"  L_Z={feat['left_z_diff']:.2f} R_Z={feat['right_z_diff']:.2f}")
+        # ---- 6) 状态迁移处理 ----
+        result = None
 
-                return None  # 动作刚开始，尚无判定结果
+        if self._logical_state == "stopped" and new_state == "active":
+            # ★ 动作开始：创建 action_data
+            self._hip_consecutive = 0  # 新动作开始，重置停止计数器
+            if self._verbose:
+                print(f"\n▶ [帧 {global_frame}] 动作开始！"
+                      f"  L={left_region_cur}  R={right_region_cur}")
+            self._action_data = reset_action_data(
+                shoulder_width, feat, left_palm_ori, right_palm_ori
+            )
+            self._action_data["_verbose"] = self._verbose
 
-            return None
-
-        # ================================================================
-        # ACTIVE 状态
-        # ================================================================
-        if self._state == config.STATE_ACTIVE:
-            # 追加特征到 action_data（reset_action_data 已处理入口帧）
-            _update_action_data(self._action_data, feat,
-                                left_palm_ori, right_palm_ori)
-
+        elif self._logical_state == "active" and new_state == "stopped" and self._action_data is not None:
+            # ★ 动作结束：分类判定
             ad = self._action_data
             fc = ad["frame_count"]
 
-            # 调试：打印 hip_hold_count
             if self._verbose:
-                print(f"  [debug] hip_hold_count={ad.get('hip_hold_count', 0)}/{config.HOLD_FRAMES}"
-                      f"  active_arm={ad.get('active_arm', '?')}"
-                      f"  L={feat['left_region']}  R={feat['right_region']}",
+                print(f"\n◀ [帧 {global_frame}] 动作结束！"
+                      f"  frames={fc}  hip_consecutive={self._hip_consecutive}")
+
+            if fc < config.MIN_ACTION_FRAMES:
+                if self._verbose:
+                    print(f"   ⚠ 误触过滤（仅 {fc} 帧）\n")
+                self._last_result = "误触过滤"
+                self._last_confidence = 0.0
+            else:
+                # 稳定识别：中间判定取众数（去噪）
+                stable_results = ad.get("stable_results", [])
+                if stable_results:
+                    gesture = mode_list(stable_results)
+                    conf = 0.85
+                    if self._verbose:
+                        print(f"   稳定判断[众数 {len(stable_results)}次]: {gesture}\n")
+                else:
+                    gesture, conf = classify_action(ad, verbose=self._verbose)
+
+                self._last_result = gesture
+                self._last_confidence = conf
+                result = (gesture, conf)
+
+            self._action_data = None
+
+        elif self._logical_state == "active" and new_state == "moving" and self._action_data is not None:
+            # 动作中被全身移动打断
+            if self._verbose:
+                print(f"\n⚠ [帧 {global_frame}] 动作中断（人体移动）")
+            self._last_result = "无动作"
+            self._last_confidence = 0.0
+            self._action_data = None
+            result = ("无动作", 0.0)
+
+        elif self._logical_state == "active" and new_state == "active" and self._action_data is not None:
+            # 动作持续中：追加特征 + 中间判定
+            _update_action_data(self._action_data, feat, left_palm_ori, right_palm_ori)
+            ad = self._action_data
+            fc = ad["frame_count"]
+
+            if self._verbose:
+                print(f"  [debug] fc={fc} L={feat['left_region']} R={feat['right_region']}"
+                      f"  hip_cons={self._hip_consecutive}  moving={is_body_moving}",
                       end="\r")
 
-            # ---- 退出判定 ----
-            end_reason = None
-            if ad.get("hip_hold_count", 0) >= config.HOLD_FRAMES and fc >= config.MIN_ACTION_FRAMES:
-                end_reason = "⬇ 双手持续回落胯部结束"
-            elif fc > config.MAX_FRAMES:
-                end_reason = "⏰ 超时强制结束"
-
-            if end_reason:
+            # 中间稳定判定（每 N 帧）
+            if fc > config.MIN_ACTION_FRAMES and fc % config.STABLE_CLASSIFY_INTERVAL == 0:
+                mid_result, _ = classify_action(ad, verbose=False)
+                if mid_result not in ("其他手势", "无动作"):
+                    ad.setdefault("stable_results", []).append(mid_result)
                 if self._verbose:
-                    print(f"\n◀ [帧 {global_frame}] 动作结束！（{end_reason}）"
-                          f"  frames={fc}"
-                          f"  hip_hold_count={ad.get('hip_hold_count', 0)}"
-                          f"  L_Z_min={ad['min_left_z_diff']:.2f}"
-                          f"  R_Z_min={ad['min_right_z_diff']:.2f}")
+                    sc = len(ad.get("stable_results", []))
+                    print(f"\n  [mid #{sc}] fc={fc} → {mid_result}", end="")
 
-                if fc < config.MIN_ACTION_FRAMES:
-                    if self._verbose:
-                        print(f"   ⚠ 误触过滤（仅 {fc} 帧，需 >= {config.MIN_ACTION_FRAMES}）\n")
-                    result, confidence = ("误触过滤", 0.0)
+            # 超时强制结束
+            if fc >= config.MAX_FRAMES:
+                if self._verbose:
+                    print(f"\n⏰ [帧 {global_frame}] 超时强制结束")
+                ad2 = self._action_data
+                stable_results = ad2.get("stable_results", [])
+                if stable_results:
+                    gesture = mode_list(stable_results)
+                    conf = 0.85
                 else:
-                    result, confidence = classify_action(ad, verbose=self._verbose)
-                    if self._verbose:
-                        print(f"   判定结果: {result}  (置信度: {confidence:.0%})\n")
-
-                self._last_result = result
-                self._last_confidence = confidence
-                self._state = config.STATE_IDLE
+                    gesture, conf = classify_action(ad2, verbose=self._verbose)
+                self._last_result = gesture
+                self._last_confidence = conf
                 self._action_data = None
-                self._cooldown_counter = config.COOLDOWN_FRAMES
-                self._idle_trigger_count = 0
+                new_state = "stopped"
+                result = (gesture, conf)
 
-                return (result, confidence)
+        # ---- 7) 提交状态变更 ----
+        self._logical_state = new_state
+        self._display_text = self.display_text  # 触发 property 刷新
 
-            return None
-
-        return None
+        return result
 
     def cancel_action(self, global_frame: int = 0):
-        """
-        强制取消当前动作（如人体丢失时调用）。
-
-        Args:
-            global_frame: 全局帧号（仅用于日志）
-        """
-        if self._state == config.STATE_ACTIVE:
+        """强制取消当前动作（人体丢失时调用）。"""
+        if self._action_data is not None:
             if self._verbose:
                 print(f"⚠️ [帧 {global_frame}] 动作中断（未检测到人体）")
-            self._state = config.STATE_IDLE
+            self._logical_state = "stopped"
             self._action_data = None
-            self._cooldown_counter = config.COOLDOWN_FRAMES
-            self._idle_trigger_count = 0
+            self._lower_body_history.clear()
+            self._hip_consecutive = 0
 
     def reset(self):
         """重置状态机到初始状态。"""
-        self._state = config.STATE_IDLE
+        self._logical_state = "stopped"
         self._action_data = None
         self._last_result = None
         self._last_confidence = 0.0
-        self._idle_trigger_count = 0
-        self._cooldown_counter = 0
+        self._display_text = "动作停止"
+        self._lower_body_history.clear()
+        self._hip_consecutive = 0
+
+    # ================================================================
+    # 内部工具方法
+    # ================================================================
+
+    def _update_lower_body_history(self, feat: dict):
+        """更新下半身关键点历史窗口。"""
+        entry = {
+            "body_cx": feat.get("body_cx", 0.0),
+            "body_cz": feat.get("body_cz", 0.0),
+            "left_hip_xz":  feat.get("left_hip_xz", (0.0, 0.0)),
+            "right_hip_xz": feat.get("right_hip_xz", (0.0, 0.0)),
+            "left_knee_xz":  feat.get("left_knee_xz", (0.0, 0.0)),
+            "right_knee_xz": feat.get("right_knee_xz", (0.0, 0.0)),
+            "left_ankle_xz":  feat.get("left_ankle_xz", (0.0, 0.0)),
+            "right_ankle_xz": feat.get("right_ankle_xz", (0.0, 0.0)),
+        }
+        self._lower_body_history.append(entry)
+        if len(self._lower_body_history) > config.BODY_WINDOW_SIZE:
+            self._lower_body_history.pop(0)
+
+    def _check_whole_body_moving(self, shoulder_width: float) -> bool:
+        """
+        使用下半身骨架关键点检测全身移动。
+
+        不只依赖单一距离，而是综合检查髋、膝、踝多个关键点
+        在滑动窗口内的位移。如果下肢多个关键点都在移动 →
+        说明整个人在走动（而非站着做手势）。
+
+        Args:
+            shoulder_width: 肩宽（米），用于自适应阈值
+
+        Returns:
+            True  → 全身在移动
+            False → 站立不动
+        """
+        if len(self._lower_body_history) < config.BODY_WINDOW_SIZE:
+            return False
+
+        first = self._lower_body_history[0]
+        last  = self._lower_body_history[-1]
+
+        # 计算每个下肢关键点从窗口首帧到末帧的位移
+        def disp_2d(p1, p2):
+            return math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+
+        displacements = []
+
+        # 髋部中心
+        displacements.append(
+            math.sqrt((last["body_cx"] - first["body_cx"])**2
+                    + (last["body_cz"] - first["body_cz"])**2)
+        )
+
+        # 左/右髋
+        displacements.append(disp_2d(first["left_hip_xz"],  last["left_hip_xz"]))
+        displacements.append(disp_2d(first["right_hip_xz"], last["right_hip_xz"]))
+
+        # 左/右膝
+        displacements.append(disp_2d(first["left_knee_xz"],  last["left_knee_xz"]))
+        displacements.append(disp_2d(first["right_knee_xz"], last["right_knee_xz"]))
+
+        # 左/右脚踝
+        displacements.append(disp_2d(first["left_ankle_xz"],  last["left_ankle_xz"]))
+        displacements.append(disp_2d(first["right_ankle_xz"], last["right_ankle_xz"]))
+
+        # 阈值：基于肩宽自适应
+        threshold = max(shoulder_width * 0.8, config.LOWER_BODY_DISP_THRESHOLD)
+
+        # 如果有 3 个以上关键点位移超过阈值 → 全身移动
+        moving_count = sum(1 for d in displacements if d > threshold)
+
+        return moving_count >= 3

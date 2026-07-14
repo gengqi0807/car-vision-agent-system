@@ -300,48 +300,74 @@ class CTPGREngine:
         self.h, self.c = h_new, c_new
 
         # ============================================================
-        # 步骤 3: EMA 对数平滑（消除单帧预测噪声）
+        # 步骤 3: 几何纠偏（在 EMA 之前，防止类别反复横跳）
         # ============================================================
         raw_logits_np = class_out[0].cpu().numpy()  # shape (9,)
 
+        # ★ 关键：几何纠偏前置 — 根据当前帧的骨骼空间位置，
+        #   直接 boost/suppress raw logits，让 EMA 自然收敛到正确类别。
+        #   这解决了旧版"EMA 偏向 A 类但几何说应是 B 类→逐帧反复修正"的问题。
+        geo_adjusted = self._geo_boost_logits(raw_logits_np.copy(), coord_norm)
+
+        # ============================================================
+        # 步骤 4: EMA 平滑（平滑的是几何纠偏后的 logits）
+        # ============================================================
         if self.logit_ema is None:
-            self.logit_ema = raw_logits_np.copy()
+            self.logit_ema = geo_adjusted.copy()
         else:
-            # 旋转帧使用极低 α → EMA 几乎不变，输出被锁定
             alpha = self.ema_alpha_rot if is_rotating else self.ema_alpha
             self.logit_ema = (
-                alpha * raw_logits_np + (1.0 - alpha) * self.logit_ema
+                alpha * geo_adjusted + (1.0 - alpha) * self.logit_ema
             )
 
         # ============================================================
-        # 步骤 4: 解码 + 旋转门控（区分"真实转身"与"手势侧身"）
+        # 步骤 5: 解码 EMA + 轻量安全网
         # ============================================================
         result = self._decode_output(self.logit_ema.copy(), coord_norm)
 
+        # ============================================================
+        # 步骤 6: 旋转门控（区分"真实转身动作"与"纯转身无手势"）
+        # ============================================================
         if is_rotating:
-            # ---- 4a: 从当前帧原始 logits 检测旋转型手势 ----
-            # 左转弯/左待转/右转弯 本身涉及侧身 → 肩宽必然缩小。
-            # 不能简单因为肩宽变小就压制 —— 要看"手是不是真的在做动作"。
-            raw_logits_s = raw_logits_np - np.max(raw_logits_np)
-            raw_probs = np.exp(raw_logits_s) / np.sum(np.exp(raw_logits_s))
-            raw_id = int(np.argmax(raw_probs))
-            raw_conf = float(raw_probs[raw_id])
-            raw_gesture = self.GESTURE_MAP.get(raw_id, "")
+            # 计算手臂活跃度：手腕是否离开了髋部
+            mid_hip_raw = np.array([
+                (coord_norm[0, 6] + coord_norm[0, 9]) / 2.0,
+                (coord_norm[1, 6] + coord_norm[1, 9]) / 2.0,
+            ])
+            neck_raw = coord_norm[:, 13]
+            torso_raw = np.linalg.norm(neck_raw - mid_hip_raw) + 1e-8
+            lw_raw = coord_norm[:, 5]
+            rw_raw = coord_norm[:, 2]
 
-            # 这些手势天然伴随身体转向，旋转期间应当允许通过
+            # ★ 旋转时 torso_len 缩小会虚增距离比，单靠距离比不可靠
+            #   改用"腕肘高度差"判断：自然下垂→腕低于肘；手势→腕高于或平齐于肘
+            #   这是旋转不变的——因为肘-腕在2D中始终保持上-下关系
+            le_raw = coord_norm[:, 4]   # 左肘 AIC=4
+            re_raw = coord_norm[:, 1]   # 右肘 AIC=1
+            left_wrist_raised  = lw_raw[1] <= le_raw[1]   # y小=高
+            right_wrist_raised = rw_raw[1] <= re_raw[1]
+
+            left_dist  = np.linalg.norm(lw_raw - mid_hip_raw) / torso_raw
+            right_dist = np.linalg.norm(rw_raw - mid_hip_raw) / torso_raw
+            left_arm_up  = left_dist > 0.60 and left_wrist_raised
+            right_arm_up = right_dist > 0.60 and right_wrist_raised
+            any_arm_raised = left_arm_up or right_arm_up
+
             ROT_NATURAL = {"左转弯", "左待转", "右转弯"}
+            ema_is_rot_gesture = result["gesture"] in ROT_NATURAL and result["confidence"] > 0.55
 
-            if raw_gesture in ROT_NATURAL and raw_conf > 0.50:
-                # 当前帧强信号 → 旋转手势正在进行，覆盖 EMA 输出
-                result["gesture"] = raw_gesture
-                result["confidence"] = raw_conf
-            elif result["confidence"] < 0.25:
-                # 既非旋转手势，EMA 也低置信 → 纯粹转身（无动作），回退
+            if ema_is_rot_gesture:
+                pass  # EMA 已确认旋转手势，保留
+            elif any_arm_raised:
+                # 手臂真正抬起 → 解码当前帧原始 logits（含几何校验）
+                raw_result = self._decode_output(
+                    raw_logits_np.copy(), coord_norm, apply_lowconf_filter=False
+                )
+                if raw_result["gesture"] in ROT_NATURAL and raw_result["confidence"] > 0.50:
+                    result = raw_result
+            else:
                 result["gesture"] = "无手势"
-                ema_logits = self.logit_ema.copy()
-                ema_s = ema_logits - np.max(ema_logits)
-                ema_probs = np.exp(ema_s) / np.sum(np.exp(ema_s))
-                result["confidence"] = float(ema_probs[0])
+                result["confidence"] = 0.15
 
         return result
 
@@ -380,11 +406,274 @@ class CTPGREngine:
         return self.predict_from_keypoints(coord_norm)
 
     # ------------------------------------------------------------------
+    # 几何 logits 纠偏（EMA 之前调用，防止类别反复横跳）
+    # ------------------------------------------------------------------
+
+    def _geo_boost_logits(self, logits: np.ndarray, coord_norm: np.ndarray) -> np.ndarray:
+        """基于关键点空间位置调整 raw logits，boost 几何合理的类、抑制不可能的类。
+
+        关键设计：这是对 logits 的逐帧 boosting，结果送入 EMA 平滑后自然收敛。
+        避免了旧版"EMA 偏 A、几何校验强制输出 B、下一帧 EMA 仍偏 A"的横跳问题。
+        """
+        adjusted = logits.copy()
+
+        # ---- 提取关键点 & 通用特征 ----
+        rs = coord_norm[:, 0]; re = coord_norm[:, 1]; rw = coord_norm[:, 2]
+        ls = coord_norm[:, 3]; le = coord_norm[:, 4]; lw = coord_norm[:, 5]
+        neck = coord_norm[:, 13]
+        mid_hip = np.array([
+            (coord_norm[0, 6] + coord_norm[0, 9]) / 2.0,
+            (coord_norm[1, 6] + coord_norm[1, 9]) / 2.0,
+        ])
+        torso_len = np.linalg.norm(neck - mid_hip) + 1e-8
+        left_active  = np.linalg.norm(lw - mid_hip) / torso_len > 0.55
+        right_active = np.linalg.norm(rw - mid_hip) / torso_len > 0.55
+        both_active  = left_active and right_active
+
+        lw_outside   = float(ls[0] - lw[0])
+        rw_outside   = float(rw[0] - rs[0])
+        lw_above_ls  = float(ls[1] - lw[1])
+        rw_above_rs  = float(rs[1] - rw[1])
+        shoulder_w   = abs(float(ls[0] - rs[0]))
+        sideways_body= shoulder_w < 0.12 or (shoulder_w / torso_len < 0.28)
+
+        # ================================================================
+        #  直行(2) / 右转弯(5) / 停止(1) 三向评分
+        # ================================================================
+        def _side_deg(v):  # 侧展程度
+            if v > 0.030: return 4
+            elif v > 0.015: return 3
+            elif v > 0.005: return 1
+            return 0
+
+        def _fwd_deg(v):   # 前伸程度
+            if v < -0.025: return 5
+            elif v < -0.005: return 4
+            elif v < 0.010: return 2
+            return 0
+
+        def _h_deg(v):     # 高度匹配程度
+            if abs(v) < 0.015: return 3
+            elif abs(v) < 0.035: return 2
+            elif abs(v) < 0.050: return 1
+            return 0
+
+        # -- 直行得分 --
+        lw_side = _side_deg(lw_outside); rw_side = _side_deg(rw_outside)
+        lw_h = _h_deg(lw_above_ls);       rw_h = _h_deg(rw_above_rs)
+        s_score = 0
+        if both_active:                            s_score += 1
+        s_score += lw_side + rw_side
+        if lw_side >= 3: s_score += lw_h
+        if rw_side >= 3: s_score += rw_h
+        if both_active and lw_side >= 3 and rw_side >= 1 and lw_h >= 2 and rw_h >= 1:
+            s_score += 2
+
+        # -- 停止得分 --
+        # ★ 修复：不再要求另一臂必须完全不活跃（not right_active），
+        #   改为"另一臂没有明显抬起"。真实场景中闲置手臂会有自然晃动。
+        stop_score = 0
+        rw_not_raised = not right_active or rw_above_rs < 0.02
+        lw_not_raised = not left_active  or lw_above_ls < 0.02
+        if left_active and lw_above_ls > 0.12 and rw_not_raised:
+            stop_score += 6
+        elif right_active and rw_above_rs > 0.12 and lw_not_raised:
+            stop_score += 6
+        elif left_active and lw_above_ls > 0.08 and rw_not_raised:
+            stop_score += 4
+        elif right_active and rw_above_rs > 0.08 and lw_not_raised:
+            stop_score += 4
+        lw_above_head = float(coord_norm[1, 12] - lw[1])
+        rw_above_head = float(coord_norm[1, 12] - rw[1])
+        if lw_above_head > 0.02 and rw_not_raised:  stop_score += 2
+        if rw_above_head > 0.02 and lw_not_raised:   stop_score += 2
+
+        # -- 右转弯得分 --
+        body_mid_x   = (float(ls[0]) + float(rs[0])) / 2.0
+        lw_near_mid  = float(lw[0]) - body_mid_x > -0.05
+        lw_fwd       = _fwd_deg(lw_outside)
+        # ★ 右转弯右手是侧展划动，不是前伸——不纳入 rw_fwd
+        r_score = 0
+        if both_active:         r_score += 1
+        r_score += lw_fwd                     # 只计左手前伸（核心标志）
+        if rw_outside > 0.000:  r_score += 1  # 右手侧展
+        if lw_near_mid:         r_score += 3
+
+        # ★ 左臂前伸检测（右转弯核心标志）：腕在肩内侧 + 肘在内侧 + 肘伸直
+        #   前伸不看高度——和左转弯 r_arm_forward 逻辑一致
+        lw_outside_v = float(lw[0] - ls[0])    # 左腕 vs 左肩 x，<0=腕在肩内侧
+        le_outside_v = float(le[0] - ls[0])     # 左肘 vs 左肩 x
+        le_ls = np.linalg.norm(le - ls); le_lw = np.linalg.norm(le - lw)
+        lw_ls = np.linalg.norm(lw - ls)
+        le_straight = False
+        if (le_ls + le_lw) > 0.02:
+            le_straight = (lw_ls / (le_ls + le_lw)) > 0.78
+        l_arm_forward = (left_active
+                         and lw_outside_v < -0.015
+                         and le_outside_v < -0.010
+                         and le_straight)
+        # ★ l_arm_forward 确认为 True 时直接为 r_score 大幅加分，
+        #   确保右转弯在三向竞争中能压制变道。
+        if l_arm_forward:
+            r_score += 5
+
+        # ★ 变道 vs 右转弯：
+        #   右转弯 = 左臂前伸（l_arm_forward）
+        #   变道   = 右臂侧展伸直齐肩 + 左臂无大动作
+        #   左臂无大动作：不高举、不强烈侧展、不前伸
+        re_outside_v = float(re[0] - rs[0])   # 右肘 x 侧展
+        is_side_out  = rw_outside > 0.025      # 右腕明显在肩右侧
+        is_re_side   = re_outside_v > 0.005    # 右肘也在右侧
+        is_re_straight = False
+        re_rs = np.linalg.norm(re - rs); re_rw = np.linalg.norm(re - rw)
+        rw_rs = np.linalg.norm(rw - rs)
+        if (re_rs + re_rw) > 0.02:
+            is_re_straight = (rw_rs / (re_rs + re_rw)) > 0.78
+        is_shoulder_h = abs(rw_above_rs) < 0.08   # 齐肩高度
+        # 左臂无大动作：不高举、不强烈侧展、不前伸
+        # ★ 若左臂活跃（远离髋部），腕必须明显低于肩才算"自然下垂"；
+        #   否则臂处于前伸状态（右转弯标志），不能当作变道的左臂下垂条件。
+        if left_active:
+            lw_no_big_move = lw_above_ls < -0.02 and lw_outside < 0.10
+        else:
+            lw_no_big_move = lw_above_ls < 0.06 and lw_outside < 0.10
+        lane_change_flag = (right_active and is_side_out and is_re_side
+                            and is_re_straight and is_shoulder_h
+                            and not l_arm_forward
+                            and lw_no_big_move)
+        if lane_change_flag:
+            r_score = max(0, r_score - 4)
+            adjusted[6] += 1.2   # 倾向变道
+            adjusted[5] -= 1.5
+
+        # ★ 右转弯强确认：左臂前伸 + 右手侧展 → 直接倾向右转弯、抑制变道
+        #   lane_change_flag 已通过 not l_arm_forward 互斥，两者不会同时为 True。
+        right_turn_strong = (l_arm_forward and right_active
+                             and rw_outside > 0.000)
+        if right_turn_strong:
+            adjusted[5] += 2.0   # 倾向右转弯
+            adjusted[6] -= 2.0   # 抑制变道
+
+        # ★ 变道前摇：右臂齐肩但未侧展 + 左臂下垂 → 抑制右转弯
+        #   变道手势：左臂自然下垂，右臂抬至肩高后左右滑动。
+        #   右臂刚抬起尚未侧展时（rw_outside 不大），LSTM 容易误判为右转弯。
+        right_raised_no_side = (right_active and not is_side_out
+                                and abs(rw_above_rs) < 0.10
+                                and not left_active)
+        if right_raised_no_side:
+            r_score = max(0, r_score - 3)
+            adjusted[5] -= 1.2   # 抑制右转弯
+            adjusted[6] += 0.5   # 倾向变道
+
+        # ★ 停止信号互斥：单臂明显高举>0.12时，抑制右转弯/直行
+        single_arm_high = ((left_active and lw_above_ls > 0.10 and rw_not_raised)
+                           or (right_active and rw_above_rs > 0.10 and lw_not_raised))
+        if single_arm_high:
+            r_score = max(0, r_score - 3)
+
+        # -- 应用 boosts：只在得分最高且领先对手 >2 时才调整 --
+        max_125 = max(s_score, stop_score, r_score)
+        if max_125 >= 5:
+            if s_score == max_125 and s_score >= stop_score + 3 and s_score >= r_score + 3:
+                adjusted[2] += 1.8
+                adjusted[5] -= 1.5
+                adjusted[1] -= 1.0
+            elif r_score == max_125 and r_score >= stop_score + 3 and r_score >= s_score + 3:
+                adjusted[5] += 1.8
+                adjusted[2] -= 1.5
+                adjusted[1] -= 1.0
+                adjusted[6] -= 1.5   # 右转弯胜出时同步抑制变道
+            elif stop_score == max_125 and stop_score >= 6 and stop_score >= s_score + 2 and stop_score >= r_score + 2:
+                adjusted[1] += 1.8
+                adjusted[2] -= 1.2
+                adjusted[5] -= 1.2
+
+        # ================================================================
+        #  左转弯(3) vs 左待转(4) vs 面向左侧站立不动
+        # ================================================================
+        # ---- 肘伸直检测 ----
+        re_rs = np.linalg.norm(re - rs)
+        re_rw = np.linalg.norm(re - rw)
+        rw_rs = np.linalg.norm(rw - rs)
+        re_straight = False
+        if (re_rs + re_rw) > 0.02:
+            re_straight = (rw_rs / (re_rs + re_rw)) > 0.78
+
+        # ★ 核心思想：左转弯手势的本质是右臂向身体前方平伸（不是向上抬）
+        #   在2D图像中，"前伸"表现为手腕在肩内侧（x方向）且高度接近肩水平。
+        #   左转弯 = 右臂前伸（rw_outside < 0）+ 左臂侧展划动（lw_outside > 0）
+        #   左待转 = 左臂侧展划动 + 右臂无前伸/下垂
+
+        # ★ 右臂前伸（左转弯核心标志）：腕在肩内侧且高度接近肩
+        #   前伸臂应：腕在肩内侧(x) + 肘也在内侧(x) + 腕不高不低 + 肘伸直
+        re_outside = float(re[0] - rs[0])       # 右肘 vs 右肩 x，<0=肘在肩内侧
+        rw_outside_val = float(rw[0] - rs[0])   # 右腕 vs 右肩 x，<0=腕在肩内侧
+        rw_above_rs_val = rw_above_rs           # 右腕 vs 右肩 y，>0=腕高于肩
+        re_above_rs = float(rs[1] - re[1])      # 右肘 vs 右肩 y
+        # 右臂前伸：手和肘都明显在肩内侧 + 高度不离谱 + 肘伸直
+        r_arm_forward = (right_active
+                         and rw_outside_val < -0.015   # 腕在肩内侧
+                         and re_outside < -0.010       # 肘也在内侧（防甩手误判）
+                         and abs(rw_above_rs_val) < 0.10  # 腕不高不低
+                         and re_straight)              # 肘伸直
+
+        # ★ 左臂侧展划动（左待转/左转弯的特征：腕明显在肩外侧 + 主动抬起）
+        #   左待转 = 左臂在身体侧边上下摆动，必须是主动抬起的动作，
+        #   自然下垂或轻微摆动不算。要求腕在肩外侧且不低于肩太多。
+        lw_side_sweep = lw_outside > 0.025 and lw_above_ls > -0.03
+        lw_elevated   = lw_above_ls > -0.07
+
+        # ★ 右臂下垂（用于确定左待转）
+        r_arm_down = (not right_active) or (rw_above_rs_val < -0.06
+                      and not (rw_outside_val < -0.012))
+
+        # ---- 检测"面朝左侧站立不动"：侧身 + 左臂不抬高、不外展 + 右臂下垂 ----
+        #   手臂自然下垂/轻微摆动时腕可能略偏外或略高于肩，不应误判为手势。
+        lw_not_sweeping = lw_outside < 0.08      # 容忍自然站立时腕的侧向偏移
+        lw_not_raised   = lw_above_ls < 0.02     # 容忍轻微摆动时腕略超肩高
+        # 右臂下垂：不活跃 或 腕明显低于肩（不再要求腕不在内侧，侧身时视觉误差大）
+        r_arm_dropped = (not right_active) or (rw_above_rs_val < -0.06)
+        stand_leftwards = (sideways_body and left_active
+                           and lw_not_sweeping and lw_not_raised
+                           and r_arm_dropped)
+
+        if stand_leftwards:
+            adjusted[4] -= 2.5
+            adjusted[3] -= 2.5
+            adjusted[0] += 2.0   # 强力推无手势
+        else:
+            # ---- 左转弯(3) vs 左待转(4)：核心看右臂是否前伸 ----
+            if r_arm_forward:
+                # 右臂前伸 = 左转弯（不管左臂状态，早期左臂未摆也应兜底）
+                adjusted[3] += 3.5
+                adjusted[4] -= 3.0
+            elif left_active and lw_side_sweep and r_arm_down:
+                # 右臂下垂 + 左臂侧展划动 → 左待转
+                adjusted[4] += 2.0
+                adjusted[3] -= 2.0
+            elif left_active and lw_not_sweeping and not r_arm_forward:
+                # 左臂在动但无侧展、右臂无前伸 → 弱左待转
+                adjusted[4] += 0.3
+                adjusted[3] -= 0.2
+            # 其他情况（如左腕稍外展但不够 lw_side_sweep 阈值、或 r_arm_down=False）
+            # 不做 boost，让 LSTM 自己判断
+
+        return adjusted
+
+    # ------------------------------------------------------------------
     # 内部方法：logits → 手势分类
     # ------------------------------------------------------------------
 
-    def _decode_output(self, logits: np.ndarray, coord_norm: np.ndarray) -> dict:
-        """将 RNN 输出的 logits 解码为手势名称、置信度和关键点列表。"""
+    def _decode_output(self, logits: np.ndarray, coord_norm: np.ndarray,
+                        apply_lowconf_filter: bool = True) -> dict:
+        """将 RNN 输出的 logits 解码为手势名称、置信度和关键点列表。
+
+        Args:
+            logits: 形状 (9,) 的 logits 数组
+            coord_norm: 形状 (2, 14) 的归一化坐标
+            apply_lowconf_filter: 是否应用 <0.70 低置信度兜底。
+                旋转帧解码时设为 False，避免几何校验结果被阈值抹掉。
+        """
         raw_logits = logits.copy()  # 保留原始 logits 供诊断
 
         # ---- class-0 偏差校准 ----
@@ -412,11 +701,14 @@ class CTPGREngine:
         )
 
         # ---- 低置信度兜底 ----
-        # 如果最高非0类的信心不足（<0.70），说明 LSTM 没有明确识别到任何手势，
-        # 强制回退到"无手势"，避免站立/过渡动作被误判。
-        if gesture_id != 0 and confidence < 0.70:
-            gesture_id = 0
-            confidence = float(probs[0])
+        # 当 apply_lowconf_filter=True 时（正常 EMA 解码路径）：
+        #   如果非0类信心不足（<0.70），回退到"无手势"
+        # 当 apply_lowconf_filter=False 时（旋转帧原始解码）：
+        #   跳过此过滤，让旋转门控自行判断
+        if apply_lowconf_filter:
+            if gesture_id != 0 and confidence < 0.70:
+                gesture_id = 0
+                confidence = float(probs[0])
 
         # 映射手势名称
         gesture_name = self.GESTURE_MAP.get(gesture_id, f"未知({gesture_id})")
@@ -435,17 +727,10 @@ class CTPGREngine:
         }
 
     # ------------------------------------------------------------------
-    # 几何校验：利用关键点空间位置纠正易混淆手势
+    # 几何安全网：仅纠正 EMA 输出中明显不合理的情况（轻量、高阈值）
     # ------------------------------------------------------------------
-    # AIC 索引: 0=右肩 1=右肘 2=右腕  3=左肩 4=左肘 5=左腕
-    #           6=右髋 7=右膝 8=右踝  9=左髋 10=左膝 11=左踝
-    #           12=头顶 13=颈部
-    #
-    # 交警手势真值：
-    #   左转弯 (3) = 双臂动作：右臂前伸 + 左臂左前方划动
-    #   左待转 (4) = 单臂动作：右臂不动 + 左臂身体侧面划动
-    #   直行   (2) = 双臂动作：两臂侧展摆动，基本在肩水平面
-    #   右转弯 (5) = 双臂动作：左臂前伸 + 右臂右前方划动
+    # 主要纠偏工作已由 _geo_boost_logits 在 EMA 之前完成。
+    # 此方法仅处理 EMA 滞后导致的"结果与当前几何明显矛盾"的极端情况。
 
     def _geometric_verify(
         self,
@@ -454,162 +739,136 @@ class CTPGREngine:
         probs: np.ndarray,
         coord_norm: np.ndarray,
     ) -> tuple:
-        """基于关键点空间位置纠正模型容易混淆的类对。"""
-        # ---- 提取关键点 ----
-        rs = coord_norm[:, 0]   # 右肩
-        re = coord_norm[:, 1]   # 右肘
-        rw = coord_norm[:, 2]   # 右腕
-        ls = coord_norm[:, 3]   # 左肩
-        le = coord_norm[:, 4]   # 左肘
-        lw = coord_norm[:, 5]   # 左腕
+        """轻量安全网：仅在几何证据极强时才纠正。"""
+        rs = coord_norm[:, 0]; re_v = coord_norm[:, 1]; rw = coord_norm[:, 2]
+        ls = coord_norm[:, 3]; lw = coord_norm[:, 5]
         neck = coord_norm[:, 13]
         mid_hip = np.array([
             (coord_norm[0, 6] + coord_norm[0, 9]) / 2.0,
             (coord_norm[1, 6] + coord_norm[1, 9]) / 2.0,
         ])
-
-        # ---- 通用特征 ----
-        # 单臂/双臂判断：手腕远离髋部 = 手臂抬起了
         torso_len = np.linalg.norm(neck - mid_hip) + 1e-8
         left_active  = np.linalg.norm(lw - mid_hip) / torso_len > 0.55
         right_active = np.linalg.norm(rw - mid_hip) / torso_len > 0.55
         both_active  = left_active and right_active
 
-        # 腕 vs 肩 水平偏移（>0 = 腕在肩外侧/侧展；<0 = 腕在肩内侧/前伸）
-        lw_outside  = float(ls[0] - lw[0])   # >0 左腕在左肩左侧（侧展）
-        rw_outside  = float(rw[0] - rs[0])   # >0 右腕在右肩右侧（侧展）
-        lw_inside   = float(lw[0] - ls[0])   # >0 左腕在左肩右侧（前伸向内）
-        rw_inside   = float(rs[0] - rw[0])   # >0 右腕在右肩左侧（前伸向内）
-
-        # 腕与肩同高（y 增大 = 向下，>0 表示腕高于肩）
+        lw_outside  = float(ls[0] - lw[0])
         lw_above_ls = float(ls[1] - lw[1])
         rw_above_rs = float(rs[1] - rw[1])
-        at_shoulder  = abs(lw_above_ls) < 0.035 and abs(rw_above_rs) < 0.035
 
-        # ============================================================
-        #  左转弯 (3) vs 左待转 (4)
-        # ============================================================
-        #   左转弯 = 双臂：右臂前伸 + 左臂左前方划动
-        #   左待转 = 单臂：右臂贴近身体不动 + 左臂身体侧面划动
-        #
-        #   关键差异：右腕是否贴近身体（用腕-髋距离/躯干长来衡量）
+        # ---- 停止(1) → 直行(2)：双臂侧展不可能同时是停止 ----
+        if gesture_id == 1 and both_active:
+            gesture_id = 2
+            confidence = max(float(probs[2]), 0.72)
+            return gesture_id, confidence
+
+        # ---- 左转弯(3) ↔ 左待转(4)：基于右臂前伸 ----
         if gesture_id in (3, 4):
-            rw_to_hip   = np.linalg.norm(rw - mid_hip) / torso_len
-            rw_near_body = rw_to_hip < 0.45         # 右腕贴近身体 = 手臂休息位
+            rw_outside_v = float(rw[0] - rs[0])
+            re_outside_v = float(re_v[0] - rs[0])
+            re_above_rs_v = float(rs[1] - re_v[1])
+            rw_above_rs_v = rw_above_rs
 
-            # 侧身检测：肩膀 x 间距过小 → 身体侧转，右臂可能被遮挡
-            #   MP 骨架会把右腕投射到左腕附近，rw_near_body 失效
-            shoulder_width = abs(float(ls[0] - rs[0]))
-            sideways_body = shoulder_width < 0.10 or (shoulder_width / torso_len < 0.25)
+            # 右臂前伸检测（同 _geo_boost_logits）
+            re_rs_v = np.linalg.norm(re_v - rs); re_rw_v = np.linalg.norm(re_v - rw)
+            rw_rs_v = np.linalg.norm(rw - rs)
+            re_str = (rw_rs_v / (re_rs_v + re_rw_v)) > 0.78 if (re_rs_v + re_rw_v) > 0.02 else False
 
-            left_turn_pat = (
-                both_active                         # 双臂都抬起
-                and rw_inside > 0.005               # 右腕在肩内侧（前伸）
-                and not rw_near_body                # 右腕远离身体
-            )
-            # 正脸左待转：右臂贴在身上不动 + 左臂侧前方划动
-            left_wait_pat = (
-                left_active                         # 左臂抬起
-                and rw_near_body                    # ★ 右腕贴近身体
-                and lw_outside > -0.005             # 左腕不越过身体中线（放宽）
-            )
-            # 侧身左待转：右臂被遮挡，MP 可能误判右臂随左臂前伸
-            #   → 只要求左臂抬起，右腕位置极不可靠，大幅放宽
-            left_wait_sideways_pat = (
-                sideways_body                       # 身体侧转中
-                and left_active                     # 左臂抬起
-                and lw_outside > -0.015             # 左腕不跑到身体右侧
-                and not (rw_inside > 0.030)         # 右腕没越过左腕位置（极宽）
-                and rw_to_hip < 0.90                # 右腕别飞太远即可
-            )
+            r_arm_forward = (right_active
+                             and rw_outside_v < -0.015
+                             and re_outside_v < -0.010
+                             and abs(rw_above_rs_v) < 0.10
+                             and re_str)
 
-            if gesture_id == 3 and (left_wait_pat or left_wait_sideways_pat) and not left_turn_pat:
-                # 模型说左转弯，但几何特征指向左待转 → 改左待转
-                gesture_id = 4
-                confidence = float(probs[4])
-            elif gesture_id == 4 and left_turn_pat and not (left_wait_pat or left_wait_sideways_pat):
-                # 模型说左待转，但右臂明显前伸 → 改左转弯
-                gesture_id = 3
-                confidence = float(probs[3])
-            elif gesture_id in (3, 4) and not (left_turn_pat or left_wait_pat or left_wait_sideways_pat):
+            lw_side = lw_outside > -0.015
+            lw_not_sweeping = lw_outside < 0.05
+            lw_not_raised   = lw_above_ls < 0.0
+            r_arm_dropped = (not right_active) or (rw_above_rs_v < -0.06)
+
+            # 面朝左侧站立不动 → 无手势
+            shoulder_w = abs(float(ls[0] - rs[0]))
+            sideways_body = shoulder_w < 0.12 or (shoulder_w / torso_len < 0.28)
+            stand_leftwards = (sideways_body and left_active
+                               and lw_not_sweeping and lw_not_raised
+                               and r_arm_dropped)
+            if stand_leftwards:
                 gesture_id = 0
                 confidence = float(probs[0])
+                return gesture_id, confidence
 
-        # ============================================================
-        #  右转弯 (5) vs 直行 (2) vs 停止 (1)
-        # ============================================================
-        #   直行   = 两臂大幅侧展，腕远离身体、几乎在肩外侧最远点
-        #   右转弯 = 左臂前伸（腕在身体前方），右臂在身体右前方划动
-        #   停止   = 单臂（通常左臂）高举过头，另一臂自然下垂
-        #
-        #   用评分制：各自算匹配度，分高且差距 >2 才触发纠正
-        if gesture_id in (1, 2, 5):
-            # ---- 停止得分（单臂高举 + 另一臂下垂） ----
-            # 当前帧左臂高举过头且右臂未激活 → 极可能是停止
-            stop_score = 0
-            if left_active and lw_above_ls > 0.06 and not right_active:
-                stop_score += 6    # 左臂高举 + 右臂下垂（强证据）
-            elif right_active and rw_above_rs > 0.06 and not left_active:
-                stop_score += 6    # 右臂高举 + 左臂下垂（强证据）
-            elif left_active and lw_above_ls > 0.04 and not right_active:
-                stop_score += 4
-            elif right_active and rw_above_rs > 0.04 and not left_active:
-                stop_score += 4
+            # 右臂前伸 = 左转弯，EMA 说左待转 → 翻回左转弯
+            if gesture_id == 4 and r_arm_forward:
+                gesture_id = 3
+                confidence = max(float(probs[3]), 0.72)
+                return gesture_id, confidence
 
-            # 右臂高举且手掌向前 = 交警标准停止（额外加分）
-            lw_above_head = float(coord_norm[1, 12] - lw[1])  # 左腕高于头顶
-            rw_above_head = float(coord_norm[1, 12] - rw[1])  # 右腕高于头顶
-            if left_active and lw_above_head > 0.02 and not right_active:
-                stop_score += 2
-            elif right_active and rw_above_head > 0.02 and not left_active:
-                stop_score += 2
+            if gesture_id == 3 and not both_active and lw_side and not r_arm_forward:
+                # 模型说左转弯但只有左臂在动且右臂未前伸 → 左待转
+                gesture_id = 4
+                confidence = max(float(probs[4]), 0.72)
 
-            # ---- 直行得分（两腕侧展程度） ----
-            s_score = 0
-            if both_active:           s_score += 1
-            if lw_outside > 0.010:    s_score += 3    # 左腕侧展（关键）
-            if rw_outside > 0.010:    s_score += 3    # 右腕侧展（关键）
-            if at_shoulder:           s_score += 1
+        # ---- 右转弯(5) ↔ 变道(6)：左臂前伸=右转弯，右臂侧展+左臂无大动作=变道 ----
+        if gesture_id == 5:
+            rw_outside_v = float(rw[0] - rs[0])
+            re_outside_v = float(re_v[0] - rs[0])
+            re_rs_v = np.linalg.norm(re_v - rs); re_rw_v = np.linalg.norm(re_v - rw)
+            rw_rs_v = np.linalg.norm(rw - rs)
+            re_str = (rw_rs_v / (re_rs_v + re_rw_v)) > 0.78 if (re_rs_v + re_rw_v) > 0.02 else False
+            rw_above_rs_v = float(rs[1] - rw[1])
+            # 左臂前伸检测（右转弯核心标志，不看高度）
+            le_v = coord_norm[:, 4]
+            lw_outside_v2 = float(lw[0] - ls[0])
+            le_outside_v2 = float(le_v[0] - ls[0])
+            le_ls_v = np.linalg.norm(le_v - ls); le_lw_v = np.linalg.norm(le_v - lw)
+            lw_ls_v = np.linalg.norm(lw - ls)
+            le_str = (lw_ls_v / (le_ls_v + le_lw_v)) > 0.78 if (le_ls_v + le_lw_v) > 0.02 else False
+            l_arm_forward = (left_active
+                             and lw_outside_v2 < -0.015
+                             and le_outside_v2 < -0.010
+                             and le_str)
+            # 左臂无大动作：不高举、不强烈侧展、不前伸
+            # ★ 与 _geo_boost_logits 逻辑一致：左臂活跃时必须明显低于肩
+            if left_active:
+                lw_no_big_move = lw_above_ls < -0.02 and lw_outside < 0.10
+            else:
+                lw_no_big_move = lw_above_ls < 0.06 and lw_outside < 0.10
+            lane_change_flag = (right_active and rw_outside_v > 0.025
+                                and re_outside_v > 0.005
+                                and re_str
+                                and abs(rw_above_rs_v) < 0.08
+                                and not l_arm_forward
+                                and lw_no_big_move)
+            if lane_change_flag:
+                gesture_id = 6
+                confidence = max(float(probs[6]), 0.72)
+                return gesture_id, confidence
 
-            # ---- 右转弯得分（左腕前伸 + 右腕右前方） ----
-            r_score = 0
-            if both_active:           r_score += 1
-            if lw_outside < 0.010:    r_score += 4    # 左腕不侧展 = 前伸（核心）
-            if rw_outside > 0.000:    r_score += 2    # 右腕在身体右侧
-            if rw_inside > -0.010:    r_score += 1    # 右腕不在身体左侧
+        # ---- 变道(6) → 右转弯(5)：左臂前伸=右转弯，EMA若误判变道需纠正 ----
+        if gesture_id == 6:
+            le_v = coord_norm[:, 4]
+            lw_outside_v2 = float(lw[0] - ls[0])
+            le_outside_v2 = float(le_v[0] - ls[0])
+            le_ls_v = np.linalg.norm(le_v - ls); le_lw_v = np.linalg.norm(le_v - lw)
+            lw_ls_v = np.linalg.norm(lw - ls)
+            le_str = (lw_ls_v / (le_ls_v + le_lw_v)) > 0.78 if (le_ls_v + le_lw_v) > 0.02 else False
+            l_arm_forward = (left_active
+                             and lw_outside_v2 < -0.015
+                             and le_outside_v2 < -0.010
+                             and le_str)
+            if l_arm_forward:
+                gesture_id = 5
+                confidence = max(float(probs[5]), 0.72)
+                return gesture_id, confidence
 
-            # ---- 比较得分，差距 >2 才纠正（避免歧义帧反复跳动） ----
-            if gesture_id == 5:
-                # 右转弯必须是双臂动作；单臂高举更像停止
-                if stop_score > r_score and stop_score >= 6:
-                    gesture_id = 1
-                    confidence = float(probs[1])
-                elif s_score > r_score + 2:
-                    gesture_id = 2
-                    confidence = float(probs[2])
-                elif r_score < 3:
-                    gesture_id = 0
-                    confidence = float(probs[0])
-                elif r_score >= 5:
-                    # 几何特征强烈确认右转弯 → 提升置信度，防止被 0.70 门槛误杀
-                    confidence = max(confidence, 0.71)
-            elif gesture_id == 2:
-                if stop_score > s_score and stop_score >= 6:
-                    gesture_id = 1
-                    confidence = float(probs[1])
-                elif r_score > s_score + 2:
-                    gesture_id = 5
-                    confidence = float(probs[5])
-                elif s_score >= 5:
-                    confidence = max(confidence, 0.71)
-            elif gesture_id == 1:
-                # 模型说停止，但双臂都在做动作 → 更可能是其他手势
-                if both_active and stop_score < 4:
-                    if r_score > s_score:
-                        gesture_id = 5
-                        confidence = float(probs[5])
-                    elif s_score > r_score:
-                        gesture_id = 2
-                        confidence = float(probs[2])
+        # ---- 停止(1) ↔ 右转弯(5)：单臂高举不可能是右转弯 ----
+        if gesture_id == 5:
+            lw_not_raised = not left_active or lw_above_ls < 0.02
+            rw_not_raised = not right_active or rw_above_rs < 0.02
+            if left_active and lw_above_ls > 0.10 and rw_not_raised:
+                gesture_id = 1
+                confidence = max(float(probs[1]), 0.72)
+            elif right_active and rw_above_rs > 0.10 and lw_not_raised:
+                gesture_id = 1
+                confidence = max(float(probs[1]), 0.72)
 
         return gesture_id, confidence

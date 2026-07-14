@@ -41,21 +41,24 @@
 
         <div class="preview-shell">
           <div v-if="mode === 'camera'" class="preview-stage camera-stage">
-            <video ref="videoRef" class="hidden-video" autoplay muted playsinline />
-            <canvas ref="captureCanvasRef" class="capture-canvas" />
-            <img v-if="cameraDisplayUrl" :src="cameraDisplayUrl" class="preview-image" />
+            <iframe v-if="cameraPlaybackUrl" :src="cameraPlaybackUrl" class="preview-frame" allow="autoplay; fullscreen" />
             <div v-if="!cameraActive" class="image-placeholder police-frame">
               交警手势实时识别
               <div class="small">点击“开启摄像头”开始实时检测</div>
             </div>
-            <div v-else-if="!cameraDisplayUrl" class="image-placeholder police-frame">
+            <div v-else class="image-placeholder police-frame">
               交警手势实时识别
               <div class="small">摄像头已开启，等待后端返回首帧标注结果</div>
             </div>
           </div>
 
           <div v-else-if="mode === 'video' && previewStreamUrl" class="preview-stage">
-            <img :src="previewStreamUrl" class="preview-image" @load="handleVideoPreviewLoad" />
+            <iframe
+              :src="previewStreamUrl"
+              class="preview-frame"
+              allow="autoplay; fullscreen"
+              @load="handleVideoPreviewLoad"
+            />
           </div>
 
           <div v-else-if="mode === 'video' && processedVideoUrl" class="preview-stage">
@@ -133,13 +136,16 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import {
-  fetchPoliceGestureApi,
   fetchPoliceGestureHistoryApi,
+  fetchPoliceGestureStreamResultApi,
+  fetchPoliceGestureStreamStateApi,
   fetchPoliceGestureVideoProgressApi,
   recognizePoliceGestureVideoApi,
+  startPoliceGestureStreamApi,
+  stopPoliceGestureStreamApi,
   type PoliceGestureFrameResult,
   type PoliceGestureHistoryItem,
   type PoliceGestureVideoProgress,
@@ -156,19 +162,9 @@ const videoResult = ref<PoliceGestureVideoResult | null>(null);
 const videoProgress = ref<PoliceGestureVideoProgress | null>(null);
 const historyItems = ref<PoliceGestureHistoryItem[]>([]);
 
-const videoRef = ref<HTMLVideoElement | null>(null);
-const captureCanvasRef = ref<HTMLCanvasElement | null>(null);
-
 const cameraActive = ref(false);
-let mediaStream: MediaStream | null = null;
-let captureTimer: number | null = null;
-let requestInFlight = false;
-let lastInferenceDurationMs = 140;
-const baseFrameIntervalMs = 80;
-const captureJpegQuality = 0.82;
-const previewIdealWidth = 960;
-const previewIdealHeight = 720;
-const cameraSessionId = ref("");
+const cameraPlaybackUrl = ref("");
+let streamResultTimer: number | null = null;
 
 const GESTURE_LABELS: Record<string, string> = {
   stop: "停止信号",
@@ -189,15 +185,14 @@ const currentResult = computed(() => {
   return videoResult.value;
 });
 const gestureLabel = computed(() => formatGesture(currentResult.value?.gesture ?? ""));
-const cameraDisplayUrl = computed(() => cameraResult.value?.annotated_image || "");
 const processedVideoUrl = computed(() => normalizeMediaUrl(videoResult.value?.processed_video_url ?? ""));
 const previewStreamUrl = computed(() => {
   if (mode.value !== "video") return "";
-  const taskId = videoProgress.value?.task_id;
-  if (!taskId || videoProgress.value?.status === "completed" || videoProgress.value?.status === "failed") {
+  const progress = videoProgress.value;
+  if (!progress?.playback_url || progress.status === "completed" || progress.status === "failed") {
     return "";
   }
-  return buildPreviewStreamUrl(taskId);
+  return `${progress.playback_url}?task=${encodeURIComponent(progress.task_id)}`;
 });
 const videoEvents = computed(() => videoProgress.value?.events ?? []);
 const videoPreviewStarted = ref(false);
@@ -404,14 +399,6 @@ function createTaskId() {
   return `police-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function buildPreviewStreamUrl(taskId: string) {
-  const token = localStorage.getItem("cvms_token") || "";
-  const baseUrl = resolveBackendApiBase();
-  const encodedTaskId = encodeURIComponent(taskId);
-  const encodedToken = encodeURIComponent(token);
-  return `${baseUrl}/police-gesture/video/preview/${encodedTaskId}?token=${encodedToken}`;
-}
-
 function buildVideoProgressText(progress: PoliceGestureVideoProgress) {
   const percentage = `${Math.round((progress.progress || 0) * 100)}%`;
   const frameText = progress.processed_frame_count > 0 ? ` · ${progress.processed_frame_count} 帧` : "";
@@ -474,120 +461,62 @@ async function startCamera() {
   mode.value = "camera";
   error.value = "";
   cameraResult.value = null;
-  cameraSessionId.value = createTaskId();
-
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        width: { ideal: previewIdealWidth, max: 1280 },
-        height: { ideal: previewIdealHeight, max: 720 },
-        frameRate: { ideal: 24, max: 30 }
-      },
-      audio: false
-    });
-    mediaStream = stream;
-    if (!videoRef.value) {
-      throw new Error("摄像头初始化失败");
-    }
-    videoRef.value.srcObject = stream;
+    await stopPoliceGestureStreamApi().catch(() => undefined);
+    const { data } = await startPoliceGestureStreamApi("0", 15);
+    if (!data.playback_url) throw new Error("后端未返回 MediaMTX 播放地址");
     cameraActive.value = true;
-    await nextTick();
-    await videoRef.value.play();
-    startCaptureLoop();
+    startStreamResultPolling();
+    await waitForStreamPublished(data.playback_url);
   } catch (err) {
     stopCamera();
-    error.value = err instanceof Error ? err.message : "无法开启摄像头";
+    error.value = err instanceof Error ? err.message : "无法开启后端摄像头";
   }
 }
 
 function stopCamera() {
-  stopCaptureLoop();
+  void stopPoliceGestureStreamApi().catch(() => undefined);
+  stopStreamResultPolling();
   loading.value = false;
-  requestInFlight = false;
   cameraActive.value = false;
   cameraResult.value = null;
-  cameraSessionId.value = "";
-
-  if (videoRef.value) {
-    videoRef.value.pause();
-    videoRef.value.srcObject = null;
-  }
-  if (mediaStream) {
-    mediaStream.getTracks().forEach((track) => track.stop());
-    mediaStream = null;
-  }
+  cameraPlaybackUrl.value = "";
 }
 
-function startCaptureLoop() {
-  stopCaptureLoop();
-  const tick = async () => {
+function startStreamResultPolling() {
+  stopStreamResultPolling();
+  const poll = async () => {
     if (!cameraActive.value) return;
-    await captureFrame();
-    if (!cameraActive.value) return;
-    const nextDelay = Math.max(80, Math.min(180, Math.round(lastInferenceDurationMs * 0.18 + baseFrameIntervalMs)));
-    captureTimer = window.setTimeout(() => {
-      void tick();
-    }, nextDelay);
+    try {
+      const { data } = await fetchPoliceGestureStreamResultApi();
+      cameraResult.value = data;
+    } catch {
+      if (cameraActive.value) error.value = "无法获取交警手势识别结果";
+    } finally {
+      if (cameraActive.value) streamResultTimer = window.setTimeout(poll, 200);
+    }
   };
-  void tick();
+  void poll();
 }
 
-function stopCaptureLoop() {
-  if (captureTimer !== null) {
-    window.clearTimeout(captureTimer);
-    captureTimer = null;
-  }
+function stopStreamResultPolling() {
+  if (streamResultTimer !== null) window.clearTimeout(streamResultTimer);
+  streamResultTimer = null;
 }
 
-async function captureFrame() {
-  if (!cameraActive.value || requestInFlight) return;
-  const video = videoRef.value;
-  const captureCanvas = captureCanvasRef.value;
-  if (!video || !captureCanvas || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
-
-  const width = Math.max(320, Math.min(video.videoWidth || previewIdealWidth, 640));
-  const height = Math.max(240, Math.min(video.videoHeight || previewIdealHeight, 480));
-  captureCanvas.width = width;
-  captureCanvas.height = height;
-
-  const ctx = captureCanvas.getContext("2d");
-  if (!ctx) return;
-  ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(video, 0, 0, width, height);
-
-  const blob = await new Promise<Blob | null>((resolve) => {
-    captureCanvas.toBlob(resolve, "image/jpeg", captureJpegQuality);
-  });
-  if (!blob) return;
-
-  requestInFlight = true;
-  loading.value = true;
-  const activeSessionId = cameraSessionId.value || createTaskId();
-  cameraSessionId.value = activeSessionId;
-  const formData = new FormData();
-  formData.append("file", blob, "police-gesture-camera.jpg");
-  formData.append("input_mode", "camera");
-  formData.append("session_id", activeSessionId);
-  const startedAt = performance.now();
-
-  try {
-    const { data } = await fetchPoliceGestureApi(formData);
-    lastInferenceDurationMs = performance.now() - startedAt;
-    if (!cameraActive.value || cameraSessionId.value !== activeSessionId) {
+async function waitForStreamPublished(playbackUrl: string) {
+  const deadline = Date.now() + 15_000;
+  while (cameraActive.value && Date.now() < deadline) {
+    const { data } = await fetchPoliceGestureStreamStateApi();
+    if (data.last_error) throw new Error(data.last_error);
+    if (!data.running) throw new Error("交警手势推流已停止");
+    if (data.published) {
+      cameraPlaybackUrl.value = `${playbackUrl}?t=${Date.now()}`;
       return;
     }
-    cameraResult.value = data;
-  } catch (err) {
-    if (!cameraActive.value || cameraSessionId.value !== activeSessionId) {
-      return;
-    }
-    error.value = extractErrorMessage(err, "实时识别失败");
-  } finally {
-    if (cameraSessionId.value === activeSessionId) {
-      loading.value = false;
-      requestInFlight = false;
-    }
+    await new Promise((resolve) => window.setTimeout(resolve, 150));
   }
+  throw new Error("等待 MediaMTX 交警手势流就绪超时");
 }
 
 onMounted(async () => {
@@ -604,6 +533,17 @@ onBeforeUnmount(() => {
 .hidden-input,
 .capture-canvas {
   display: none;
+}
+
+.preview-frame {
+  display: block;
+  width: 100%;
+  min-height: 360px;
+  max-height: min(72vh, 720px);
+  aspect-ratio: 16 / 9;
+  border: 0;
+  border-radius: 10px;
+  background: #111;
 }
 
 .hidden-video {

@@ -77,6 +77,7 @@ class PoliceGestureVideoProgress(BaseModel):
     gesture: str | None = None
     confidence: float | None = None
     annotated_frame: str | None = None
+    playback_url: str | None = None
     events: list[PoliceGestureVideoEvent] = Field(default_factory=list)
     updated_at: datetime
 

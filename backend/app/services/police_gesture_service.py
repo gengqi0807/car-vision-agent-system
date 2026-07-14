@@ -42,6 +42,7 @@ from app.services.police_gesture_local_runtime import (
 )
 from app.services.alert_service import AlertService
 from app.services.monitor_service import MonitorService
+from app.services.police_video_preview_publisher import PoliceVideoPreviewPublisher
 from police.visualization import draw_chinese_text
 
 logger = logging.getLogger(__name__)
@@ -280,6 +281,7 @@ class PoliceGestureService:
         source_path, output_path = self._prepare_video_paths(filename)
         capture = None
         writer = None
+        preview_publisher: PoliceVideoPreviewPublisher | None = None
         temp_output_path = output_path.with_name(f"{output_path.stem}.raw.mp4")
         processed_frame_count = 0
         total_frames = 0
@@ -311,6 +313,8 @@ class PoliceGestureService:
             if fps <= 1:
                 fps = 25.0
             total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            preview_publisher = PoliceVideoPreviewPublisher(resolved_task_id, fps)
+            preview_publisher.start()
             progress_log_interval = max(settings.police_video_progress_log_interval_frames, 10)
 
             logger.info(
@@ -386,6 +390,10 @@ class PoliceGestureService:
                         )
 
                     annotated = annotate_and_write_frame(current_frame_index, frame_result.annotated_frame)
+                    preview_publisher.submit(
+                        current_frame_index,
+                        self._resize_frame_to_limit(annotated, settings.police_video_preview_max_side)
+                    )
 
                     if processed_frame_count == 1 or processed_frame_count % progress_log_interval == 0:
                         logger.info(
@@ -423,6 +431,7 @@ class PoliceGestureService:
                         total_frames=total_frames if total_frames > 0 else None,
                         gesture=last_result["gesture"] if last_result["gesture"] != NO_VIDEO_GESTURE else None,
                         confidence=last_result["confidence"] if last_result["gesture"] != NO_VIDEO_GESTURE else None,
+                        playback_url=preview_publisher.playback_url if preview_publisher.ready else None,
                     )
 
             if processed_frame_count == 0:
@@ -430,6 +439,13 @@ class PoliceGestureService:
 
             if best_result["gesture"] == NO_VIDEO_GESTURE and last_result["gesture"] != NO_VIDEO_GESTURE:
                 best_result = last_result
+
+            if writer is not None:
+                writer.release()
+                writer = None
+            if preview_publisher is not None:
+                preview_publisher.close()
+                preview_publisher = None
 
             self._set_video_progress(
                 resolved_task_id,
@@ -441,6 +457,7 @@ class PoliceGestureService:
                 total_frames=total_frames if total_frames > 0 else None,
                 gesture=best_result["gesture"] if best_result["gesture"] != NO_VIDEO_GESTURE else None,
                 confidence=best_result["confidence"] if best_result["gesture"] != NO_VIDEO_GESTURE else None,
+                playback_url="",
             )
 
             logger.info("Transcoding processed police video: %s -> %s", temp_output_path.name, output_path.name)
@@ -516,6 +533,8 @@ class PoliceGestureService:
                 capture.release()
             if writer is not None:
                 writer.release()
+            if preview_publisher is not None:
+                preview_publisher.close()
             if not settings.plate_save_uploads:
                 try:
                     source_path.unlink(missing_ok=True)
@@ -956,6 +975,7 @@ class PoliceGestureService:
         gesture: str | None = None,
         confidence: float | None = None,
         annotated_frame: str | None = None,
+        playback_url: str | None = None,
     ) -> None:
         with self._progress_lock:
             current = self._video_progress.get(task_id)
@@ -970,6 +990,7 @@ class PoliceGestureService:
                 gesture=gesture,
                 confidence=confidence,
                 annotated_frame=annotated_frame,
+                playback_url=playback_url if playback_url is not None else (current.playback_url if current else None),
                 events=list(current.events) if current is not None else [],
                 updated_at=datetime.utcnow(),
             )

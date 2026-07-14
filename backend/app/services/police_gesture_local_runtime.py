@@ -20,7 +20,13 @@ from police.features import associate_hands, classify_palm_orientation, extract_
 from police.geometry import calc_dist, get_hand_region, setup_local_frame
 from police.gesture_classifier import GestureStateMachine
 from police.models import create_hand_detector, create_pose_detector, detect_hand, detect_pose
-from police.visualization import draw_chinese_text, draw_hand_landmarks, draw_pose_landmarks, draw_wrist_marker
+from police.visualization import (
+    draw_chinese_text,
+    draw_chinese_text_lines,
+    draw_hand_landmarks,
+    draw_pose_landmarks,
+    draw_wrist_marker,
+)
 
 try:
     from ctpgr_engine import CTPGREngine, mediapipe_to_aic14
@@ -107,6 +113,12 @@ class PoliceGestureVideoSession:
         self.dl_persist_confidence = 0.0
         self.dl_persist_counter = 0
         self.dl_persist_max = 8
+        self.locked_gesture: str | None = None
+        self.locked_confidence = 0.0
+        self.lock_candidate: str | None = None
+        self.lock_candidate_confidence = 0.0
+        self.lock_consecutive_count = 0
+        self.was_active = False
 
     def __enter__(self) -> PoliceGestureVideoSession:
         return self
@@ -120,7 +132,7 @@ class PoliceGestureVideoSession:
             self.hand_detector.close()
 
     def process_frame(self, frame: np.ndarray) -> LocalPoliceGestureResult:
-        source_frame = frame.copy()
+        source_frame = frame
         annotated = frame.copy()
         self.frame_counter += 1
         self.global_frame += 1
@@ -332,6 +344,8 @@ class PoliceGestureVideoSession:
                     self.dl_gesture = raw_gesture
                     self.dl_confidence = raw_confidence
 
+        show_gesture, show_confidence = self._update_locked_dl_result()
+
         if not should_infer and self.last_landmarks is not None:
             draw_pose_landmarks(annotated, self.last_landmarks, height, width)
             if self.last_hand_left:
@@ -349,56 +363,47 @@ class PoliceGestureVideoSession:
             self.display_result = None
             self.display_confidence = 0.0
 
+        text_lines: list[tuple[str, tuple[int, int], tuple[int, int, int], int]] = []
+
         if self.realtime and self.dl_engine is not None and not self.dl_warmed_up:
             remaining = self.warmup_seconds - (time.time() - self.warmup_started_at)
             if remaining > 0:
                 overlay = annotated.copy()
                 cv2.rectangle(overlay, (0, 0), (width, height), (0, 0, 0), -1)
                 annotated = cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0)
-                annotated = draw_chinese_text(
-                    annotated,
-                    "请保持站立，倒计时结束后开始识别",
-                    (max(width // 2 - 220, 20), max(height // 2 - 10, 20)),
-                    (0, 255, 255),
-                    26,
-                )
-                annotated = draw_chinese_text(
-                    annotated,
-                    f"预热中 {max(remaining, 0.0):.0f}s",
-                    (max(width // 2 - 80, 20), max(height // 2 + 28, 20)),
-                    (255, 255, 255),
-                    24,
-                )
+                text_lines.extend([
+                    (
+                        "请保持站立，倒计时结束后开始识别",
+                        (max(width // 2 - 220, 20), max(height // 2 - 10, 20)),
+                        (0, 255, 255),
+                        26,
+                    ),
+                    (
+                        f"预热中 {max(remaining, 0.0):.0f}s",
+                        (max(width // 2 - 80, 20), max(height // 2 + 28, 20)),
+                        (255, 255, 255),
+                        24,
+                    ),
+                ])
 
+        state_text = self.state_machine.display_text
         if self.last_landmarks is None:
-            annotated = draw_chinese_text(annotated, "未检测到人体", (10, 110), (0, 0, 255), 36)
-        elif self.state_machine.state == police_cfg.STATE_ACTIVE:
-            annotated = draw_chinese_text(annotated, "动作识别中...", (10, 110), (0, 255, 255), 30)
-        elif self.state_machine.cooldown_counter > 0:
-            annotated = draw_chinese_text(
-                annotated,
-                f"冷却中 {self.state_machine.cooldown_counter}",
-                (10, 110),
-                (128, 128, 128),
-                28,
-            )
+            text_lines.append(("未检测到人体", (10, 110), (0, 0, 255), 36))
+        elif state_text == "动作中":
+            text_lines.append(("动作识别中...", (10, 110), (0, 255, 255), 30))
+        elif state_text == "无动作":
+            text_lines.append(("无动作", (10, 110), (128, 128, 128), 28))
         elif self.dl_engine is None and self.display_result and self.display_result != FILTERED_GESTURE:
-            annotated = draw_chinese_text(
-                annotated,
-                f"交警手势: {self.display_result}",
-                (10, 110),
-                (0, 255, 0),
-                34,
-            )
+            text_lines.append((f"交警手势: {self.display_result}", (10, 110), (0, 255, 0), 34))
         else:
-            annotated = draw_chinese_text(annotated, "等待动作...", (10, 110), (255, 255, 255), 30)
+            text_lines.append(("等待动作...", (10, 110), (255, 255, 255), 30))
 
         if self.last_feat is not None:
             info_x = width - 200
             left_region = self.last_feat.get("left_region", "?")
             right_region = self.last_feat.get("right_region", "?")
-            annotated = draw_chinese_text(annotated, f"左手: {left_region}", (info_x, 15), (0, 200, 255), 20)
-            annotated = draw_chinese_text(annotated, f"右手: {right_region}", (info_x, 42), (200, 100, 255), 20)
+            text_lines.append((f"左手: {left_region}", (info_x, 15), (0, 200, 255), 20))
+            text_lines.append((f"右手: {right_region}", (info_x, 42), (200, 100, 255), 20))
 
         if self.dl_engine is not None:
             panel_w, panel_h = 260, 80
@@ -407,21 +412,25 @@ class PoliceGestureVideoSession:
             cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (20, 20, 50), -1)
             cv2.rectangle(overlay, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), (0, 200, 255), 2)
             annotated = cv2.addWeighted(overlay, 0.65, annotated, 0.35, 0)
-            annotated = draw_chinese_text(annotated, "交警手势识别", (panel_x + 10, panel_y + 5), (0, 255, 255), 22)
-            annotated = draw_chinese_text(annotated, self.dl_gesture, (panel_x + 10, panel_y + 28), (0, 215, 255), 28)
-            annotated = draw_chinese_text(
-                annotated,
-                f"置信度: {self.dl_confidence:.1%}",
-                (panel_x + 10, panel_y + 60),
-                (255, 255, 255),
-                18,
-            )
+            text_lines.extend([
+                ("交警手势识别", (panel_x + 10, panel_y + 5), (0, 255, 255), 22),
+                (show_gesture, (panel_x + 10, panel_y + 28), (0, 215, 255), 28),
+                (
+                    f"置信度: {show_confidence:.1%}" if show_confidence > 0 else "置信度: —",
+                    (panel_x + 10, panel_y + 60),
+                    (255, 255, 255),
+                    18,
+                ),
+            ])
+
+        if text_lines:
+            annotated = draw_chinese_text_lines(annotated, text_lines)
 
         keypoints = _pose_landmarks_to_keypoints(self.last_landmarks)
         if self.dl_engine is not None and self.dl_warmed_up:
-            gesture = normalize_gesture(self.dl_gesture)
-            confidence = round(float(self.dl_confidence), 4)
-            display_label = VIDEO_GESTURE_TEXT.get(gesture, self.dl_gesture)
+            gesture = normalize_gesture(show_gesture)
+            confidence = round(float(show_confidence), 4)
+            display_label = VIDEO_GESTURE_TEXT.get(gesture, show_gesture)
         elif self.display_result and self.display_result != FILTERED_GESTURE:
             gesture = normalize_gesture(self.display_result)
             confidence = round(float(self.display_confidence), 4)
@@ -442,6 +451,70 @@ class PoliceGestureVideoSession:
             annotated_frame=annotated,
             display_label=display_label,
         )
+
+    def _update_locked_dl_result(self) -> tuple[str, float]:
+        """Mirror the new run_recognition.py action-gated DL result locking."""
+        if self.dl_engine is None:
+            return self.dl_gesture, self.dl_confidence
+        if self.realtime and not self.dl_warmed_up:
+            return self.dl_gesture, self.dl_confidence
+
+        is_active = self.state_machine.state == police_cfg.STATE_ACTIVE
+        if is_active:
+            if not self.was_active:
+                self.locked_gesture = None
+                self.locked_confidence = 0.0
+                self.lock_candidate = None
+                self.lock_candidate_confidence = 0.0
+                self.lock_consecutive_count = 0
+
+            dl_valid = not (
+                self.dl_gesture in {"右转弯", "右转弯信号", "靠边停车", "靠边停车信号"}
+                and self.last_feat
+                and self.last_feat.get("left_region") == "hip"
+            )
+            if dl_valid and self.dl_gesture in {"停止", "停止信号"} and self.last_feat:
+                dl_valid = self.last_feat.get("right_region") == "hip"
+
+            if dl_valid and self.dl_gesture not in {
+                "无动作",
+                "无手势",
+                "DL error",
+                "loading...",
+                "预热中...",
+            }:
+                if self.dl_gesture == self.lock_candidate:
+                    self.lock_consecutive_count += 1
+                else:
+                    self.lock_candidate = self.dl_gesture
+                    self.lock_candidate_confidence = self.dl_confidence
+                    self.lock_consecutive_count = 1
+                    self.locked_gesture = None
+                    self.locked_confidence = 0.0
+
+                self.lock_candidate_confidence = self.dl_confidence
+                if self.lock_consecutive_count >= police_cfg.LOCK_EARLY_SHOW:
+                    self.locked_gesture = self.lock_candidate
+                    self.locked_confidence = self.lock_candidate_confidence
+
+            result = (
+                (self.locked_gesture, self.locked_confidence)
+                if self.locked_gesture
+                else ("识别中...", 0.0)
+            )
+        else:
+            if self.was_active and self.locked_gesture is None and self.lock_candidate is not None:
+                result = (self.lock_candidate, self.lock_candidate_confidence)
+            else:
+                result = ("无手势", 0.0)
+            self.locked_gesture = None
+            self.locked_confidence = 0.0
+            self.lock_candidate = None
+            self.lock_candidate_confidence = 0.0
+            self.lock_consecutive_count = 0
+
+        self.was_active = is_active
+        return result
 
 
 class PoliceGestureLocalRuntime:

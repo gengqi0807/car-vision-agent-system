@@ -11,6 +11,7 @@ from app.core.logger import get_logger
 from app.models_infer.errors import InferenceConfigurationError
 from app.schemas.plate import PlateStreamControlResponse
 from app.services.plate_service import PlateService
+from app.services.mediamtx_runtime import MediaMTXRuntime
 
 logger = get_logger(__name__)
 
@@ -46,6 +47,7 @@ class PlatePushService:
         worker_to_stop: threading.Thread | None = None
         previous_rtsp_url: str | None = None
         rtsp_url = rtsp_url.strip()
+        MediaMTXRuntime.ensure_running()
 
         with self._lock:
             stream_name = self._resolve_stream_name(rtsp_url, stream_name)

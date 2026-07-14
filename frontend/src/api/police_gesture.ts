@@ -37,6 +37,7 @@ export interface PoliceGestureVideoProgress {
   gesture?: string | null;
   confidence?: number | null;
   annotated_frame?: string | null;
+  playback_url?: string | null;
   events: Array<{
     gesture: string;
     confidence: number;
@@ -53,6 +54,17 @@ export interface PoliceGestureHistoryItem {
   confidence: number;
   source_path?: string | null;
   updated_at: string;
+}
+
+export interface PoliceGestureStreamState {
+  running: boolean;
+  source: string;
+  fps: number;
+  published: boolean;
+  publish_rtsp_url?: string | null;
+  playback_url?: string | null;
+  last_error?: string | null;
+  started_at?: string | null;
 }
 
 export const fetchPoliceGestureApi = (formData: FormData) =>
@@ -76,3 +88,15 @@ export const fetchPoliceGestureVideoProgressApi = (taskId: string) =>
 
 export const fetchPoliceGestureHistoryApi = () =>
   request.get<PoliceGestureHistoryItem[]>("/police-gesture/history");
+
+export const startPoliceGestureStreamApi = (source = "0", fps = 15) =>
+  request.post<PoliceGestureStreamState>("/police-gesture/stream/start", { command: "start", source, fps });
+
+export const stopPoliceGestureStreamApi = () =>
+  request.post<PoliceGestureStreamState>("/police-gesture/stream/stop");
+
+export const fetchPoliceGestureStreamStateApi = () =>
+  request.get<PoliceGestureStreamState>("/police-gesture/stream");
+
+export const fetchPoliceGestureStreamResultApi = () =>
+  request.get<PoliceGestureFrameResult>("/police-gesture/stream/result");
