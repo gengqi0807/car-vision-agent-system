@@ -4,24 +4,53 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
+.venv*/
 venv/
 env/
+.idea/
 
 node_modules/
 dist/
 .vite/
+frontend/.vite-cache/
 
 .env
 .env.local
 .env.*.local
+frontend/.env.*
 
 backend/uploads/
 backend/logs/
+backend/runtime/
+backend/*.db
+*.db
+*.log
 
 
 backend/models/*.onnx
 backend/models/*.tflite
+backend/models/*.pt
+backend/models/*.pth
+backend/models/*.joblib
+backend/models/*.task
+backend/weights/*.pt
+backend/weights/*.pth
+backend/*.pt
+backend/*.task
+backend/yolov*.pt
 !backend/models/.gitkeep
+!backend/weights/.gitkeep
 owner_gesture_dataset_
+owner_gesture_dataset_features/*.npz
+*.crt
+*.key
+*.avi
+*.mp4
+*.jpg
+*.jpeg
+*.png
+sample_processed_frame.jpg
+tmp_*
+$count
 .DS_Store
 Thumbs.db
