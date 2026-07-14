@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 
 from app.models_infer.errors import PlateInferenceError
@@ -45,7 +47,12 @@ def _absolutize_video_job_response(
 async def recognize_plate_image(file: UploadFile = File(...)) -> PlateRecognitionResponse:
     image_bytes = await file.read()
     try:
-        return await service.recognize_image(file.filename or "unknown.jpg", image_bytes)
+        return await asyncio.wait_for(
+            service.recognize_image(file.filename or "unknown.jpg", image_bytes),
+            timeout=60.0,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=408, detail="图片识别超时，请尽量上传更清晰或更小的图片后重试。") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PlateInferenceError as exc:

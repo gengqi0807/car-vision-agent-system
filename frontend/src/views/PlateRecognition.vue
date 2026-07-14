@@ -859,9 +859,9 @@ async function refreshStreamStatus() {
       playbackRefreshKey.value = Date.now();
     }
     if (data.phase === "source_unavailable" || data.phase === "interrupted") {
-      requestError.value = data.last_error || data.status_message || "";
+      requestError.value = summarizeStreamUiError(data);
     } else if (data.last_error && !data.running) {
-      requestError.value = data.last_error;
+      requestError.value = summarizeStreamUiError(data);
     } else if (!data.running) {
       requestError.value = "";
     }
@@ -1034,10 +1034,49 @@ function extractErrorMessage(error: unknown, fallback: string) {
   if (typeof error === "object" && error && "response" in error) {
     const response = (error as { response?: { data?: { detail?: string } } }).response;
     if (response?.data?.detail) {
-      return response.data.detail;
+      return sanitizeUiErrorMessage(response.data.detail, fallback);
     }
   }
-  return fallback;
+  return sanitizeUiErrorMessage(fallback, fallback);
+}
+
+function summarizeStreamUiError(control?: PlateStreamControlResponse | null) {
+  if (!control) {
+    return "实时推流异常，请查看后端日志。";
+  }
+  if (control.phase === "source_unavailable") {
+    return "源 RTSP 当前不可用，请确认视频流已开启。";
+  }
+  if (control.phase === "interrupted") {
+    return "实时推流已中断，请稍后重试或查看后端日志。";
+  }
+  if (control.status_message) {
+    return control.status_message;
+  }
+  if (control.last_error) {
+    return "实时推流启动失败，请查看后端日志。";
+  }
+  return "";
+}
+
+function sanitizeUiErrorMessage(message: string, fallback: string) {
+  const normalized = (message || "").toLowerCase();
+  if (
+    normalized.includes("ffmpeg passthrough exited unexpectedly") ||
+    normalized.includes("ffmpeg publisher exited unexpectedly") ||
+    normalized.includes("broken pipe")
+  ) {
+    return "本地推流异常，请查看后端日志。";
+  }
+  if (
+    normalized.includes("failed to open the rtsp stream") ||
+    normalized.includes("describe failed") ||
+    normalized.includes("server returned 404") ||
+    normalized.includes("404 not found")
+  ) {
+    return "源 RTSP 当前不可用，请确认视频流已开启。";
+  }
+  return message || fallback;
 }
 
 function startStatusPolling() {

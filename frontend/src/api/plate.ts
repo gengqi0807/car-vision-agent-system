@@ -70,7 +70,7 @@ export function recognizePlateImageApi(file: File) {
   const formData = new FormData();
   formData.append("file", file);
   return request.post<PlateRecognitionResponse>("/plate/image", formData, {
-    timeout: 2 * 60 * 1000
+    timeout: 60 * 1000
   });
 }
 
