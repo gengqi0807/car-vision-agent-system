@@ -82,8 +82,99 @@ def parse_args():
         "--no-dl", action="store_true",
         help="禁用深度学习模型（仅规则）"
     )
+    parser.add_argument(
+        "--num-poses", type=int, default=police_cfg.NUM_POSES_MULTI,
+        help=f"同时检测的最大人数，用于排除其他人物的干扰（默认: {police_cfg.NUM_POSES_MULTI}）"
+    )
+    parser.add_argument(
+        "--no-lock", action="store_true",
+        help="禁用目标人物锁定（使用所有人物的第一个检测结果）"
+    )
     return parser.parse_args()
 
+
+
+def _select_target_person(pose_landmarks_list, frame_w, frame_h, prefer_center=True):
+    """
+    从多个检测到的人体中选出目标人物。
+
+    优先策略：
+      1) 选取肩宽最大的（通常离摄像头最近、最可能是测试者）
+      2) 若 prefer_center=True，在肩宽相近时优先选靠近画面中心的
+
+    Args:
+        pose_landmarks_list: MediaPipe Pose 归一化关键点列表
+        frame_w, frame_h: 画面尺寸
+        prefer_center: 是否优先画面中心
+
+    Returns:
+        (best_idx, person_info_dict) 或 (0, None)
+    """
+    if not pose_landmarks_list:
+        return 0, None
+
+    best_idx = 0
+    best_score = -1.0
+    best_info = None
+
+    for i, lm in enumerate(pose_landmarks_list):
+        # 肩宽（归一化坐标）
+        ls = (lm[11].x, lm[11].y)
+        rs = (lm[12].x, lm[12].y)
+        sw = ((ls[0] - rs[0]) ** 2 + (ls[1] - rs[1]) ** 2) ** 0.5
+
+        # 人体中心坐标（归一化）
+        cx = (lm[11].x + lm[12].x + lm[23].x + lm[24].x) / 4.0
+        cy = (lm[11].y + lm[12].y + lm[23].y + lm[24].y) / 4.0
+
+        # 距画面中心的距离
+        dist_to_center = ((cx - 0.5) ** 2 + (cy - 0.5) ** 2) ** 0.5
+
+        # 综合评分：肩宽大 + 靠近中心
+        score = sw * 3.0 - dist_to_center * 0.5
+        if score > best_score:
+            best_score = score
+            best_idx = i
+            best_info = {"sw": sw, "cx": cx, "cy": cy, "dist_center": dist_to_center}
+
+    return best_idx, best_info
+
+
+def _track_target_person(pose_landmarks_list, last_target_info, track_thresh=0.35):
+    """
+    帧间追踪目标人物：找到与上一帧目标位置最接近的人体。
+
+    Args:
+        pose_landmarks_list: 当前帧所有检测到的人体关键点
+        last_target_info: 上一帧目标人物的信息 {"cx", "cy", ...}
+        track_thresh: 匹配距离阈值（归一化坐标）
+
+    Returns:
+        (matched_idx, matched_info) 或 (0, None) 如果匹配失败
+    """
+    if not pose_landmarks_list or last_target_info is None:
+        return 0, None
+
+    best_idx = 0
+    best_dist = float('inf')
+    best_info = None
+
+    lcx, lcy = last_target_info.get("cx", 0.5), last_target_info.get("cy", 0.5)
+
+    for i, lm in enumerate(pose_landmarks_list):
+        cx = (lm[11].x + lm[12].x + lm[23].x + lm[24].x) / 4.0
+        cy = (lm[11].y + lm[12].y + lm[23].y + lm[24].y) / 4.0
+        dist = ((cx - lcx) ** 2 + (cy - lcy) ** 2) ** 0.5
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = i
+            best_info = {"cx": cx, "cy": cy}
+
+    if best_dist > track_thresh:
+        # 距离太远，可能目标人物丢失，回退到选择最靠近中心的
+        return _select_target_person(pose_landmarks_list, 1.0, 1.0, prefer_center=True)
+
+    return best_idx, best_info
 
 
 def main():
@@ -95,6 +186,9 @@ def main():
     police_cfg.SKIP_FRAMES = args.skip
     police_cfg.INFER_SCALE = args.scale
 
+    # 是否启用目标人物锁定
+    enable_target_lock = not args.no_lock
+
     # ================================================================
     # 1. 加载 MediaPipe 模型
     # ================================================================
@@ -103,9 +197,17 @@ def main():
         print("  请确认 backend/pose_landmarker_lite.task 文件存在")
         return
 
+    # 临时覆盖 NUM_POSES，使 pose_detector 支持多人检测
+    _saved_num_poses = police_cfg.NUM_POSES
+    police_cfg.NUM_POSES = args.num_poses
+
     print(f"[LOAD] Pose 模型: {args.pose_model}")
+    print(f"        多人物检测: 最多 {args.num_poses} 人")
     pose_detector = create_pose_detector(args.pose_model)
     print("[ OK ] PoseLandmarker 就绪（33 个身体关键点）")
+
+    # 恢复原始配置
+    police_cfg.NUM_POSES = _saved_num_poses
 
     hand_detector = None
     if not args.no_hand:
@@ -209,6 +311,16 @@ def main():
     warmup_start_time = time.time()   # 预热提示开始时间
     WARMUP_SECONDS = 2.0              # 提示持续时间（秒）
 
+    # ---- 目标人物锁定与追踪（排除其他人物走动干扰） ----
+    #   预热完成后前 TARGET_LOCK_FRAMES 帧锁定目标人物
+    #   之后通过帧间位置匹配持续追踪该人物
+    target_locked = False
+    target_info = None              # {"cx", "cy", "sw", ...} 目标人物位置/体型信息
+    target_lock_counter = 0
+    TARGET_LOCK_FRAMES = police_cfg.TARGET_LOCK_FRAMES
+    TARGET_TRACK_THRESH = police_cfg.TARGET_TRACK_THRESH
+    multi_person_warned = False     # 多人检测提示仅打印一次
+
     # 显示缩放
     DISPLAY_SCALE = 1.5
 
@@ -252,18 +364,78 @@ def main():
             hand_result = None
 
         if should_infer and pose_result and pose_result.pose_landmarks:
-            landmarks = pose_result.pose_landmarks[0]
+            num_detected = len(pose_result.pose_landmarks)
+
+            # ---- 目标人物选择（排除其他人物的干扰） ----
+            if enable_target_lock:
+                if not target_locked:
+                    # 预热完成后锁定目标人物：选肩宽最大 + 最靠近中心的
+                    target_idx, person_info = _select_target_person(
+                        pose_result.pose_landmarks, w, h
+                    )
+                    target_lock_counter += 1
+                    if target_lock_counter >= TARGET_LOCK_FRAMES:
+                        target_locked = True
+                        target_info = person_info
+                        if num_detected > 1:
+                            print(f"\n[TARGET] 已锁定目标人物 (共检测到 {num_detected} 人)")
+                            print(f"         目标位置: 中心({target_info['cx']:.2f}, {target_info['cy']:.2f})")
+                            multi_person_warned = True
+                else:
+                    # 追踪已锁定的目标人物
+                    target_idx, person_info = _track_target_person(
+                        pose_result.pose_landmarks, target_info, TARGET_TRACK_THRESH
+                    )
+                    if person_info:
+                        # EMA 平滑更新目标位置
+                        alpha = 0.7
+                        target_info["cx"] = alpha * person_info["cx"] + (1 - alpha) * target_info["cx"]
+                        target_info["cy"] = alpha * person_info["cy"] + (1 - alpha) * target_info["cy"]
+
+                    if num_detected > 1 and not multi_person_warned:
+                        print(f"\n[INFO] 检测到 {num_detected} 人，已锁定目标人物进行追踪")
+                        multi_person_warned = True
+            else:
+                # 未启用目标锁定时，使用默认的第一个检测结果
+                target_idx = 0
+                if num_detected > 1 and not multi_person_warned:
+                    print(f"\n[WARN] 检测到 {num_detected} 人，但目标锁定已禁用，可能受其他人物干扰")
+                    multi_person_warned = True
+
+            landmarks = pose_result.pose_landmarks[target_idx]
             last_landmarks = landmarks
 
+            # ---- 多人物可视化：目标人物绿色骨架，其他人物灰色骨架 ----
+            if enable_target_lock and num_detected > 1:
+                for i, other_lm in enumerate(pose_result.pose_landmarks):
+                    if i == target_idx:
+                        continue
+                    # 灰色半透明绘制其他人物
+                    draw_pose_landmarks(frame, other_lm, h, w,
+                                        point_color=(100, 100, 100),
+                                        line_color=(80, 80, 80))
+
             world_landmarks = None
-            if pose_result.pose_world_landmarks:
-                world_landmarks = pose_result.pose_world_landmarks[0]
+            if (pose_result.pose_world_landmarks and
+                    target_idx < len(pose_result.pose_world_landmarks)):
+                world_landmarks = pose_result.pose_world_landmarks[target_idx]
                 last_world_landmarks = world_landmarks
             else:
                 world_landmarks = last_world_landmarks
 
             # ---- 绘制 Pose 骨架（33 个关键点 + 连线） ----
             draw_pose_landmarks(frame, landmarks, h, w)
+
+            # ---- 目标人物边界框（多人检测时用绿色标注追踪目标） ----
+            if enable_target_lock and num_detected > 1:
+                xs = [int(lm.x * w) for lm in landmarks]
+                ys = [int(lm.y * h) for lm in landmarks]
+                if xs and ys:
+                    x1, y1 = max(min(xs) - 20, 0), max(min(ys) - 30, 0)
+                    x2, y2 = min(max(xs) + 20, w), min(max(ys) + 20, h)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, "ME", (x1, y1 - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             # ---- 提取像素关键点 ----
             def px(idx):
@@ -416,8 +588,13 @@ def main():
                     if (time.time() - warmup_start_time) >= WARMUP_SECONDS:
                         dl_warmed_up = True
                         dl_engine.reset_state()
+                        # 预热完成 → 启动目标人物锁定流程
+                        target_locked = False
+                        target_lock_counter = 0
+                        target_info = None
+                        multi_person_warned = False
                         print(f"\n[DL-OK] 预热完成，LSTM 状态已重置为 h0/c0，开始实时识别")
-                        print("        现在可以开始做手势了！\n")
+                        print("        正在锁定目标人物...\n")
 
                 # 仅预热完成后才推理
                 if dl_warmed_up:
@@ -520,6 +697,11 @@ def main():
             dl_window.clear()
             dl_filtered_gesture = "无手势"
             dl_filtered_confidence = 0.0
+            # 人体丢失 → 重新锁定目标人物
+            if target_locked:
+                target_locked = False
+                target_lock_counter = 0
+                target_info = None
 
         # ---- 非推理帧：绘制缓存骨架（防止闪烁） ----
         if not should_infer and last_landmarks is not None:
@@ -592,6 +774,30 @@ def main():
             frame = draw_chinese_text(frame, f"置信度: {dl_confidence:.1%}",
                                       (panel_x + 10, panel_y + 60),
                                       (255, 255, 255), 18)
+
+        # ---- 多人检测 / 目标锁定状态（左上角面板下方） ----
+        if enable_target_lock and last_landmarks is not None and dl_warmed_up:
+            # 获取当前帧检测到的人数（从缓存的 pose_result 推断）
+            multi_info_y = 105
+            if target_locked:
+                frame = draw_chinese_text(frame, "已锁定目标",
+                                          (25, multi_info_y),
+                                          (0, 255, 0), 18)
+                if target_info:
+                    frame = draw_chinese_text(
+                        frame,
+                        f"位置: ({target_info.get('cx', 0):.2f}, {target_info.get('cy', 0):.2f})",
+                        (25, multi_info_y + 22),
+                        (180, 180, 180), 16
+                    )
+            elif target_lock_counter > 0:
+                remaining = TARGET_LOCK_FRAMES - target_lock_counter
+                frame = draw_chinese_text(
+                    frame,
+                    f"锁定目标中... {remaining}/{TARGET_LOCK_FRAMES}",
+                    (25, multi_info_y),
+                    (0, 200, 255), 18
+                )
 
         # ---- 动作切换提示（画面中央偏上） ----
         if action_flash_remaining > 0:
