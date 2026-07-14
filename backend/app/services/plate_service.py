@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 from dataclasses import dataclass, field
 from datetime import datetime
 import os
@@ -61,6 +62,7 @@ class PlateTrack:
     plate_color: str
     confidence: float
     bbox: list[int]
+    last_recognized_bbox: list[int]
     template: object
     last_seen_frame: int
     last_recognized_frame: int
@@ -169,7 +171,7 @@ class PlateService:
             return PlateRecognitionResponse(frame_id=filename, detections=[])
 
         source_path = self._persist_upload(image_bytes, filename) if settings.plate_save_uploads else None
-        detections = self._recognize_image_detections(image_bytes)
+        detections = self._coalesce_plate_results_by_number(self._recognize_image_detections(image_bytes))
 
         if detections:
             self._save_history(detections, source_path)
@@ -366,6 +368,9 @@ class PlateService:
             "detections_updated_at": 0.0,
             "frame_width": 0,
             "frame_height": 0,
+            "tracks": [],
+            "track_frame_index": 0,
+            "tracks_generation": 0,
         }
         recognition_submit_interval = self._stream_recognition_submit_interval_seconds(min_interval)
         last_recognition_submit_at = 0.0
@@ -401,10 +406,29 @@ class PlateService:
                         if now - state.last_history_saved_at >= settings.plate_stream_history_interval_seconds:
                             self._save_history(fresh_detections, None)
                             state.last_history_saved_at = now
+                    current_time = time.monotonic()
                     with recognition_lock:
+                        recognition_state["tracks"] = copy.deepcopy(state.tracks)
+                        recognition_state["track_frame_index"] = state.frame_index
+                        recognition_state["tracks_generation"] = int(recognition_state["tracks_generation"]) + 1
+                        if self._should_keep_previous_stream_detections(
+                            next_detections=source_detections,
+                            current_detections=recognition_state["detections"],
+                            current_version=int(recognition_state["version"]),
+                            detections_version=int(recognition_state["detections_version"]),
+                            detections_updated_at=float(recognition_state["detections_updated_at"]),
+                            current_time=current_time,
+                            submit_interval=recognition_submit_interval,
+                        ):
+                            recognition_state["detections_version"] = local_version
+                            recognition_state["detections_updated_at"] = current_time
+                            recognition_state["frame_width"] = local_frame.shape[1]
+                            recognition_state["frame_height"] = local_frame.shape[0]
+                            recognition_state["processed_version"] = local_version
+                            continue
                         recognition_state["detections"] = [item.model_copy() for item in source_detections]
                         recognition_state["detections_version"] = local_version
-                        recognition_state["detections_updated_at"] = time.monotonic()
+                        recognition_state["detections_updated_at"] = current_time
                         recognition_state["frame_width"] = local_frame.shape[1]
                         recognition_state["frame_height"] = local_frame.shape[0]
                         recognition_state["processed_version"] = local_version
@@ -475,6 +499,37 @@ class PlateService:
                     last_recognition_submit_at = now
 
                 display_frame = self._resize_stream_frame(source_frame)
+                tracking_detections: list[PlateDetection] = []
+                working_frame = self._resize_frame_to_limit(
+                    source_frame,
+                    self._resolve_stream_tracking_max_side(),
+                )
+                with recognition_lock:
+                    track_generation = int(recognition_state["tracks_generation"])
+                    track_frame_index = int(recognition_state["track_frame_index"])
+                    tracking_tracks = copy.deepcopy(recognition_state["tracks"])
+                if tracking_tracks:
+                    updated_tracks = self._update_tracks(
+                        working_frame,
+                        tracking_tracks,
+                        track_frame_index + 1,
+                        stream_mode=True,
+                    )
+                    display_tracking_tracks = self._select_stream_tracking_display_tracks(
+                        updated_tracks,
+                        frame_index=track_frame_index + 1,
+                    )
+                    tracking_detections = self._scale_detections(
+                        self._tracks_to_detections(display_tracking_tracks),
+                        working_frame.shape[1],
+                        working_frame.shape[0],
+                        display_frame.shape[1],
+                        display_frame.shape[0],
+                    )
+                    with recognition_lock:
+                        if int(recognition_state["tracks_generation"]) == track_generation:
+                            recognition_state["tracks"] = display_tracking_tracks
+                            recognition_state["track_frame_index"] = track_frame_index + 1
                 with recognition_lock:
                     cached_detections = [item.model_copy() for item in recognition_state["detections"]]
                     cached_detections_version = int(recognition_state["detections_version"])
@@ -483,6 +538,7 @@ class PlateService:
                     cached_frame_height = int(recognition_state["frame_height"])
                     current_version = int(recognition_state["version"])
 
+                cached_scaled_detections: list[PlateDetection] = []
                 if (
                     cached_detections
                     and cached_frame_width > 0
@@ -495,16 +551,26 @@ class PlateService:
                         submit_interval=recognition_submit_interval,
                     )
                 ):
-                    scaled_detections = self._scale_detections(
+                    cached_scaled_detections = self._scale_detections(
                         cached_detections,
                         cached_frame_width,
                         cached_frame_height,
                         display_frame.shape[1],
                         display_frame.shape[0],
                     )
-                else:
-                    scaled_detections = []
 
+                if tracking_detections and cached_scaled_detections:
+                    scaled_detections = self._merge_stream_tracking_and_cached_detections(
+                        tracking_detections,
+                        cached_scaled_detections,
+                    )
+                elif tracking_detections:
+                    scaled_detections = tracking_detections
+                else:
+                    scaled_detections = cached_scaled_detections
+
+                if scaled_detections:
+                    scaled_detections = self._deduplicate_stream_display_detections(scaled_detections)
                 annotated = self._annotate_frame(display_frame, scaled_detections)
                 last_sent_at = time.monotonic()
                 last_output_frame = annotated.copy() if hasattr(annotated, "copy") else annotated
@@ -1142,14 +1208,16 @@ class PlateService:
         since_last = state.frame_index - state.last_recognition_frame
         if state.stream_mode:
             if not state.tracks:
-                return since_last >= max(interval, 2)
+                return since_last >= max(interval, 1)
             if any(track.misses > 0 for track in state.tracks):
-                return since_last >= max(interval, 2)
+                return since_last >= max(interval, 1)
             if any(not track.plate_number for track in state.tracks):
-                return since_last >= max(interval * 2, 4)
+                return since_last >= max(interval, 2)
+            if sum(1 for track in state.tracks if track.misses == 0) >= 2:
+                return since_last >= max(interval, 2)
             if any(self._is_large_recognized_track(track) for track in state.tracks):
-                return since_last >= max(interval * 3, 6)
-            return since_last >= max(interval, 4)
+                return since_last >= max(interval * 2, 3)
+            return since_last >= max(interval, 2)
         if not state.tracks:
             return since_last >= max(interval // 2, 8)
         if any(track.misses > 0 for track in state.tracks):
@@ -1165,6 +1233,20 @@ class PlateService:
             return False
         if not state.tracks:
             return False
+        if state.stream_mode:
+            unread_track_count = sum(1 for track in state.tracks if not track.plate_number and track.misses == 0)
+            has_small_target_unread = self._has_active_small_target_unread_track(state.tracks)
+            has_large_recognized = any(self._is_large_recognized_track(track) for track in state.tracks)
+            active_track_count = sum(1 for track in state.tracks if track.misses == 0)
+
+            if unread_track_count >= 1:
+                probe_interval = 2 if has_small_target_unread else 3
+            elif active_track_count <= 1 and has_large_recognized:
+                probe_interval = 3
+            else:
+                probe_interval = 4
+            return state.frame_index - state.last_probe_frame >= probe_interval
+
         unread_track_count = sum(1 for track in state.tracks if not track.plate_number and track.misses == 0)
         has_small_target_unread = self._has_active_small_target_unread_track(state.tracks)
         if unread_track_count == 0:
@@ -2304,7 +2386,7 @@ class PlateService:
             else:
                 max_candidates = min(max_candidates, 4)
         if stream_mode and video_mode:
-            max_candidates = min(max_candidates, 3)
+            max_candidates = min(max(max_candidates, 5), 5)
 
         if video_mode:
             plate_hits, vehicle_hits = self._count_detector_hit_kinds(detector_hits[:max_candidates])
@@ -3514,6 +3596,47 @@ class PlateService:
         if current == VEHICLE_TYPE_TRUCK and candidate == VEHICLE_TYPE_CRANE:
             return candidate
         return current
+
+    def _coalesce_plate_results_by_number(self, detections: list[PlateDetection]) -> list[PlateDetection]:
+        if not detections:
+            return detections
+
+        unread_detections = [item for item in detections if not item.plate_number]
+        merged: dict[str, PlateDetection] = {}
+        for detection in detections:
+            plate_number = (detection.plate_number or "").strip()
+            if not plate_number:
+                continue
+
+            normalized = detection.model_copy(
+                update={
+                    "plate_color": self._normalize_plate_color_for_plate(detection.plate_color, plate_number),
+                    "vehicle_type": self._normalize_vehicle_type_from_label(detection.vehicle_type),
+                }
+            )
+            current = merged.get(plate_number)
+            if current is None:
+                merged[plate_number] = normalized
+                continue
+
+            merged[plate_number] = PlateDetection(
+                plate_number=plate_number,
+                plate_color=self._pick_better_plate_color(
+                    current.plate_color,
+                    normalized.plate_color,
+                    plate_number,
+                ),
+                vehicle_type=self._pick_better_vehicle_type(current.vehicle_type, normalized.vehicle_type),
+                confidence=min(1.0, max(current.confidence, normalized.confidence) + 0.02),
+                bbox=list(normalized.bbox if normalized.confidence >= current.confidence else current.bbox),
+            )
+
+        merged_detections = sorted(
+            merged.values(),
+            key=lambda item: (self._score_plate_candidate(item), item.confidence, item.bbox[2] * item.bbox[3]),
+            reverse=True,
+        )
+        return merged_detections + unread_detections
     def _score_plate_candidate(self, detection: PlateDetection) -> float:
         plate_number = detection.plate_number or ""
         suffix = plate_number[2:]
@@ -3584,7 +3707,7 @@ class PlateService:
             gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         for track in tracks:
             tracked = self._track_plate(gray_frame, track, stream_mode=stream_mode) if gray_frame is not None else False
-            if tracked and self._should_reject_stale_tracked_plate(track, frame_index):
+            if tracked and self._should_reject_stale_tracked_plate(track, frame_index, stream_mode=stream_mode):
                 tracked = False
                 track.misses += 2
             if tracked:
@@ -3635,11 +3758,29 @@ class PlateService:
         track.last_tracking_score = float(max_score)
         return True
 
-    def _should_reject_stale_tracked_plate(self, track: PlateTrack, frame_index: int) -> bool:
+    def _should_reject_stale_tracked_plate(
+        self,
+        track: PlateTrack,
+        frame_index: int,
+        *,
+        stream_mode: bool = False,
+    ) -> bool:
         if not track.plate_number:
             return False
 
         stale_frames = frame_index - track.last_recognized_frame
+        if stream_mode:
+            if stale_frames >= 10:
+                return True
+            if stale_frames >= 6:
+                score = track.last_tracking_score
+                recognized_bbox = track.last_recognized_bbox or track.bbox
+                iou = self._compute_iou(track.bbox, recognized_bbox)
+                offset_x_ratio, offset_y_ratio = self._compute_bbox_center_offset_ratio(track.bbox, recognized_bbox)
+                if score < 0.78:
+                    return True
+                if iou < 0.08 and (offset_x_ratio > 1.45 or offset_y_ratio > 1.45):
+                    return True
         if stale_frames <= 8:
             return False
 
@@ -3693,6 +3834,106 @@ class PlateService:
     def _stream_recognition_submit_interval_seconds(self, min_interval: float) -> float:
         base_interval = min_interval if min_interval > 0 else 0.125
         return min(max(base_interval * 1.5, 0.12), 0.3)
+
+    def _resolve_stream_tracking_max_side(self) -> int:
+        configured_limit = int(settings.plate_stream_recognition_max_side)
+        if configured_limit > 0:
+            return configured_limit
+        return max(int(settings.plate_stream_max_side), 1)
+
+    def _merge_stream_tracking_and_cached_detections(
+        self,
+        tracking_detections: list[PlateDetection],
+        cached_detections: list[PlateDetection],
+    ) -> list[PlateDetection]:
+        merged = [item.model_copy() for item in tracking_detections]
+        accepted_numbers = {
+            (item.plate_number or "").strip()
+            for item in merged
+            if (item.plate_number or "").strip()
+        }
+        for detection in cached_detections:
+            plate_number = (detection.plate_number or "").strip()
+            if plate_number and plate_number in accepted_numbers:
+                continue
+            merged.append(detection.model_copy())
+            if plate_number:
+                accepted_numbers.add(plate_number)
+        return merged
+
+    def _select_stream_tracking_display_tracks(
+        self,
+        tracks: list[PlateTrack],
+        *,
+        frame_index: int,
+    ) -> list[PlateTrack]:
+        selected: list[PlateTrack] = []
+        for track in tracks:
+            if not track.plate_number:
+                selected.append(track)
+                continue
+
+            stale_frames = frame_index - track.last_recognized_frame
+            if stale_frames <= 2:
+                selected.append(track)
+                continue
+            if stale_frames >= 5:
+                continue
+
+            recognized_bbox = track.last_recognized_bbox or track.bbox
+            iou = self._compute_iou(track.bbox, recognized_bbox)
+            offset_x_ratio, offset_y_ratio = self._compute_bbox_center_offset_ratio(track.bbox, recognized_bbox)
+            if track.last_tracking_score >= 0.82 and iou >= 0.16 and offset_x_ratio <= 0.95 and offset_y_ratio <= 0.95:
+                selected.append(track)
+        return selected
+
+    def _deduplicate_stream_display_detections(
+        self,
+        detections: list[PlateDetection],
+    ) -> list[PlateDetection]:
+        best_by_plate: dict[str, PlateDetection] = {}
+        ordered: list[PlateDetection] = []
+        for detection in detections:
+            plate_number = (detection.plate_number or "").strip()
+            if not plate_number:
+                ordered.append(detection)
+                continue
+
+            current_best = best_by_plate.get(plate_number)
+            if current_best is None:
+                best_by_plate[plate_number] = detection
+                continue
+
+            current_area = current_best.bbox[2] * current_best.bbox[3]
+            next_area = detection.bbox[2] * detection.bbox[3]
+            current_score = (current_best.confidence * 2.0) + (current_area / 1000.0)
+            next_score = (detection.confidence * 2.0) + (next_area / 1000.0)
+            if next_score > current_score:
+                best_by_plate[plate_number] = detection
+
+        ordered.extend(best_by_plate.values())
+        return self._deduplicate_display_detections(ordered)
+
+    def _should_keep_previous_stream_detections(
+        self,
+        *,
+        next_detections: list[PlateDetection],
+        current_detections: list[PlateDetection],
+        current_version: int,
+        detections_version: int,
+        detections_updated_at: float,
+        current_time: float,
+        submit_interval: float,
+    ) -> bool:
+        if next_detections or not current_detections:
+            return False
+        return self._should_display_stream_cached_detections(
+            current_version=current_version,
+            detections_version=detections_version,
+            detections_updated_at=detections_updated_at,
+            current_time=current_time,
+            submit_interval=submit_interval,
+        )
 
     def _should_display_stream_cached_detections(
         self,
@@ -3759,6 +4000,7 @@ class PlateService:
 
             self._apply_detection_vote(track, detection)
             track.bbox = list(detection.bbox)
+            track.last_recognized_bbox = list(detection.bbox)
             track.template = template
             track.last_seen_frame = frame_index
             track.last_recognized_frame = frame_index
@@ -3831,6 +4073,7 @@ class PlateService:
             plate_color=best.plate_color,
             confidence=max(primary.confidence, secondary.confidence),
             bbox=list(best.bbox),
+            last_recognized_bbox=list(best.last_recognized_bbox or best.bbox),
             template=best.template,
             last_seen_frame=max(primary.last_seen_frame, secondary.last_seen_frame),
             last_recognized_frame=max(primary.last_recognized_frame, secondary.last_recognized_frame),
@@ -3891,6 +4134,7 @@ class PlateService:
             plate_color=detection.plate_color,
             confidence=detection.confidence,
             bbox=list(detection.bbox),
+            last_recognized_bbox=list(detection.bbox),
             template=template,
             last_seen_frame=frame_index,
             last_recognized_frame=frame_index,
@@ -4515,6 +4759,7 @@ class PlateService:
                 accepted_numbers.add(item.plate_number)
                 supplement_limit -= 1
         accepted = [self._stabilize_video_detection_color(item) for item in accepted]
+        accepted = self._coalesce_plate_results_by_number(accepted)
         accepted = [
             item.model_copy(
                 update={
@@ -4897,6 +5142,7 @@ class PlateService:
         return intersection / union
 
     def _save_history(self, detections: list[PlateDetection], source_path: str | None) -> None:
+        detections = self._coalesce_plate_results_by_number(detections)
         records = [
             PlateRecord(
                 plate_number=detection.plate_number,
