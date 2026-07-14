@@ -6,8 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="d266786f-ee78-41ea-9080-d512dbeddab5" name="更改" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/backend/models/gesture_classifier_svm.joblib" beforeDir="false" afterPath="$PROJECT_DIR$/backend/models/gesture_classifier_svm.joblib" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/owner_gesture_dataset_features/features.npz" beforeDir="false" afterPath="$PROJECT_DIR$/owner_gesture_dataset_features/features.npz" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
