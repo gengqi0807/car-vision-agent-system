@@ -1,31 +1,31 @@
 {
-  "hash": "8538aef9",
-  "configHash": "dc513dee",
-  "lockfileHash": "0caff214",
-  "browserHash": "e5fa30de",
+  "hash": "8186dc46",
+  "configHash": "b1c65ad4",
+  "lockfileHash": "90787cd8",
+  "browserHash": "3088720e",
   "optimized": {
     "axios": {
       "src": "../../node_modules/axios/index.js",
       "file": "axios.js",
-      "fileHash": "bb48bb9e",
+      "fileHash": "bb795b6e",
       "needsInterop": false
     },
     "pinia": {
       "src": "../../node_modules/pinia/dist/pinia.mjs",
       "file": "pinia.js",
-      "fileHash": "2b4be2b1",
+      "fileHash": "48a9bb89",
       "needsInterop": false
     },
     "vue": {
       "src": "../../node_modules/vue/dist/vue.runtime.esm-bundler.js",
       "file": "vue.js",
-      "fileHash": "427ac171",
+      "fileHash": "888f2d04",
       "needsInterop": false
     },
     "vue-router": {
       "src": "../../node_modules/vue-router/dist/vue-router.mjs",
       "file": "vue-router.js",
-      "fileHash": "5b930471",
+      "fileHash": "3ebc5ed6",
       "needsInterop": false
     }
   },
