@@ -38,6 +38,8 @@ export interface PoliceGestureVideoProgress {
   confidence?: number | null;
   annotated_frame?: string | null;
   playback_url?: string | null;
+  processed_video_url?: string | null;
+  duration_seconds?: number | null;
   events: Array<{
     gesture: string;
     confidence: number;
@@ -47,6 +49,11 @@ export interface PoliceGestureVideoProgress {
     updated_at: string;
   }>;
   updated_at: string;
+}
+
+export interface PoliceGestureVideoJobCreateResponse {
+  task_id: string;
+  status: string;
 }
 
 export interface PoliceGestureHistoryItem {
@@ -82,6 +89,17 @@ export const recognizePoliceGestureVideoApi = (formData: FormData, taskId?: stri
     timeout: 10 * 60 * 1000,
   });
 };
+
+export const createPoliceGestureVideoJobApi = (formData: FormData, taskId: string) => {
+  formData.set("task_id", taskId);
+  return request.post<PoliceGestureVideoJobCreateResponse>("/police-gesture/video/jobs", formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+    timeout: 60 * 1000,
+  });
+};
+
+export const cancelPoliceGestureVideoJobApi = (taskId: string) =>
+  request.post<PoliceGestureVideoProgress>(`/police-gesture/video/jobs/${taskId}/cancel`);
 
 export const fetchPoliceGestureVideoProgressApi = (taskId: string) =>
   request.get<PoliceGestureVideoProgress>(`/police-gesture/video/progress/${taskId}`);

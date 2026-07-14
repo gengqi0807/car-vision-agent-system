@@ -137,6 +137,10 @@
           </div>
 
           <div v-if="isLoading" class="status-note">{{ loadingText }}</div>
+          <div v-if="mode === 'video' && isVideoTaskActive" class="video-task-actions">
+            <span>视频识别可在后台继续运行</span>
+            <button type="button" class="cancel-task-btn" @click="cancelVideoTask">终止识别</button>
+          </div>
           <div
             v-else-if="mode === 'image' && imagePreviewUrl && currentDetections.length === 0 && !requestError"
             class="status-note"
@@ -222,6 +226,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import {
+  cancelPlateVideoJobApi,
   createPlateVideoJobApi,
   fetchPlateHistoryApi,
   fetchPlatePushStreamStatusApi,
@@ -256,6 +261,7 @@ interface OverlayDetection extends PlateDetection {
 const PLATE_MODE_STORAGE_KEY = "plate-recognition-mode";
 const PLATE_STREAM_INPUT_STORAGE_KEY = "plate-stream-input";
 const PLATE_STREAM_PRESET_STORAGE_KEY = "plate-stream-preset";
+const PLATE_VIDEO_TASK_STORAGE_KEY = "plate-active-video-task";
 
 function readStoredMode(): Mode {
   if (typeof window === "undefined") {
@@ -349,6 +355,9 @@ const videoProgressPercent = computed(() => {
   }
   return Math.max(0, Math.min(Math.round((videoJob.value.progress ?? 0) * 100), 100));
 });
+const isVideoTaskActive = computed(() =>
+  ["queued", "processing", "cancelling"].includes(videoJob.value?.status ?? "")
+);
 
 const currentDetections = computed(() => {
   if (mode.value === "image") {
@@ -609,6 +618,7 @@ async function refreshVideoJobStatus(jobId: string) {
   videoJob.value = data;
   requestError.value = "";
   if (data.status === "completed" && data.processed_video_url) {
+    window.localStorage.removeItem(PLATE_VIDEO_TASK_STORAGE_KEY);
     videoResult.value = {
       source_filename: data.source_filename,
       processed_video_url: data.processed_video_url,
@@ -623,11 +633,13 @@ async function refreshVideoJobStatus(jobId: string) {
     return;
   }
 
-  if (data.status === "failed") {
+  if (data.status === "failed" || data.status === "cancelled") {
+    window.localStorage.removeItem(PLATE_VIDEO_TASK_STORAGE_KEY);
     videoResult.value = null;
     isLoading.value = false;
     loadingText.value = "";
-    requestError.value = data.error_message || "视频识别失败，请稍后重试。";
+    requestError.value = data.status === "cancelled" ? "" : (data.error_message || "视频识别失败，请稍后重试。");
+    if (data.status === "cancelled") loadingText.value = "视频识别已终止。";
     stopVideoJobPolling();
     return;
   }
@@ -648,6 +660,7 @@ function startVideoJobPolling(jobId: string) {
           ? (error as { response?: { status?: number } }).response?.status
           : undefined;
       if (responseStatus === 404) {
+        window.localStorage.removeItem(PLATE_VIDEO_TASK_STORAGE_KEY);
         stopVideoJobPolling();
         activeVideoJobId = "";
         videoJob.value = null;
@@ -672,7 +685,9 @@ function setMode(nextMode: Mode) {
     resetImageState();
   }
   if (nextMode !== "video") {
-    resetVideoState();
+    stopVideoJobPolling();
+  } else {
+    restoreVideoTask();
   }
 }
 
@@ -786,6 +801,7 @@ async function handleVideoFileChange(event: Event) {
 
   try {
     const { data } = await createPlateVideoJobApi(file);
+    window.localStorage.setItem(PLATE_VIDEO_TASK_STORAGE_KEY, data.job_id);
     videoJob.value = {
       job_id: data.job_id,
       source_filename: file.name,
@@ -806,6 +822,30 @@ async function handleVideoFileChange(event: Event) {
     requestError.value = extractErrorMessage(error, "视频识别失败，请确认视频格式可读取并稍后重试。");
   } finally {
     input.value = "";
+  }
+}
+
+function restoreVideoTask() {
+  const jobId = window.localStorage.getItem(PLATE_VIDEO_TASK_STORAGE_KEY);
+  if (!jobId) return;
+  activeVideoJobId = jobId;
+  isLoading.value = true;
+  loadingText.value = "正在恢复后台视频识别任务...";
+  void refreshVideoJobStatus(jobId).then(() => {
+    if (!videoResult.value && isVideoTaskActive.value) startVideoJobPolling(jobId);
+  }).catch(() => {
+    window.localStorage.removeItem(PLATE_VIDEO_TASK_STORAGE_KEY);
+  });
+}
+
+async function cancelVideoTask() {
+  if (!activeVideoJobId || !isVideoTaskActive.value) return;
+  try {
+    const { data } = await cancelPlateVideoJobApi(activeVideoJobId);
+    videoJob.value = data;
+    startVideoJobPolling(activeVideoJobId);
+  } catch (error) {
+    requestError.value = extractErrorMessage(error, "无法终止视频识别任务。");
   }
 }
 
@@ -882,6 +922,10 @@ onMounted(async () => {
   await loadHistory();
   await refreshStreamStatus();
   startStatusPolling();
+  if (window.localStorage.getItem(PLATE_VIDEO_TASK_STORAGE_KEY)) {
+    mode.value = "video";
+    restoreVideoTask();
+  }
 });
 
 watch(keyword, () => {
@@ -922,6 +966,28 @@ onBeforeUnmount(() => {
 <style scoped lang="scss">
 .hidden-input {
   display: none;
+}
+
+.video-task-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent);
+  color: var(--text-soft);
+  background: var(--surface-muted);
+}
+
+.cancel-task-btn {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 6px;
+  color: #fff;
+  background: #b94a48;
+  cursor: pointer;
 }
 
 .page-shell {

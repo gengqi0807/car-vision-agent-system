@@ -78,8 +78,15 @@ class PoliceGestureVideoProgress(BaseModel):
     confidence: float | None = None
     annotated_frame: str | None = None
     playback_url: str | None = None
+    processed_video_url: str | None = None
+    duration_seconds: float | None = None
     events: list[PoliceGestureVideoEvent] = Field(default_factory=list)
     updated_at: datetime
+
+
+class PoliceGestureVideoJobCreateResponse(BaseModel):
+    task_id: str
+    status: str
 
 
 class OwnerGestureResult(BaseModel):

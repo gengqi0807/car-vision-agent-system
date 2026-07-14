@@ -10,6 +10,7 @@ from app.core.config import settings
 from app.schemas.gesture import GestureFrameResult, Keypoint, StreamState
 from app.services.mediamtx_runtime import MediaMTXRuntime
 from app.services.camera_source import open_camera_source
+from app.services.camera_lease import CameraLeaseManager
 from app.services.police_gesture_local_runtime import PoliceGestureVideoSession
 
 
@@ -31,7 +32,12 @@ class PoliceGestureStreamService:
 
     def start(self, source: str = "0", fps: int = 15) -> StreamState:
         self.stop()
-        MediaMTXRuntime.ensure_running()
+        CameraLeaseManager.acquire("交警手势识别")
+        try:
+            MediaMTXRuntime.ensure_running()
+        except Exception:
+            CameraLeaseManager.release("交警手势识别")
+            raise
         with self._lock:
             self._running = True
             self._state = StreamState(
@@ -56,6 +62,7 @@ class PoliceGestureStreamService:
         with self._lock:
             self._thread = None
             self._state = StreamState(running=False)
+            CameraLeaseManager.release("交警手势识别")
             return self._state
 
     def status(self) -> StreamState:
@@ -111,6 +118,7 @@ class PoliceGestureStreamService:
                     ffmpeg.kill()
             with self._lock:
                 self._running = False
+            CameraLeaseManager.release("交警手势识别")
 
     def _start_ffmpeg(self, width: int, height: int, fps: int) -> subprocess.Popen[bytes]:
         command = [

@@ -139,6 +139,7 @@ class VideoProcessingJob:
     playback_url: str | None = None
     error_message: str | None = None
     updated_at: int = 0
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 class PlateService:
@@ -351,6 +352,18 @@ class PlateService:
                 duration_seconds=job.duration_seconds,
                 error_message=job.error_message,
             )
+
+    def cancel_video_job(self, job_id: str) -> PlateVideoJobStatusResponse | None:
+        with self._video_jobs_lock:
+            job = self._video_jobs.get(job_id)
+            if job is None:
+                return None
+            job.cancel_event.set()
+            if job.status not in {"completed", "failed", "cancelled"}:
+                job.status = "cancelling"
+                job.error_message = None
+                job.updated_at = int(time.time() * 1000)
+        return self.get_video_job_status(job_id)
 
     def stream_rtsp(self, rtsp_url: str):
         for frame, detections in self.iter_annotated_stream(rtsp_url):
@@ -601,6 +614,7 @@ class PlateService:
                 job.source_filename,
                 progress_callback=lambda **payload: self._handle_video_job_progress(job_id, **payload),
                 preview_callback=preview_publisher.submit if preview_enabled else None,
+                stop_event=job.cancel_event,
             )
             self._update_video_job(
                 job_id,
@@ -611,6 +625,13 @@ class PlateService:
                 unread_samples=result.unread_samples,
                 duration_seconds=result.duration_seconds,
                 processed_video_url=result.processed_video_url,
+            )
+        except InterruptedError:
+            logger.info("Plate video job cancelled: %s", job_id)
+            self._update_video_job(
+                job_id,
+                status="cancelled",
+                error_message=None,
             )
         except Exception as exc:
             logger.exception("Video job failed: %s", job_id)
@@ -726,6 +747,7 @@ class PlateService:
         filename: str,
         progress_callback=None,
         preview_callback=None,
+        stop_event: threading.Event | None = None,
     ) -> PlateVideoRecognitionResponse:
         cv2 = self._require_cv2()
         capture, pending_frame = self._open_local_video_capture(source_path)
@@ -774,6 +796,8 @@ class PlateService:
 
         try:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError("视频识别已由用户终止。")
                 if pending_frame is not None:
                     source_frame = pending_frame
                     pending_frame = None

@@ -93,6 +93,9 @@ export function createPlateVideoJobApi(file: File) {
 export const fetchPlateVideoJobStatusApi = (jobId: string) =>
   request.get<PlateVideoJobStatusResponse>(`/plate/video/jobs/${jobId}`);
 
+export const cancelPlateVideoJobApi = (jobId: string) =>
+  request.post<PlateVideoJobStatusResponse>(`/plate/video/jobs/${jobId}/cancel`);
+
 export function startPlatePushStreamApi(rtspUrl: string, streamName?: string, processFrames = true) {
   return request.post<PlateStreamControlResponse>("/plate/stream/start", {
     rtsp_url: rtspUrl,

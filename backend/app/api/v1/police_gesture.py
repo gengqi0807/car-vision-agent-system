@@ -11,6 +11,7 @@ from app.models.user import User
 from app.schemas.gesture import (
     GestureFrameResult,
     GestureHistoryItem,
+    PoliceGestureVideoJobCreateResponse,
     PoliceGestureVideoProgress,
     PoliceGestureVideoResult,
     StreamControlRequest,
@@ -69,6 +70,36 @@ async def current_police_gesture(
     except Exception as exc:
         logger.exception("Police gesture image recognition failed for %s", file.filename or "upload.jpg")
         raise HTTPException(status_code=500, detail=f"交警手势图片识别失败：{exc}") from exc
+
+
+@router.post(
+    "/video/jobs",
+    response_model=PoliceGestureVideoJobCreateResponse,
+    summary="创建交警手势视频后台识别任务",
+)
+async def create_police_gesture_video_job(
+    file: UploadFile = File(...),
+    task_id: str | None = Form(default=None),
+    current_user: User = Depends(get_current_user),
+) -> PoliceGestureVideoJobCreateResponse:
+    video_bytes = await file.read()
+    try:
+        return service.start_video_job(
+            video_bytes,
+            file.filename or "upload.mp4",
+            current_user.id,
+            task_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/video/jobs/{task_id}/cancel", response_model=PoliceGestureVideoProgress)
+async def cancel_police_gesture_video_job(
+    task_id: str,
+    _current_user: User = Depends(get_current_user),
+) -> PoliceGestureVideoProgress:
+    return service.cancel_video_job(task_id)
 
 
 @router.post(

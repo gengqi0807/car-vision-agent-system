@@ -53,6 +53,11 @@
           <div class="sub">处理完成后会生成标注视频并保留识别结果</div>
         </label>
 
+        <div v-if="mode === 'video' && isVideoTaskActive" class="video-task-actions">
+          <span>{{ videoProgress?.message || "视频识别正在后台运行" }}</span>
+          <button type="button" class="mode-btn cancel-task-btn" @click="cancelVideoTask">终止识别</button>
+        </div>
+
         <div class="video-status" v-if="error">
           <span class="off">{{ error }}</span>
         </div>
@@ -153,11 +158,12 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import {
+  cancelPoliceGestureVideoJobApi,
+  createPoliceGestureVideoJobApi,
   fetchPoliceGestureHistoryApi,
   fetchPoliceGestureStreamResultApi,
   fetchPoliceGestureStreamStateApi,
   fetchPoliceGestureVideoProgressApi,
-  recognizePoliceGestureVideoApi,
   startPoliceGestureStreamApi,
   stopPoliceGestureStreamApi,
   type PoliceGestureFrameResult,
@@ -212,6 +218,11 @@ const previewStreamUrl = computed(() => {
 });
 const videoEvents = computed(() => videoProgress.value?.events ?? []);
 const videoPreviewStarted = ref(false);
+const videoTaskCreated = ref(false);
+const POLICE_VIDEO_TASK_STORAGE_KEY = "police-gesture-active-video-task";
+const isVideoTaskActive = computed(() =>
+  ["uploading", "queued", "preparing", "processing", "transcoding", "cancelling"].includes(videoProgress.value?.status ?? "")
+);
 const cameraStatusText = computed(() => {
   if (!cameraActive.value) return "摄像头未开启";
   if (loading.value) return "实时识别中 ... 正在等待后端返回结果";
@@ -237,8 +248,9 @@ function setMode(nextMode: Mode) {
     cameraResult.value = null;
   }
   if (nextMode !== "video") {
-    videoProgress.value = null;
-    videoResult.value = null;
+    stopVideoProgressPolling();
+  } else {
+    restoreVideoTask();
   }
 }
 
@@ -259,6 +271,7 @@ async function onVideoFileChange(event: Event) {
   videoResult.value = null;
   error.value = "";
   loading.value = true;
+  videoTaskCreated.value = false;
   stopVideoProgressPolling();
   videoPreviewStarted.value = false;
 
@@ -282,25 +295,16 @@ async function onVideoFileChange(event: Event) {
   try {
     const formData = new FormData();
     formData.append("file", file);
-    const { data } = await recognizePoliceGestureVideoApi(formData, taskId);
-    videoResult.value = data;
-    videoProgress.value = {
-      task_id: data.task_id ?? taskId,
-      source_filename: data.source_filename,
-      status: "completed",
-      progress: 1,
-      message: "视频识别完成，标注视频已生成。",
-      processed_frame_count: data.processed_frame_count,
-      total_frames: videoProgress.value?.total_frames ?? null,
-      gesture: data.gesture,
-      confidence: data.confidence,
-      annotated_frame: null,
-      events: videoProgress.value?.events ?? [],
-      updated_at: data.updated_at
-    };
-    stopVideoProgressPolling();
-    await loadHistory();
+    await createPoliceGestureVideoJobApi(formData, taskId);
+    videoTaskCreated.value = true;
+    window.localStorage.setItem(POLICE_VIDEO_TASK_STORAGE_KEY, taskId);
+    if (videoProgress.value) {
+      videoProgress.value.status = "queued";
+      videoProgress.value.message = "视频已上传，后台识别任务已创建。";
+    }
+    startVideoProgressPolling(taskId);
   } catch (err) {
+    window.localStorage.removeItem(POLICE_VIDEO_TASK_STORAGE_KEY);
     videoResult.value = null;
     stopVideoProgressPolling();
     videoProgress.value = {
@@ -328,6 +332,13 @@ async function pollVideoProgress(taskId: string) {
   try {
     const { data } = await fetchPoliceGestureVideoProgressApi(taskId);
     if (data.status === "missing") {
+      if (videoTaskCreated.value) {
+        window.localStorage.removeItem(POLICE_VIDEO_TASK_STORAGE_KEY);
+        loading.value = false;
+        error.value = "之前的视频识别任务已失效，请重新上传视频。";
+        stopVideoProgressPolling();
+        return;
+      }
       if (loading.value) {
         videoProgress.value = {
           task_id: taskId,
@@ -352,7 +363,29 @@ async function pollVideoProgress(taskId: string) {
     }
 
     videoProgress.value = data;
-    if (data.status === "completed" || data.status === "failed") {
+    if (data.status === "completed") {
+      window.localStorage.removeItem(POLICE_VIDEO_TASK_STORAGE_KEY);
+      if (data.processed_video_url) {
+        videoResult.value = {
+          source_filename: data.source_filename,
+          gesture: data.gesture ?? "no_gesture",
+          confidence: data.confidence ?? 0,
+          keypoints: [],
+          task_id: data.task_id,
+          processed_video_url: data.processed_video_url,
+          processed_frame_count: data.processed_frame_count,
+          duration_seconds: data.duration_seconds ?? null,
+          updated_at: data.updated_at
+        };
+      }
+      loading.value = false;
+      stopVideoProgressPolling();
+      await loadHistory();
+      return;
+    }
+    if (data.status === "failed" || data.status === "cancelled") {
+      window.localStorage.removeItem(POLICE_VIDEO_TASK_STORAGE_KEY);
+      loading.value = false;
       stopVideoProgressPolling();
       return;
     }
@@ -396,6 +429,26 @@ function scheduleNextVideoProgressPoll(taskId: string, afterFailure = false) {
 
 function handleVideoPreviewLoad() {
   videoPreviewStarted.value = true;
+}
+
+function restoreVideoTask() {
+  const taskId = window.localStorage.getItem(POLICE_VIDEO_TASK_STORAGE_KEY);
+  if (!taskId) return;
+  videoTaskCreated.value = true;
+  loading.value = true;
+  startVideoProgressPolling(taskId);
+}
+
+async function cancelVideoTask() {
+  const taskId = videoProgress.value?.task_id;
+  if (!taskId || !isVideoTaskActive.value) return;
+  try {
+    const { data } = await cancelPoliceGestureVideoJobApi(taskId);
+    videoProgress.value = data;
+    startVideoProgressPolling(taskId);
+  } catch (err) {
+    error.value = extractErrorMessage(err, "无法终止视频识别任务");
+  }
 }
 
 function extractErrorMessage(error: unknown, fallback: string) {
@@ -541,10 +594,24 @@ async function waitForStreamPublished(playbackUrl: string) {
 
 onMounted(async () => {
   await loadHistory();
+  if (window.localStorage.getItem(POLICE_VIDEO_TASK_STORAGE_KEY)) {
+    mode.value = "video";
+    restoreVideoTask();
+  }
+  try {
+    const { data } = await fetchPoliceGestureStreamStateApi();
+    if (data.running && data.playback_url) {
+      cameraActive.value = true;
+      cameraPlaybackUrl.value = `${data.playback_url}?t=${Date.now()}`;
+      startStreamResultPolling();
+    }
+  } catch {
+    // Keep the camera controls idle when no previous stream exists.
+  }
 });
 
 onBeforeUnmount(() => {
-  stopCamera();
+  stopStreamResultPolling();
   stopVideoProgressPolling();
 });
 </script>
@@ -568,6 +635,24 @@ onBeforeUnmount(() => {
 
 .hidden-video {
   display: none;
+}
+
+.video-task-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 42px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent);
+  color: var(--text-soft);
+  background: var(--surface-muted);
+}
+
+.cancel-task-btn {
+  flex: 0 0 auto;
+  color: #fff;
+  background: #b94a48;
 }
 
 .compact-header :deep(h1) {

@@ -589,7 +589,14 @@ class OwnerGestureService:
         )
 
     def start(self, source: str, fps: int = 15) -> StreamState:
-        self._ensure_mediamtx_running()
+        from app.services.camera_lease import CameraLeaseManager
+
+        CameraLeaseManager.acquire("车内手势识别")
+        try:
+            self._ensure_mediamtx_running()
+        except Exception:
+            CameraLeaseManager.release("车内手势识别")
+            raise
         with self._stream_lock:
             if self._stream_running:
                 return self._stream_state
@@ -627,6 +634,8 @@ class OwnerGestureService:
             return self._stream_state
 
     def stop(self) -> StreamState:
+        from app.services.camera_lease import CameraLeaseManager
+
         with self._stream_lock:
             self._stream_running = False
 
@@ -637,6 +646,7 @@ class OwnerGestureService:
             self._stream_state = StreamState(running=False)
             with self._frame_condition:
                 self._frame_condition.notify_all()
+            CameraLeaseManager.release("车内手势识别")
             return self._stream_state
 
     def mjpeg_frames(self):
@@ -894,6 +904,8 @@ class OwnerGestureService:
             with self._stream_lock:
                 self._stream_running = False
                 self._stream_state = self._stream_state.model_copy(update={"running": False, "published": False})
+            from app.services.camera_lease import CameraLeaseManager
+            CameraLeaseManager.release("车内手势识别")
             with self._frame_condition:
                 self._frame_condition.notify_all()
 

@@ -96,6 +96,14 @@ async def get_plate_video_job_status(request: Request, job_id: str) -> PlateVide
     return _absolutize_video_job_response(request, response)
 
 
+@router.post("/video/jobs/{job_id}/cancel", response_model=PlateVideoJobStatusResponse)
+async def cancel_plate_video_job(request: Request, job_id: str) -> PlateVideoJobStatusResponse:
+    response = service.cancel_video_job(job_id)
+    if response is None:
+        raise HTTPException(status_code=404, detail="Video job not found.")
+    return _absolutize_video_job_response(request, response)
+
+
 @router.post("/stream/start", response_model=PlateStreamControlResponse)
 async def start_plate_stream(payload: PlateStreamStartRequest) -> PlateStreamControlResponse:
     try:

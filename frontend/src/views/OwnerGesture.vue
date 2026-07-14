@@ -7,7 +7,7 @@
 
     <section class="two-col">
       <article class="panel">
-        <div class="upload-row">
+        <div class="upload-row" :class="{ 'camera-upload-row': inputMode === 'camera' }">
           <div class="mode-switch">
             <button
               class="mode-chip"
@@ -82,7 +82,7 @@
             />
           </template>
 
-          <span class="file-name">{{ inputStatusText }}</span>
+          <span class="file-name input-status-line">{{ inputStatusText }}</span>
         </div>
 
         <div class="video-status" v-if="error">
@@ -1325,15 +1325,26 @@ function handleViewportResize() {
   return;
 }
 
-onMounted(() => {
+onMounted(async () => {
   window.addEventListener("resize", handleViewportResize);
   uiClockTimer = window.setInterval(() => {
     uiNow.value = Date.now();
   }, 1000);
+  try {
+    const { data } = await fetchOwnerGestureStreamStateApi();
+    if (data.running && data.playback_url) {
+      cameraActive.value = true;
+      cameraDeviceLabel.value = `摄像头 ${data.source}`;
+      streamVideoUrl.value = `${data.playback_url}?t=${Date.now()}`;
+      startStreamResultPolling();
+    }
+  } catch {
+    // Keep the camera controls idle when no previous stream exists.
+  }
 });
 
 onBeforeUnmount(() => {
-  stopCamera();
+  stopStreamResultPolling();
   revokeSourcePreview();
   window.removeEventListener("resize", handleViewportResize);
   if (uiClockTimer !== null) {
@@ -1360,6 +1371,12 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 14px;
+  min-width: 0;
+}
+
+.camera-upload-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
 }
 
 .camera-source-control {
@@ -1388,11 +1405,36 @@ onBeforeUnmount(() => {
 }
 
 .camera-controls {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 8px;
-  flex: 0 0 auto;
   flex-wrap: nowrap;
+  min-width: 0;
+  justify-content: flex-start;
+}
+
+.camera-controls .control-button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.input-status-line {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+@media (max-width: 760px) {
+  .camera-upload-row {
+    grid-template-columns: 1fr;
+  }
+
+  .camera-controls {
+    flex-wrap: wrap;
+  }
+
+  .input-status-line {
+    grid-column: 1;
+  }
 }
 
 .mode-switch {

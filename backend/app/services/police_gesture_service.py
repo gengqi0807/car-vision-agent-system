@@ -30,6 +30,7 @@ from app.schemas.gesture import (
     GestureHistoryItem,
     Keypoint,
     PoliceGestureVideoEvent,
+    PoliceGestureVideoJobCreateResponse,
     PoliceGestureVideoProgress,
     PoliceGestureVideoResult,
 )
@@ -100,6 +101,7 @@ class PoliceGestureService:
     _video_progress: dict[str, PoliceGestureVideoProgress] = {}
     _preview_condition = threading.Condition()
     _video_preview_frames: dict[str, deque[bytes]] = {}
+    _video_cancel_events: dict[str, threading.Event] = {}
     _unrecognized_behavior_window_seconds = 30
     _video_event_min_gap_multiplier = 3
 
@@ -257,6 +259,7 @@ class PoliceGestureService:
         filename: str,
         user_id: int | None,
         task_id: str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> PoliceGestureVideoResult:
         if not video_bytes:
             raise ValueError("Uploaded video is empty.")
@@ -350,6 +353,8 @@ class PoliceGestureService:
 
             with self._runtime.create_video_session() as session:
                 while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise InterruptedError("视频识别已由用户终止。")
                     ok, current_frame = capture.read()
                     if not ok or current_frame is None:
                         break
@@ -504,13 +509,16 @@ class PoliceGestureService:
                 total_frames=total_frames if total_frames > 0 else None,
                 gesture=response.gesture,
                 confidence=response.confidence,
+                processed_video_url=response.processed_video_url,
+                duration_seconds=response.duration_seconds,
             )
             return response
         except Exception as exc:
+            cancelled = isinstance(exc, InterruptedError)
             self._set_video_progress(
                 resolved_task_id,
                 source_filename=filename,
-                status="failed",
+                status="cancelled" if cancelled else "failed",
                 progress=1.0,
                 message=str(exc),
                 processed_frame_count=processed_frame_count,
@@ -530,6 +538,61 @@ class PoliceGestureService:
                     source_path.unlink(missing_ok=True)
                 except Exception:
                     logger.warning("Failed to remove temporary uploaded police video: %s", source_path)
+
+    def start_video_job(
+        self,
+        video_bytes: bytes,
+        filename: str,
+        user_id: int | None,
+        task_id: str | None = None,
+    ) -> PoliceGestureVideoJobCreateResponse:
+        if not video_bytes:
+            raise ValueError("Uploaded video is empty.")
+        resolved_task_id = task_id or uuid4().hex
+        cancel_event = threading.Event()
+        with self._progress_lock:
+            current = self._video_progress.get(resolved_task_id)
+            if current is not None and current.status not in {"completed", "failed", "cancelled", "missing"}:
+                raise ValueError("该视频任务正在处理中。")
+            self._video_cancel_events[resolved_task_id] = cancel_event
+
+        def worker() -> None:
+            try:
+                self.process_video_bytes(
+                    video_bytes,
+                    filename,
+                    user_id,
+                    resolved_task_id,
+                    cancel_event,
+                )
+            except InterruptedError:
+                logger.info("Police gesture video job cancelled: %s", resolved_task_id)
+            except Exception:
+                logger.exception("Police gesture video job failed: %s", resolved_task_id)
+            finally:
+                with self._progress_lock:
+                    self._video_cancel_events.pop(resolved_task_id, None)
+
+        threading.Thread(target=worker, daemon=True, name=f"police-video-{resolved_task_id[:8]}").start()
+        return PoliceGestureVideoJobCreateResponse(task_id=resolved_task_id, status="queued")
+
+    def cancel_video_job(self, task_id: str) -> PoliceGestureVideoProgress:
+        with self._progress_lock:
+            cancel_event = self._video_cancel_events.get(task_id)
+            progress = self._video_progress.get(task_id)
+            if cancel_event is not None:
+                cancel_event.set()
+            if progress is None:
+                return PoliceGestureVideoProgress(
+                    task_id=task_id,
+                    status="missing",
+                    message="未找到对应的视频识别任务。",
+                    updated_at=datetime.utcnow(),
+                )
+            if progress.status not in {"completed", "failed", "cancelled"}:
+                progress = progress.model_copy(update={"status": "cancelling", "message": "正在终止视频识别..."})
+                self._video_progress[task_id] = progress
+            return progress.model_copy(deep=True)
 
     def history(self, user_id: int | None = None) -> list[GestureHistoryItem]:
         try:
@@ -953,6 +1016,8 @@ class PoliceGestureService:
         confidence: float | None = None,
         annotated_frame: str | None = None,
         playback_url: str | None = None,
+        processed_video_url: str | None = None,
+        duration_seconds: float | None = None,
     ) -> None:
         with self._progress_lock:
             current = self._video_progress.get(task_id)
@@ -968,6 +1033,10 @@ class PoliceGestureService:
                 confidence=confidence,
                 annotated_frame=annotated_frame,
                 playback_url=playback_url if playback_url is not None else (current.playback_url if current else None),
+                processed_video_url=(
+                    processed_video_url if processed_video_url is not None else (current.processed_video_url if current else None)
+                ),
+                duration_seconds=(duration_seconds if duration_seconds is not None else (current.duration_seconds if current else None)),
                 events=list(current.events) if current is not None else [],
                 updated_at=datetime.utcnow(),
             )
