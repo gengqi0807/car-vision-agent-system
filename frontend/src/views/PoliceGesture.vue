@@ -16,6 +16,24 @@
         </div>
 
         <div v-if="mode === 'camera'" class="camera-actions">
+          <label class="camera-source-control">
+            <span>摄像头</span>
+            <select v-model="cameraSourceChoice" :disabled="cameraActive">
+              <option value="0">摄像头 0</option>
+              <option value="1">摄像头 1</option>
+              <option value="2">摄像头 2</option>
+              <option value="3">摄像头 3</option>
+              <option value="custom">其他</option>
+            </select>
+            <input
+              v-if="cameraSourceChoice === 'custom'"
+              v-model.number="customCameraSource"
+              type="number"
+              min="0"
+              step="1"
+              :disabled="cameraActive"
+            />
+          </label>
           <button type="button" class="mode-btn action-btn" :disabled="cameraActive" @click="startCamera">
             开启摄像头
           </button>
@@ -159,6 +177,8 @@ const videoProgress = ref<PoliceGestureVideoProgress | null>(null);
 const historyItems = ref<PoliceGestureHistoryItem[]>([]);
 
 const cameraActive = ref(false);
+const cameraSourceChoice = ref("0");
+const customCameraSource = ref(4);
 const cameraPlaybackUrl = ref("");
 let streamResultTimer: number | null = null;
 
@@ -459,7 +479,11 @@ async function startCamera() {
   cameraResult.value = null;
   try {
     await stopPoliceGestureStreamApi().catch(() => undefined);
-    const { data } = await startPoliceGestureStreamApi("auto", 15);
+    const cameraSource = cameraSourceChoice.value === "custom" ? customCameraSource.value : cameraSourceChoice.value;
+    if (!Number.isInteger(Number(cameraSource)) || Number(cameraSource) < 0) {
+      throw new Error("请选择有效的摄像头编号");
+    }
+    const { data } = await startPoliceGestureStreamApi(String(cameraSource), 15);
     if (!data.playback_url) throw new Error("后端未返回 MediaMTX 播放地址");
     cameraActive.value = true;
     startStreamResultPolling();
@@ -573,6 +597,32 @@ onBeforeUnmount(() => {
 .camera-actions {
   padding-top: 0;
   background: transparent;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.camera-source-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted-soft);
+  font-size: 13px;
+}
+
+.camera-source-control select,
+.camera-source-control input {
+  height: 38px;
+  min-width: 112px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-muted);
+}
+
+.camera-source-control input {
+  width: 84px;
+  min-width: 84px;
 }
 
 .mode-btn {

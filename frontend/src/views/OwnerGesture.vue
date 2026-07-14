@@ -28,17 +28,37 @@
           </div>
 
           <template v-if="inputMode === 'camera'">
-            <button class="btn-video control-button" type="button" :disabled="cameraActive" @click="startCamera">
-              开启摄像头
-            </button>
-            <button
-              class="btn-video control-button secondary-button"
-              type="button"
-              :disabled="!cameraActive"
-              @click="stopCamera"
-            >
-              停止识别
-            </button>
+            <div class="camera-controls">
+              <label class="camera-source-control">
+                <span>摄像头</span>
+                <select v-model="cameraSourceChoice" :disabled="cameraActive">
+                  <option value="0">摄像头 0</option>
+                  <option value="1">摄像头 1</option>
+                  <option value="2">摄像头 2</option>
+                  <option value="3">摄像头 3</option>
+                  <option value="custom">其他</option>
+                </select>
+                <input
+                  v-if="cameraSourceChoice === 'custom'"
+                  v-model.number="customCameraSource"
+                  type="number"
+                  min="0"
+                  step="1"
+                  :disabled="cameraActive"
+                />
+              </label>
+              <button class="btn-video control-button" type="button" :disabled="cameraActive" @click="startCamera">
+                开启摄像头
+              </button>
+              <button
+                class="btn-video control-button secondary-button"
+                type="button"
+                :disabled="!cameraActive"
+                @click="stopCamera"
+              >
+                停止识别
+              </button>
+            </div>
           </template>
 
           <template v-else>
@@ -322,6 +342,8 @@ const videoRef = ref<HTMLVideoElement | null>(null);
 const captureCanvasRef = ref<HTMLCanvasElement | null>(null);
 const panelState = ref<OwnerControlPanelState>(createDefaultPanelState());
 const cameraActive = ref(false);
+const cameraSourceChoice = ref("0");
+const customCameraSource = ref(4);
 const streamVideoUrl = ref("");
 const sessionId = ref("");
 const cameraDeviceLabel = ref("");
@@ -715,9 +737,13 @@ async function startCamera() {
 
   try {
     await stopOwnerGestureStreamApi().catch(() => undefined);
-    const { data } = await startOwnerGestureStreamApi("auto", 15);
+    const cameraSource = cameraSourceChoice.value === "custom" ? customCameraSource.value : cameraSourceChoice.value;
+    if (!Number.isInteger(Number(cameraSource)) || Number(cameraSource) < 0) {
+      throw new Error("请选择有效的摄像头编号");
+    }
+    const { data } = await startOwnerGestureStreamApi(String(cameraSource), 15);
     if (!data.playback_url) throw new Error("后端未返回 MediaMTX 播放地址");
-    cameraDeviceLabel.value = "正在自动选择摄像头";
+    cameraDeviceLabel.value = `正在打开摄像头 ${cameraSource}`;
     cameraActive.value = true;
     streamStarting = true;
     startStreamResultPolling();
@@ -1334,6 +1360,39 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 14px;
+}
+
+.camera-source-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  color: var(--muted-soft);
+  font-size: 13px;
+}
+
+.camera-source-control select,
+.camera-source-control input {
+  height: 36px;
+  min-width: 112px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-muted);
+}
+
+.camera-source-control input {
+  width: 84px;
+  min-width: 84px;
+}
+
+.camera-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
 }
 
 .mode-switch {

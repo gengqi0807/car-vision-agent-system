@@ -8,8 +8,9 @@ from app.core.config import settings
 def open_camera_source(source: str) -> tuple[cv2.VideoCapture, str]:
     normalized = str(source or "").strip()
     if normalized.lower() not in {"", "auto", "default"}:
-        resolved: str | int = int(normalized) if normalized.isdigit() else normalized
-        return cv2.VideoCapture(resolved), normalized
+        if normalized.isdigit():
+            return cv2.VideoCapture(int(normalized), cv2.CAP_DSHOW), normalized
+        return cv2.VideoCapture(normalized), normalized
 
     tried: set[int] = set()
     for index in (settings.external_camera_index, settings.local_camera_index):
