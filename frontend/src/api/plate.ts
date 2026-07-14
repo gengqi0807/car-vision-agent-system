@@ -56,7 +56,9 @@ export interface PlateStreamControlResponse {
   phase?: string;
   status_message?: string | null;
   process_frames?: boolean;
+  source_type?: "rtsp" | "camera";
   rtsp_url?: string | null;
+  camera_index?: number | null;
   stream_name?: string | null;
   publish_rtsp_url?: string | null;
   playback_url?: string | null;
@@ -93,11 +95,19 @@ export function createPlateVideoJobApi(file: File) {
 export const fetchPlateVideoJobStatusApi = (jobId: string) =>
   request.get<PlateVideoJobStatusResponse>(`/plate/video/jobs/${jobId}`);
 
-export function startPlatePushStreamApi(rtspUrl: string, streamName?: string, processFrames = true) {
+export function startPlatePushStreamApi(payload: {
+  sourceType?: "rtsp" | "camera";
+  rtspUrl?: string;
+  cameraIndex?: number;
+  streamName?: string;
+  processFrames?: boolean;
+}) {
   return request.post<PlateStreamControlResponse>("/plate/stream/start", {
-    rtsp_url: rtspUrl,
-    stream_name: streamName,
-    process_frames: processFrames
+    source_type: payload.sourceType ?? "rtsp",
+    rtsp_url: payload.rtspUrl,
+    camera_index: payload.cameraIndex,
+    stream_name: payload.streamName,
+    process_frames: payload.processFrames ?? true
   });
 }
 

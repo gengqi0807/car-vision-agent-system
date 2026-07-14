@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 from datetime import datetime
-import re
 import subprocess
 import threading
 import time
+import re
 from urllib.parse import urlparse
 
 from app.core.config import settings
@@ -21,7 +21,9 @@ class PlatePushState:
     published: bool = False
     publisher_started: bool = False
     process_frames: bool = True
+    source_type: str = "rtsp"
     rtsp_url: str | None = None
+    camera_index: int | None = None
     stream_name: str | None = None
     publish_rtsp_url: str | None = None
     playback_url: str | None = None
@@ -44,49 +46,92 @@ class PlatePushService:
         stream_name: str | None = None,
         process_frames: bool = True,
     ) -> PlateStreamControlResponse:
-        rtsp_url = rtsp_url.strip()
+        return self._start_source(
+            source_type="rtsp",
+            rtsp_url=rtsp_url.strip(),
+            camera_index=None,
+            stream_name=stream_name,
+            process_frames=process_frames,
+        )
 
+    def start_camera(
+        self,
+        camera_index: int,
+        stream_name: str | None = None,
+        process_frames: bool = True,
+    ) -> PlateStreamControlResponse:
+        return self._start_source(
+            source_type="camera",
+            rtsp_url=None,
+            camera_index=camera_index,
+            stream_name=stream_name,
+            process_frames=process_frames,
+        )
+
+    def _start_source(
+        self,
+        *,
+        source_type: str,
+        rtsp_url: str | None,
+        camera_index: int | None,
+        stream_name: str | None,
+        process_frames: bool,
+    ) -> PlateStreamControlResponse:
         with self._lock:
-            stream_name = self._resolve_stream_name(rtsp_url, stream_name)
-            if not stream_name:
-                raise InferenceConfigurationError("Stream name cannot be empty.")
-
+            resolved_stream_name = self._resolve_stream_name(
+                source_type=source_type,
+                rtsp_url=rtsp_url,
+                camera_index=camera_index,
+                stream_name=stream_name,
+            )
             if self._state.running:
                 if (
-                    self._state.rtsp_url == rtsp_url
-                    and self._state.stream_name == stream_name
+                    self._state.source_type == source_type
+                    and self._state.rtsp_url == rtsp_url
+                    and self._state.camera_index == camera_index
+                    and self._state.stream_name == resolved_stream_name
                     and self._state.process_frames == process_frames
                 ):
                     return self._to_response()
-
                 self._stop_event.set()
 
         with self._lock:
             self._stop_event = threading.Event()
             self._worker_token += 1
             worker_token = self._worker_token
+            publish_rtsp_url = self._build_publish_rtsp_url(resolved_stream_name)
             self._state = PlatePushState(
                 running=True,
                 published=False,
                 publisher_started=False,
                 process_frames=process_frames,
+                source_type=source_type,
                 rtsp_url=rtsp_url,
-                stream_name=stream_name,
-                publish_rtsp_url=self._build_publish_rtsp_url(stream_name),
-                playback_url=self._build_playback_url(stream_name),
+                camera_index=camera_index,
+                stream_name=resolved_stream_name,
+                publish_rtsp_url=publish_rtsp_url,
+                playback_url=self._build_playback_url(resolved_stream_name),
                 last_error=None,
                 started_at=datetime.utcnow(),
             )
             self._worker = threading.Thread(
                 target=self._run_worker,
-                args=(rtsp_url, stream_name, process_frames, self._stop_event, worker_token),
+                args=(
+                    source_type,
+                    rtsp_url,
+                    camera_index,
+                    resolved_stream_name,
+                    process_frames,
+                    self._stop_event,
+                    worker_token,
+                ),
                 daemon=True,
             )
             self._worker.start()
             logger.info(
                 "Started plate push worker for %s -> %s | process_frames=%s",
-                rtsp_url,
-                self._state.publish_rtsp_url,
+                self._describe_source(source_type=source_type, rtsp_url=rtsp_url, camera_index=camera_index),
+                publish_rtsp_url,
                 process_frames,
             )
             return self._to_response()
@@ -126,20 +171,40 @@ class PlatePushService:
 
     def _run_worker(
         self,
-        rtsp_url: str,
+        source_type: str,
+        rtsp_url: str | None,
+        camera_index: int | None,
         stream_name: str,
         process_frames: bool,
         stop_event: threading.Event,
         worker_token: int,
     ) -> None:
         if process_frames:
-            self._run_processed_worker(rtsp_url, stream_name, stop_event, worker_token)
-        else:
-            self._run_passthrough_worker(rtsp_url, stream_name, stop_event, worker_token)
+            self._run_processed_worker(
+                source_type=source_type,
+                rtsp_url=rtsp_url,
+                camera_index=camera_index,
+                stream_name=stream_name,
+                stop_event=stop_event,
+                worker_token=worker_token,
+            )
+            return
+
+        self._run_passthrough_worker(
+            source_type=source_type,
+            rtsp_url=rtsp_url,
+            camera_index=camera_index,
+            stream_name=stream_name,
+            stop_event=stop_event,
+            worker_token=worker_token,
+        )
 
     def _run_processed_worker(
         self,
-        rtsp_url: str,
+        *,
+        source_type: str,
+        rtsp_url: str | None,
+        camera_index: int | None,
         stream_name: str,
         stop_event: threading.Event,
         worker_token: int,
@@ -148,7 +213,12 @@ class PlatePushService:
         first_frame_written = False
         try:
             publish_url = self._build_publish_rtsp_url(stream_name)
-            for frame, _ in self._plate_service.iter_annotated_stream(rtsp_url, stop_event=stop_event):
+            for frame, _ in self._iter_processed_frames(
+                source_type=source_type,
+                rtsp_url=rtsp_url,
+                camera_index=camera_index,
+                stop_event=stop_event,
+            ):
                 if stop_event.is_set():
                     break
 
@@ -183,25 +253,61 @@ class PlatePushService:
 
     def _run_passthrough_worker(
         self,
-        rtsp_url: str,
+        *,
+        source_type: str,
+        rtsp_url: str | None,
+        camera_index: int | None,
         stream_name: str,
         stop_event: threading.Event,
         worker_token: int,
     ) -> None:
         ffmpeg_process: subprocess.Popen[bytes] | None = None
+        first_frame_written = False
         try:
             publish_url = self._build_publish_rtsp_url(stream_name)
-            ffmpeg_process = self._start_ffmpeg_passthrough(rtsp_url=rtsp_url, publish_url=publish_url)
-            self._mark_publisher_started(publish_url, worker_token)
-            logger.info("Started passthrough publisher for %s -> %s", rtsp_url, publish_url)
+            if source_type == "rtsp":
+                if not rtsp_url:
+                    raise InferenceConfigurationError("RTSP URL is required for passthrough streaming.")
+                ffmpeg_process = self._start_ffmpeg_passthrough(rtsp_url=rtsp_url, publish_url=publish_url)
+                self._mark_publisher_started(publish_url, worker_token)
+                logger.info("Started passthrough publisher for %s -> %s", rtsp_url, publish_url)
 
-            while not stop_event.is_set():
+                while not stop_event.is_set():
+                    if ffmpeg_process.poll() is not None:
+                        stderr_output = self._read_process_error(ffmpeg_process)
+                        raise InferenceConfigurationError(
+                            f"ffmpeg passthrough exited unexpectedly. {stderr_output or 'Check mediamtx, ffmpeg, and the source RTSP URL.'}"
+                        )
+                    time.sleep(0.2)
+                return
+
+            for frame in self._plate_service.iter_camera_frames(
+                self._require_camera_index(camera_index),
+                stop_event=stop_event,
+            ):
+                if stop_event.is_set():
+                    break
+
+                if ffmpeg_process is None:
+                    height, width = frame.shape[:2]
+                    ffmpeg_process = self._start_ffmpeg(width=width, height=height, publish_url=publish_url)
+                    self._mark_publisher_started(publish_url, worker_token)
+
                 if ffmpeg_process.poll() is not None:
                     stderr_output = self._read_process_error(ffmpeg_process)
                     raise InferenceConfigurationError(
-                        f"ffmpeg passthrough exited unexpectedly. {stderr_output or 'Check mediamtx, ffmpeg, and the source RTSP URL.'}"
+                        f"ffmpeg publisher exited unexpectedly. {stderr_output or 'Check mediamtx and the publish URL.'}"
                     )
-                time.sleep(0.2)
+
+                try:
+                    assert ffmpeg_process.stdin is not None
+                    ffmpeg_process.stdin.write(frame.tobytes())
+                    ffmpeg_process.stdin.flush()
+                    if not first_frame_written:
+                        logger.info("First camera frame written to ffmpeg stdin for %s", publish_url)
+                        first_frame_written = True
+                except BrokenPipeError as exc:
+                    raise InferenceConfigurationError("ffmpeg pipe closed while pushing the camera stream.") from exc
         except Exception as exc:
             logger.exception("Plate passthrough worker failed")
             with self._lock:
@@ -384,17 +490,74 @@ class PlatePushService:
     def _build_playback_url(self, stream_name: str) -> str:
         return f"{settings.plate_push_playback_base_url.rstrip('/')}/{stream_name}"
 
-    def _resolve_stream_name(self, rtsp_url: str, stream_name: str | None) -> str:
+    def _iter_processed_frames(
+        self,
+        *,
+        source_type: str,
+        rtsp_url: str | None,
+        camera_index: int | None,
+        stop_event: threading.Event,
+    ):
+        if source_type == "camera":
+            yield from self._plate_service.iter_annotated_camera(
+                self._require_camera_index(camera_index),
+                stop_event=stop_event,
+            )
+            return
+
+        if not rtsp_url:
+            raise InferenceConfigurationError("RTSP URL is required for RTSP stream processing.")
+        yield from self._plate_service.iter_annotated_stream(rtsp_url, stop_event=stop_event)
+
+    def _require_camera_index(self, camera_index: int | None) -> int:
+        if camera_index is None or camera_index < 0:
+            raise InferenceConfigurationError("Camera index must be a non-negative integer.")
+        return camera_index
+
+    def _describe_source(
+        self,
+        *,
+        source_type: str,
+        rtsp_url: str | None,
+        camera_index: int | None,
+    ) -> str:
+        if source_type == "camera":
+            return f"camera:{self._require_camera_index(camera_index)}"
+        return rtsp_url or "rtsp:unknown"
+
+    def _resolve_stream_name(
+        self,
+        *,
+        source_type: str,
+        rtsp_url: str | None,
+        camera_index: int | None,
+        stream_name: str | None,
+    ) -> str:
         candidate = (stream_name or "").strip()
         if not candidate:
-            candidate = self._build_default_stream_name(rtsp_url)
+            candidate = self._build_default_stream_name(
+                source_type=source_type,
+                rtsp_url=rtsp_url,
+                camera_index=camera_index,
+            )
 
         sanitized = re.sub(r"[^A-Za-z0-9_-]+", "-", candidate).strip("-")
         if not sanitized:
             raise InferenceConfigurationError("Invalid stream name. Use letters, numbers, underscores, or hyphens.")
         return sanitized[:64]
 
-    def _build_default_stream_name(self, rtsp_url: str) -> str:
+    def _build_default_stream_name(
+        self,
+        *,
+        source_type: str,
+        rtsp_url: str | None,
+        camera_index: int | None,
+    ) -> str:
+        if source_type == "camera":
+            return f"plate-camera-{self._require_camera_index(camera_index)}"
+
+        if not rtsp_url:
+            return settings.plate_push_stream_name
         try:
             parsed = urlparse(rtsp_url)
             path_parts = [part for part in parsed.path.split("/") if part]
@@ -415,7 +578,9 @@ class PlatePushService:
             phase=phase,
             status_message=status_message,
             process_frames=self._state.process_frames,
+            source_type=self._state.source_type,
             rtsp_url=self._state.rtsp_url,
+            camera_index=self._state.camera_index,
             stream_name=self._state.stream_name,
             publish_rtsp_url=self._state.publish_rtsp_url,
             playback_url=self._state.playback_url,
@@ -424,27 +589,34 @@ class PlatePushService:
         )
 
     def _build_phase_and_message(self) -> tuple[str, str]:
+        source_name = "摄像头" if self._state.source_type == "camera" else "RTSP"
         if self._state.running:
             if self._state.published:
                 return "running", "识别推流中" if self._state.process_frames else "实时直推预览中"
             if self._state.publisher_started:
                 return (
                     "waiting_publish",
-                    "已连接源 RTSP，等待本地播放流发布"
+                    f"已连接{source_name}源，等待本地播放流发布"
                     if self._state.process_frames
-                    else "源 RTSP 已接入，等待本地播放流发布",
+                    else f"{source_name}源已接入，等待本地播放流发布",
                 )
             return (
                 "connecting_source",
-                "正在连接源 RTSP，等待首帧"
+                f"正在连接{source_name}源，等待首帧"
                 if self._state.process_frames
-                else "正在连接源 RTSP，准备直接转发到前端",
+                else f"正在连接{source_name}源，准备直接转发到前端",
             )
 
         if self._state.last_error:
             lower = self._state.last_error.lower()
-            if "failed to open the rtsp stream" in lower or "timeout" in lower or "timed out" in lower:
-                return "source_unavailable", "源 RTSP 未开启、不可达，或当前没有可读视频帧"
+            if (
+                "failed to open the rtsp stream" in lower
+                or "failed to open the camera source" in lower
+                or "camera source has no readable frames" in lower
+                or "timeout" in lower
+                or "timed out" in lower
+            ):
+                return "source_unavailable", f"{source_name}源未开启、不可达，或当前没有可读视频帧"
             return "interrupted", "推流中断"
 
         return "idle", "未启动推流"

@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -54,7 +55,9 @@ class PlateRecordSummary(BaseModel):
 
 
 class PlateStreamStartRequest(BaseModel):
-    rtsp_url: str = Field(min_length=1)
+    source_type: Literal["rtsp", "camera"] = "rtsp"
+    rtsp_url: str | None = Field(default=None, min_length=1)
+    camera_index: int | None = Field(default=None, ge=0)
     stream_name: str | None = Field(default=None, min_length=1)
     process_frames: bool = True
 
@@ -66,7 +69,9 @@ class PlateStreamControlResponse(BaseModel):
     phase: str = "idle"
     status_message: str | None = None
     process_frames: bool = True
+    source_type: Literal["rtsp", "camera"] = "rtsp"
     rtsp_url: str | None = None
+    camera_index: int | None = None
     stream_name: str | None = None
     publish_rtsp_url: str | None = None
     playback_url: str | None = None

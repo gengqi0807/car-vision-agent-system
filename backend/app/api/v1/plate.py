@@ -105,6 +105,14 @@ async def get_plate_video_job_status(request: Request, job_id: str) -> PlateVide
 @router.post("/stream/start", response_model=PlateStreamControlResponse)
 async def start_plate_stream(payload: PlateStreamStartRequest) -> PlateStreamControlResponse:
     try:
+        if payload.source_type == "camera":
+            return push_service.start_camera(
+                camera_index=payload.camera_index if payload.camera_index is not None else 0,
+                stream_name=payload.stream_name,
+                process_frames=payload.process_frames,
+            )
+        if not payload.rtsp_url:
+            raise HTTPException(status_code=400, detail="RTSP URL is required when source_type is 'rtsp'.")
         return push_service.start(
             rtsp_url=payload.rtsp_url,
             stream_name=payload.stream_name,

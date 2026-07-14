@@ -40,20 +40,57 @@
             </span>
           </div>
 
+          <div class="stream-source-tabs">
+            <button
+              type="button"
+              class="mode-btn"
+              :class="{ active: streamSourceType === 'rtsp' }"
+              @click="setStreamSourceType('rtsp')"
+            >
+              沙盘 RTSP
+            </button>
+            <button
+              type="button"
+              class="mode-btn"
+              :class="{ active: streamSourceType === 'camera' }"
+              @click="setStreamSourceType('camera')"
+            >
+              摄像头模式
+            </button>
+          </div>
+
           <div class="video-input-row stream-input-row">
-            <select v-model="selectedPreset" class="stream-select" @change="applyPreset">
+            <select v-if="streamSourceType === 'rtsp'" v-model="selectedPreset" class="stream-select" @change="applyPreset">
               <option value="">选择沙盘摄像头</option>
               <option v-for="item in streamCameraPresets" :key="item.url" :value="item.url">
                 {{ item.label }}
               </option>
             </select>
-            <input v-model="streamInput" type="text" placeholder="输入 RTSP 地址..." />
+            <input v-if="streamSourceType === 'rtsp'" v-model="streamInput" type="text" placeholder="输入 RTSP 地址..." />
+            <select v-if="streamSourceType === 'camera'" v-model="cameraInput" class="stream-select">
+              <option value="0">摄像头 0</option>
+              <option value="1">摄像头 1</option>
+              <option value="2">摄像头 2</option>
+              <option value="3">摄像头 3</option>
+            </select>
+            <input
+              v-if="streamSourceType === 'camera'"
+              v-model="cameraInput"
+              type="number"
+              min="0"
+              step="1"
+              placeholder="输入摄像头编号，如 0 或 1"
+            />
             <div class="stream-actions">
               <button type="button" class="btn-video" :disabled="streamStatus === 'starting'" @click="startStream">
                 {{ streamProcessFrames ? "开启识别并推流" : "开启直接推流" }}
               </button>
               <button type="button" class="btn-video secondary" @click="stopStream">停止</button>
             </div>
+          </div>
+
+          <div v-if="streamSourceType === 'camera'" class="stream-camera-tip">
+            Windows 下通常 `0` 是电脑自带摄像头，`1` 往往是外接 USB 摄像头；如果不对，可以继续试 `2`、`3`。
           </div>
 
           <label class="stream-toggle">
@@ -291,6 +328,8 @@ interface ImageBatchResult {
 const PLATE_MODE_STORAGE_KEY = "plate-recognition-mode";
 const PLATE_STREAM_INPUT_STORAGE_KEY = "plate-stream-input";
 const PLATE_STREAM_PRESET_STORAGE_KEY = "plate-stream-preset";
+const PLATE_STREAM_SOURCE_TYPE_STORAGE_KEY = "plate-stream-source-type";
+const PLATE_STREAM_CAMERA_INPUT_STORAGE_KEY = "plate-stream-camera-input";
 
 function readStoredMode(): Mode {
   if (typeof window === "undefined") {
@@ -305,6 +344,13 @@ function readStoredValue(key: string) {
     return "";
   }
   return window.sessionStorage.getItem(key) ?? "";
+}
+
+function readStoredStreamSourceType(): "rtsp" | "camera" {
+  if (typeof window === "undefined") {
+    return "rtsp";
+  }
+  return window.sessionStorage.getItem(PLATE_STREAM_SOURCE_TYPE_STORAGE_KEY) === "camera" ? "camera" : "rtsp";
 }
 
 const streamPresets = [
@@ -354,8 +400,10 @@ let activeVideoJobId = "";
 
 const historyRecords = ref<PlateRecordSummary[]>([]);
 
+const streamSourceType = ref<"rtsp" | "camera">(readStoredStreamSourceType());
 const selectedPreset = ref(readStoredValue(PLATE_STREAM_PRESET_STORAGE_KEY));
 const streamInput = ref(readStoredValue(PLATE_STREAM_INPUT_STORAGE_KEY));
+const cameraInput = ref(readStoredValue(PLATE_STREAM_CAMERA_INPUT_STORAGE_KEY) || "0");
 const streamProcessFrames = ref(false);
 const streamControl = ref<PlateStreamControlResponse | null>(null);
 const streamStatus = ref<"idle" | "starting" | "running">("idle");
@@ -631,6 +679,15 @@ function buildStreamName(rtspUrl: string) {
   return undefined;
 }
 
+function buildCameraStreamName(cameraIndex: number) {
+  return `plate-camera-${cameraIndex}`;
+}
+
+function setStreamSourceType(nextType: "rtsp" | "camera") {
+  streamSourceType.value = nextType;
+  requestError.value = "";
+}
+
 function boxStyle(item: OverlayDetection) {
   return {
     left: `${item.left}%`,
@@ -813,6 +870,9 @@ function handlePreviewImageLoad() {
 }
 
 function applyPreset() {
+  if (streamSourceType.value !== "rtsp") {
+    return;
+  }
   if (selectedPreset.value) {
     streamInput.value = selectedPreset.value;
   }
@@ -843,6 +903,12 @@ async function refreshStreamStatus() {
     const previousPublished = streamControl.value?.published ?? false;
     const { data } = await fetchPlatePushStreamStatusApi();
     streamControl.value = data;
+    if (data.running || data.publisher_started || data.published) {
+      streamSourceType.value = data.source_type ?? streamSourceType.value;
+    }
+    if ((data.running || data.publisher_started || data.published) && data.source_type === "camera" && typeof data.camera_index === "number") {
+      cameraInput.value = String(data.camera_index);
+    }
     streamStatus.value = data.running ? (data.published ? "running" : "starting") : "idle";
     if (data.running) {
       if (mode.value !== "stream") {
@@ -988,8 +1054,13 @@ async function handleVideoFileChange(event: Event) {
 
 async function startStream() {
   const rtspUrl = streamInput.value.trim();
-  if (!rtspUrl) {
-    requestError.value = "请输入 RTSP 地址。";
+  const parsedCameraIndex = Number.parseInt(cameraInput.value.trim() || "0", 10);
+  if (streamSourceType.value === "rtsp" && !rtspUrl) {
+    requestError.value = "Please enter an RTSP URL.";
+    return;
+  }
+  if (streamSourceType.value === "camera" && (!Number.isFinite(parsedCameraIndex) || parsedCameraIndex < 0)) {
+    requestError.value = "Please enter a non-negative camera index.";
     return;
   }
 
@@ -999,11 +1070,14 @@ async function startStream() {
   streamStatus.value = "starting";
 
   try {
-    const { data } = await startPlatePushStreamApi(
-      rtspUrl,
-      buildStreamName(rtspUrl),
-      streamProcessFrames.value
-    );
+    const { data } = await startPlatePushStreamApi({
+      sourceType: streamSourceType.value,
+      rtspUrl: streamSourceType.value === "rtsp" ? rtspUrl : undefined,
+      cameraIndex: streamSourceType.value === "camera" ? parsedCameraIndex : undefined,
+      streamName:
+        streamSourceType.value === "camera" ? buildCameraStreamName(parsedCameraIndex) : buildStreamName(rtspUrl),
+      processFrames: streamProcessFrames.value
+    });
     streamControl.value = data;
     streamStatus.value = data.running ? (data.published ? "running" : "starting") : "idle";
     playbackRefreshKey.value = Date.now();
@@ -1012,7 +1086,9 @@ async function startStream() {
     streamStatus.value = "idle";
     requestError.value = extractErrorMessage(
       error,
-      "启动推流失败，请确认 mediamtx 已启动、ffmpeg 可用，并检查 RTSP 地址。"
+      streamSourceType.value === "camera"
+        ? "Failed to start the camera stream. Check the camera device, MediaMTX, and ffmpeg."
+        : "Failed to start the RTSP stream. Check MediaMTX, ffmpeg, and the RTSP URL."
     );
   }
 }
@@ -1070,6 +1146,8 @@ function sanitizeUiErrorMessage(message: string, fallback: string) {
   }
   if (
     normalized.includes("failed to open the rtsp stream") ||
+    normalized.includes("failed to open the camera source") ||
+    normalized.includes("camera source has no readable frames") ||
     normalized.includes("describe failed") ||
     normalized.includes("server returned 404") ||
     normalized.includes("404 not found")
@@ -1120,9 +1198,21 @@ watch(selectedPreset, (value) => {
   }
 });
 
+watch(streamSourceType, (value) => {
+  if (typeof window !== "undefined") {
+    window.sessionStorage.setItem(PLATE_STREAM_SOURCE_TYPE_STORAGE_KEY, value);
+  }
+});
+
 watch(streamInput, (value) => {
   if (typeof window !== "undefined") {
     window.sessionStorage.setItem(PLATE_STREAM_INPUT_STORAGE_KEY, value);
+  }
+});
+
+watch(cameraInput, (value) => {
+  if (typeof window !== "undefined") {
+    window.sessionStorage.setItem(PLATE_STREAM_CAMERA_INPUT_STORAGE_KEY, value);
   }
 });
 
@@ -1204,6 +1294,11 @@ onBeforeUnmount(() => {
   padding-bottom: 16px;
 }
 
+.stream-source-tabs {
+  display: flex;
+  gap: 10px;
+}
+
 .stream-topbar,
 .monitor-panel-head,
 .history-head {
@@ -1272,6 +1367,12 @@ onBeforeUnmount(() => {
   margin-bottom: 10px;
   font-size: 13px;
   color: var(--text-soft);
+}
+
+.stream-camera-tip {
+  font-size: 12px;
+  color: var(--text-soft);
+  line-height: 1.5;
 }
 
 .stream-links,

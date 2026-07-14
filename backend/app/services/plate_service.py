@@ -355,6 +355,44 @@ class PlateService:
 
     def iter_annotated_stream(self, rtsp_url: str, stop_event=None):
         capture, pending_frame = self._open_rtsp_capture(rtsp_url)
+        yield from self._iter_live_capture(
+            capture,
+            pending_frame,
+            stop_event=stop_event,
+            source_label=f"rtsp_url={rtsp_url}",
+        )
+
+    def iter_annotated_camera(self, camera_index: int, stop_event=None):
+        capture, pending_frame = self._open_camera_capture(camera_index)
+        yield from self._iter_live_capture(
+            capture,
+            pending_frame,
+            stop_event=stop_event,
+            source_label=f"camera_index={camera_index}",
+        )
+
+    def iter_camera_frames(self, camera_index: int, stop_event=None):
+        capture, pending_frame = self._open_camera_capture(camera_index)
+        internal_stop_event = stop_event if stop_event is not None else threading.Event()
+        try:
+            while True:
+                if internal_stop_event.is_set():
+                    break
+
+                if pending_frame is not None:
+                    source_frame = pending_frame
+                    pending_frame = None
+                    ok = True
+                else:
+                    ok, source_frame = capture.read()
+
+                if not ok or source_frame is None:
+                    raise InferenceConfigurationError("Camera source has no readable frames.")
+                yield source_frame
+        finally:
+            capture.release()
+
+    def _iter_live_capture(self, capture, pending_frame, stop_event=None, source_label: str = "live_source"):
         state = PlateProcessingState(
             recognition_interval=1,
             heavy_scan_interval=max(settings.plate_stream_process_every_n_frames, 4),
@@ -463,8 +501,8 @@ class PlateService:
                     consecutive_read_failures += 1
                     if consecutive_read_failures > self._stream_read_failure_retry_limit():
                         logger.warning(
-                            "RTSP stream read failed repeatedly; stopping processed stream | rtsp_url=%s failures=%d",
-                            rtsp_url,
+                            "Live stream read failed repeatedly; stopping processed stream | source=%s failures=%d",
+                            source_label,
                             consecutive_read_failures,
                         )
                         break
@@ -2007,6 +2045,38 @@ class PlateService:
         detail = "; ".join(errors) if errors else "no extra diagnostics"
         raise InferenceConfigurationError(
             "Failed to open the RTSP stream. Verify the current computer is connected to the required network, the RTSP URL is reachable, and local OpenCV supports RTSP/FFMPEG. "
+            f"Diagnostics: {detail}"
+        )
+
+    def _open_camera_capture(self, camera_index: int):
+        cv2 = self._require_cv2()
+        attempts: list[tuple[str, int | None]] = [("DSHOW", cv2.CAP_DSHOW)]
+        if hasattr(cv2, "CAP_MSMF"):
+            attempts.append(("MSMF", cv2.CAP_MSMF))
+        attempts.append(("DEFAULT", None))
+        errors: list[str] = []
+
+        for backend_name, backend in attempts:
+            capture = (
+                cv2.VideoCapture(camera_index, backend) if backend is not None else cv2.VideoCapture(camera_index)
+            )
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if not capture.isOpened():
+                errors.append(f"{backend_name} backend open failed")
+                capture.release()
+                continue
+
+            ok, frame = capture.read()
+            if ok and frame is not None:
+                logger.info("Camera source opened via %s backend: index=%s", backend_name, camera_index)
+                return capture, frame
+
+            errors.append(f"{backend_name} backend first-frame read failed")
+            capture.release()
+
+        detail = "; ".join(errors) if errors else "no extra diagnostics"
+        raise InferenceConfigurationError(
+            "Failed to open the camera source. Verify the camera is connected, allowed by system privacy settings, and not occupied by another application. "
             f"Diagnostics: {detail}"
         )
 
