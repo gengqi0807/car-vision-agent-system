@@ -51,6 +51,24 @@ const form = reactive({
 });
 const confirmPassword = ref("");
 
+function validateContactFields() {
+  const email = form.email.trim();
+  const phone = form.phone.trim();
+  const emailPattern = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
+  const allowedEmailSuffixes = [".com", ".cn", ".com.cn", ".net", ".org", ".edu", ".edu.cn", ".gov.cn"];
+  const phonePattern = /^1[3-9]\d{9}$/;
+
+  if (email && (!emailPattern.test(email) || !allowedEmailSuffixes.some((suffix) => email.toLowerCase().endsWith(suffix)))) {
+    window.alert("邮箱格式不正确，仅支持 .com、.cn、.com.cn、.net、.org、.edu、.edu.cn、.gov.cn 后缀。");
+    return false;
+  }
+  if (phone && !phonePattern.test(phone)) {
+    window.alert("手机号格式不正确，请输入 11 位中国大陆手机号。");
+    return false;
+  }
+  return true;
+}
+
 async function submit() {
   if (!form.username || !form.password) {
     window.alert("请至少填写用户名和密码。");
@@ -59,6 +77,10 @@ async function submit() {
 
   if (form.password !== confirmPassword.value) {
     window.alert("两次输入的密码不一致。");
+    return;
+  }
+
+  if (!validateContactFields()) {
     return;
   }
 

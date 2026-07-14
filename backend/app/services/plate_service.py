@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field
 from datetime import datetime
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,8 @@ from app.core.database import SessionLocal
 from app.core.logger import get_logger
 from app.models.plate_record import PlateRecord
 from app.models_infer.errors import InferenceConfigurationError, InferenceDependencyError
+from app.models_infer.hyperlpr_recognizer import HyperLPRRecognizer
+from app.models_infer.open_traffic_flow_lpr_recognizer import OpenTrafficFlowLPRRecognizer
 from app.models_infer.paddleocr_recognizer import PaddleOCRRecognizer
 from app.models_infer.vehicle_type_classifier import VehicleTypeClassifier
 from app.models_infer.yolo_detector import YoloDetector
@@ -144,6 +147,8 @@ class PlateService:
 
     def __init__(self) -> None:
         self.recognizer = PaddleOCRRecognizer()
+        self.lpr_recognizer = OpenTrafficFlowLPRRecognizer()
+        self.hyperlpr_recognizer = HyperLPRRecognizer()
         self.detector = YoloDetector()
         self.vehicle_classifier = VehicleTypeClassifier()
         self._backend_dir = Path(__file__).resolve().parents[2]
@@ -157,6 +162,12 @@ class PlateService:
         if self._runtime_warmed:
             return
         self.detector.warmup()
+        if self.lpr_recognizer.is_available():
+            self.lpr_recognizer.recognize(self._build_lpr_warmup_image())
+        if self._is_hyperlpr_available():
+            self.hyperlpr_recognizer.recognize_all(self._build_lpr_warmup_image(), confidence_threshold=0.0)
+        elif settings.hyperlpr_enabled:
+            logger.info("HyperLPR3 is not installed; skipping optional HyperLPR warmup.")
         self.recognizer.warmup(silent=silent)
         self.vehicle_classifier.warmup()
         self._runtime_warmed = True
@@ -1855,6 +1866,8 @@ class PlateService:
         return detector.detect(image)
 
     def _augment_image_hits_with_vehicle_detector(self, image, hits: list[dict]) -> list[dict]:
+        if not settings.plate_vehicle_detector_fallback_enabled:
+            return list(hits)
         if not hits:
             hits = []
         if any(str(hit.get("kind", "plate")) == "vehicle" for hit in hits):
@@ -2478,6 +2491,8 @@ class PlateService:
         return self._deduplicate_plate_detections(recognized)
 
     def _vehicle_type_from_hit(self, hit: dict) -> str:
+        if not settings.plate_vehicle_detector_fallback_enabled:
+            return VEHICLE_TYPE_UNKNOWN
         return self._normalize_vehicle_type_from_label(str(hit.get("vehicle_type") or hit.get("label", "")))
 
     def _resolve_vehicle_type_for_plate_detection(
@@ -2601,6 +2616,8 @@ class PlateService:
         fast_mode: bool,
         video_mode: bool,
     ) -> str:
+        if not settings.plate_vehicle_detector_fallback_enabled:
+            return VEHICLE_TYPE_UNKNOWN
         detect_vehicle_classes = getattr(self.detector, "detect_vehicle_classes", None)
         if not callable(detect_vehicle_classes):
             return VEHICLE_TYPE_UNKNOWN
@@ -2777,6 +2794,8 @@ class PlateService:
         return list(hits) + list(vehicle_hits)
 
     def _attach_vehicle_type_context_to_hits(self, hits: list[dict]) -> list[dict]:
+        if not settings.plate_vehicle_detector_fallback_enabled:
+            return [dict(hit) for hit in hits]
         vehicle_hits = [
             hit for hit in hits if self._normalize_vehicle_type_from_label(str(hit.get("label", ""))) != VEHICLE_TYPE_UNKNOWN
         ]
@@ -2893,6 +2912,26 @@ class PlateService:
         confidence_threshold: float | None = None,
         allow_ocr_fallback: bool = True,
     ) -> PlateDetection | None:
+        lpr_result = self._recognize_crop_with_lprnet(crop)
+        if lpr_result is not None:
+            return PlateDetection(
+                plate_number=lpr_result.plate_number,
+                plate_color=self._normalize_plate_color_for_plate(lpr_result.plate_color, lpr_result.plate_number),
+                vehicle_type=VEHICLE_TYPE_UNKNOWN,
+                confidence=min(1.0, lpr_result.confidence * 0.82 + float(hit["confidence"]) * 0.18),
+                bbox=list(crop_bbox),
+            )
+
+        hyperlpr_result = self._recognize_crop_with_hyperlpr(crop, confidence_threshold=confidence_threshold)
+        if hyperlpr_result is not None:
+            return PlateDetection(
+                plate_number=hyperlpr_result.plate_number,
+                plate_color=self._normalize_plate_color_for_plate(hyperlpr_result.plate_color, hyperlpr_result.plate_number),
+                vehicle_type=VEHICLE_TYPE_UNKNOWN,
+                confidence=min(1.0, hyperlpr_result.confidence * 0.82 + float(hit["confidence"]) * 0.18),
+                bbox=list(crop_bbox),
+            )
+
         if not self.recognizer.is_available():
             return None
 
@@ -2928,6 +2967,55 @@ class PlateService:
             confidence=min(1.0, result.confidence * 0.82 + float(hit["confidence"]) * 0.18),
             bbox=list(crop_bbox),
         )
+
+    def _recognize_crop_with_lprnet(self, crop):
+        if not self.lpr_recognizer.is_available():
+            return None
+        try:
+            return self.lpr_recognizer.recognize(crop)
+        except (InferenceConfigurationError, InferenceDependencyError):
+            logger.warning("OpenTrafficFlow LPRNet unavailable while reading detector crop.", exc_info=True)
+            return None
+        except ValueError:
+            logger.warning("Skipping detector crop because OpenTrafficFlow LPRNet raised ValueError.", exc_info=True)
+            return None
+        except RuntimeError:
+            logger.warning("Skipping detector crop because OpenTrafficFlow LPRNet runtime failed.", exc_info=True)
+            return None
+
+    def _recognize_crop_with_hyperlpr(self, crop, confidence_threshold: float | None = None):
+        if not self._is_hyperlpr_available():
+            return None
+        try:
+            detections = self.hyperlpr_recognizer.recognize_all(
+                crop,
+                confidence_threshold=confidence_threshold if confidence_threshold is not None else 0.1,
+                aggressive=True,
+                heavy_scan=True,
+            )
+        except (InferenceConfigurationError, InferenceDependencyError):
+            logger.warning("HyperLPR unavailable while reading detector crop.", exc_info=True)
+            return None
+        except ValueError:
+            logger.warning("Skipping detector crop because HyperLPR raised ValueError.", exc_info=True)
+            return None
+        except RuntimeError:
+            logger.warning("Skipping detector crop because HyperLPR runtime failed.", exc_info=True)
+            return None
+        if not detections:
+            return None
+        return max(detections, key=lambda item: item.confidence)
+
+    @staticmethod
+    def _is_hyperlpr_available() -> bool:
+        return settings.hyperlpr_enabled and importlib.util.find_spec("hyperlpr3") is not None
+
+    def _build_lpr_warmup_image(self):
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise InferenceDependencyError("Missing numpy for LPRNet warmup.") from exc
+        return np.zeros((24, 94, 3), dtype=np.uint8)
 
     def _is_reasonable_crop_bbox(self, bbox: list[int]) -> bool:
         if len(bbox) != 4:

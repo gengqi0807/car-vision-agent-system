@@ -6,12 +6,20 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import BaseModel
 from app.utils.crypto import crypto_manager, normalize_email, normalize_phone, normalize_sensitive_value
+from app.utils.user_uid import USER_UID_LENGTH, generate_user_uid
 
 
 class User(BaseModel):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    uid: Mapped[str] = mapped_column(
+        String(USER_UID_LENGTH),
+        unique=True,
+        index=True,
+        nullable=False,
+        default=generate_user_uid,
+    )
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
 

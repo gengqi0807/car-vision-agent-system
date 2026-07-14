@@ -6,6 +6,7 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.core.config import settings
 from app.utils.crypto import crypto_manager, normalize_email, normalize_phone, normalize_sensitive_value
+from app.utils.user_uid import USER_UID_ALPHABET, USER_UID_LENGTH, generate_user_uid
 
 
 class Base(DeclarativeBase):
@@ -84,6 +85,94 @@ def _ensure_user_security_columns() -> None:
     with engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
+
+
+def _ensure_user_uid_column() -> None:
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("users")}
+    if "uid" in columns:
+        return
+
+    with engine.begin() as connection:
+        connection.execute(text(f"ALTER TABLE users ADD COLUMN uid VARCHAR({USER_UID_LENGTH}) NULL"))
+
+
+def _backfill_user_uids() -> None:
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("users")}
+    if not {"id", "uid"}.issubset(columns):
+        return
+
+    alphabet = set(USER_UID_ALPHABET)
+    used_uids: set[str] = set()
+
+    with engine.begin() as connection:
+        rows = list(
+            connection.execute(
+                text("SELECT id, uid FROM users ORDER BY id")
+            ).mappings()
+        )
+
+        for row in rows:
+            current_uid = str(row["uid"] or "").strip().upper()
+            is_valid_uid = (
+                len(current_uid) == USER_UID_LENGTH
+                and all(character in alphabet for character in current_uid)
+                and current_uid not in used_uids
+            )
+            if is_valid_uid:
+                if current_uid != row["uid"]:
+                    connection.execute(
+                        text("UPDATE users SET uid = :uid WHERE id = :id"),
+                        {"id": row["id"], "uid": current_uid},
+                    )
+                used_uids.add(current_uid)
+                continue
+
+            new_uid = _generate_unused_user_uid(used_uids)
+            connection.execute(
+                text("UPDATE users SET uid = :uid WHERE id = :id"),
+                {"id": row["id"], "uid": new_uid},
+            )
+            used_uids.add(new_uid)
+
+
+def _ensure_user_uid_index() -> None:
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("users")}
+    if "uid" not in columns:
+        return
+
+    indexes = inspector.get_indexes("users")
+    unique_constraints = inspector.get_unique_constraints("users")
+    has_unique_uid = any(
+        index.get("unique") and index.get("column_names") == ["uid"]
+        for index in indexes
+    ) or any(
+        constraint.get("column_names") == ["uid"]
+        for constraint in unique_constraints
+    )
+    if has_unique_uid:
+        return
+
+    with engine.begin() as connection:
+        connection.execute(text("CREATE UNIQUE INDEX uq_users_uid ON users (uid)"))
+
+
+def _generate_unused_user_uid(used_uids: set[str]) -> str:
+    while True:
+        uid = generate_user_uid()
+        if uid not in used_uids:
+            return uid
 
 
 def _migrate_legacy_user_sensitive_data() -> None:
@@ -171,6 +260,9 @@ def _ensure_alert_table_compatibility() -> None:
     if "alert_push_logs" in table_names:
         _ensure_alert_push_logs_columns(inspector)
         _backfill_alert_push_logs()
+
+    if "plate_records" in table_names:
+        _ensure_plate_record_columns(inspector)
 
     if "user_operation_logs" in table_names:
         _ensure_updated_at_column("user_operation_logs")
@@ -353,6 +445,51 @@ def _backfill_updated_at_from_created_at(table_name: str) -> None:
         )
 
 
+def _ensure_plate_record_columns(inspector) -> None:
+    columns = {column["name"] for column in inspector.get_columns("plate_records")}
+    statements: list[str] = []
+
+    if "user_id" not in columns:
+        statements.append("ALTER TABLE plate_records ADD COLUMN user_id INT NULL DEFAULT 0")
+    if "source_path" not in columns:
+        statements.append("ALTER TABLE plate_records ADD COLUMN source_path VARCHAR(255) NULL")
+    if "created_at" not in columns:
+        statements.append("ALTER TABLE plate_records ADD COLUMN created_at DATETIME NULL")
+    if "updated_at" not in columns:
+        statements.append("ALTER TABLE plate_records ADD COLUMN updated_at DATETIME NULL")
+
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+        if "user_id" not in columns:
+            connection.execute(
+                text(
+                    "UPDATE plate_records "
+                    "SET user_id = 0 "
+                    "WHERE user_id IS NULL"
+                )
+            )
+        if "created_at" not in columns:
+            connection.execute(
+                text(
+                    "UPDATE plate_records "
+                    "SET created_at = CURRENT_TIMESTAMP "
+                    "WHERE created_at IS NULL"
+                )
+            )
+        if "updated_at" not in columns:
+            connection.execute(
+                text(
+                    "UPDATE plate_records "
+                    "SET updated_at = COALESCE(created_at, CURRENT_TIMESTAMP) "
+                    "WHERE updated_at IS NULL"
+                )
+            )
+
+
 def _ensure_owner_gesture_record_columns(inspector) -> None:
     columns = {column["name"] for column in inspector.get_columns("owner_gesture_records")}
     statements: list[str] = []
@@ -463,6 +600,9 @@ def _ensure_police_gesture_record_columns(inspector) -> None:
 def init_database() -> None:
     ensure_database_exists()
     Base.metadata.create_all(bind=engine)
+    _ensure_user_uid_column()
+    _backfill_user_uids()
+    _ensure_user_uid_index()
     _ensure_user_security_columns()
     _migrate_legacy_user_sensitive_data()
     _ensure_alert_table_compatibility()

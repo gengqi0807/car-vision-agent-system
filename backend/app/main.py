@@ -22,12 +22,15 @@ media_root.mkdir(parents=True, exist_ok=True)
 async def lifespan(_: FastAPI):
     init_database()
     logger.info("Starting %s in %s mode", settings.app_name, settings.app_env)
-    try:
-        logger.info("Warming up plate recognition models...")
-        plate_service.warmup_runtime(silent=True)
-        logger.info("Plate recognition model warmup finished.")
-    except Exception:
-        logger.warning("Plate model warmup failed; lazy initialization will be used.", exc_info=True)
+    if settings.plate_startup_warmup_enabled:
+        try:
+            logger.info("Warming up plate recognition models...")
+            plate_service.warmup_runtime(silent=True)
+            logger.info("Plate recognition model warmup finished.")
+        except Exception:
+            logger.warning("Plate model warmup failed; lazy initialization will be used.", exc_info=True)
+    else:
+        logger.info("Plate model startup warmup disabled; lazy initialization will be used.")
     yield
     logger.info("Shutting down %s", settings.app_name)
 
