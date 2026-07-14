@@ -83,10 +83,78 @@ class LocalPoliceGestureResult:
     completed_confidence: float = 0.0
 
 
+def _person_tracking_info(landmarks) -> dict[str, float] | None:
+    if landmarks is None or len(landmarks) <= 24:
+        return None
+    left_shoulder = landmarks[11]
+    right_shoulder = landmarks[12]
+    shoulder_width = (
+        (float(left_shoulder.x) - float(right_shoulder.x)) ** 2
+        + (float(left_shoulder.y) - float(right_shoulder.y)) ** 2
+    ) ** 0.5
+    center_x = sum(float(landmarks[index].x) for index in (11, 12, 23, 24)) / 4.0
+    center_y = sum(float(landmarks[index].y) for index in (11, 12, 23, 24)) / 4.0
+    distance_to_center = ((center_x - 0.5) ** 2 + (center_y - 0.5) ** 2) ** 0.5
+    return {
+        "sw": shoulder_width,
+        "cx": center_x,
+        "cy": center_y,
+        "dist_center": distance_to_center,
+    }
+
+
+def _select_target_person(pose_landmarks_list) -> tuple[int, dict[str, float] | None]:
+    best_index = 0
+    best_score = float("-inf")
+    best_info = None
+    for index, landmarks in enumerate(pose_landmarks_list or []):
+        person_info = _person_tracking_info(landmarks)
+        if person_info is None:
+            continue
+        score = person_info["sw"] * 3.0 - person_info["dist_center"] * 0.5
+        if score > best_score:
+            best_index = index
+            best_score = score
+            best_info = person_info
+    return best_index, best_info
+
+
+def _track_target_person(
+    pose_landmarks_list,
+    last_target_info: dict[str, float] | None,
+    track_threshold: float,
+) -> tuple[int, dict[str, float] | None]:
+    if not pose_landmarks_list or last_target_info is None:
+        return _select_target_person(pose_landmarks_list)
+
+    best_index = 0
+    best_distance = float("inf")
+    best_info = None
+    for index, landmarks in enumerate(pose_landmarks_list):
+        person_info = _person_tracking_info(landmarks)
+        if person_info is None:
+            continue
+        distance = (
+            (person_info["cx"] - last_target_info["cx"]) ** 2
+            + (person_info["cy"] - last_target_info["cy"]) ** 2
+        ) ** 0.5
+        if distance < best_distance:
+            best_index = index
+            best_distance = distance
+            best_info = person_info
+
+    if best_info is None or best_distance > track_threshold:
+        return _select_target_person(pose_landmarks_list)
+    return best_index, best_info
+
+
 class PoliceGestureVideoSession:
     def __init__(self, *, realtime: bool = False) -> None:
         self.realtime = realtime
-        self.pose_detector = create_pose_detector(police_cfg.POSE_MODEL_PATH)
+        self.pose_detector = create_pose_detector(
+            police_cfg.POSE_MODEL_PATH,
+            num_poses=police_cfg.NUM_POSES_MULTI,
+        )
         self.hand_detector = None
         if os.path.exists(police_cfg.HAND_MODEL_PATH):
             self.hand_detector = create_hand_detector(police_cfg.HAND_MODEL_PATH)
@@ -126,6 +194,9 @@ class PoliceGestureVideoSession:
         self.action_flash_frames = 30
         self.completed_gesture: str | None = None
         self.completed_confidence = 0.0
+        self.target_locked = False
+        self.target_info: dict[str, float] | None = None
+        self.target_lock_counter = 0
 
     def __enter__(self) -> PoliceGestureVideoSession:
         return self
@@ -159,14 +230,28 @@ class PoliceGestureVideoSession:
             hand_result = None
 
         if should_infer and pose_result and pose_result.pose_landmarks:
-            landmarks = pose_result.pose_landmarks[0]
+            target_index = self._select_or_track_target(pose_result.pose_landmarks)
+            landmarks = pose_result.pose_landmarks[target_index]
             self.last_landmarks = landmarks
 
-            if pose_result.pose_world_landmarks:
-                world_landmarks = pose_result.pose_world_landmarks[0]
+            if pose_result.pose_world_landmarks and target_index < len(pose_result.pose_world_landmarks):
+                world_landmarks = pose_result.pose_world_landmarks[target_index]
                 self.last_world_landmarks = world_landmarks
             else:
                 world_landmarks = self.last_world_landmarks
+
+            if len(pose_result.pose_landmarks) > 1:
+                for index, other_landmarks in enumerate(pose_result.pose_landmarks):
+                    if index == target_index:
+                        continue
+                    draw_pose_landmarks(
+                        annotated,
+                        other_landmarks,
+                        height,
+                        width,
+                        point_color=(100, 100, 100),
+                        line_color=(80, 80, 80),
+                    )
 
             draw_pose_landmarks(annotated, landmarks, height, width)
 
@@ -304,6 +389,7 @@ class PoliceGestureVideoSession:
             self.last_feat = None
             self.last_hand_left = None
             self.last_hand_right = None
+            self._reset_target_tracking()
             self._reset_action_state()
 
         if self.dl_engine is not None and should_infer:
@@ -476,6 +562,35 @@ class PoliceGestureVideoSession:
                 self._reset_action_state(show_flash=True)
         else:
             self.hip_both_frames = 0
+
+    def _select_or_track_target(self, pose_landmarks_list) -> int:
+        if not self.target_locked:
+            target_index, person_info = _select_target_person(pose_landmarks_list)
+            self.target_lock_counter += 1
+            if self.target_lock_counter >= police_cfg.TARGET_LOCK_FRAMES:
+                self.target_locked = True
+                self.target_info = person_info
+            return target_index
+
+        target_index, person_info = _track_target_person(
+            pose_landmarks_list,
+            self.target_info,
+            police_cfg.TARGET_TRACK_THRESH,
+        )
+        if person_info is not None:
+            if self.target_info is None:
+                self.target_info = person_info
+            else:
+                alpha = 0.7
+                self.target_info["cx"] = alpha * person_info["cx"] + (1.0 - alpha) * self.target_info["cx"]
+                self.target_info["cy"] = alpha * person_info["cy"] + (1.0 - alpha) * self.target_info["cy"]
+                self.target_info["sw"] = person_info.get("sw", self.target_info.get("sw", 0.0))
+        return target_index
+
+    def _reset_target_tracking(self) -> None:
+        self.target_locked = False
+        self.target_info = None
+        self.target_lock_counter = 0
 
     def _reset_action_state(self, *, show_flash: bool = False) -> None:
         was_active = self.action_state == "active"

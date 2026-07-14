@@ -73,7 +73,7 @@ _patch_mediapipe_windows_free()
 # 模型创建
 # ============================================================
 
-def create_pose_detector(model_path: str) -> vision.PoseLandmarker:
+def create_pose_detector(model_path: str, *, num_poses: int | None = None) -> vision.PoseLandmarker:
     """
     创建 MediaPipe PoseLandmarker。
 
@@ -87,7 +87,7 @@ def create_pose_detector(model_path: str) -> vision.PoseLandmarker:
     options = vision.PoseLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.IMAGE,
-        num_poses=config.NUM_POSES,
+        num_poses=num_poses if num_poses is not None else config.NUM_POSES,
         min_pose_detection_confidence=config.POSE_DETECTION_CONFIDENCE,
         min_pose_presence_confidence=config.POSE_PRESENCE_CONFIDENCE,
         min_tracking_confidence=config.POSE_TRACKING_CONFIDENCE,
