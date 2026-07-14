@@ -61,7 +61,12 @@ class GestureClassifier:
     # 动态手势稳定延迟：动作开始 N 秒后才输出结果，避免初期跳变
     DYNAMIC_SETTLE_SECONDS: float = 1.0
 
-    def __init__(self, domain: str = "owner", load_custom: bool = True):
+    def __init__(
+        self,
+        domain: str = "owner",
+        load_custom: bool = True,
+        use_custom_primary: bool = False,
+    ):
         self.domain = domain
         self.tracker: HandGestureTracker | None = (
             HandGestureTracker() if domain == "owner" else None
@@ -104,6 +109,18 @@ class GestureClassifier:
             self._load_dynamic_lstm()
             if load_custom:
                 self._load_custom_model()
+                # 自定义合并模型（固有类 + 自定义类）晋升为主静态分类器：
+                # "最新版 SVM 训练结果"即 custom_gesture_classifier_svm.joblib，
+                # 它已包含固有 5 类，因此实时流无需再单独维护固有模型文件。
+                # 若自定义模型不存在，则 _ml_model 仍保持固有模型（优雅回退）。
+                if use_custom_primary and self._custom_model is not None:
+                    self._ml_model = self._custom_model
+                    self._ml_scaler = self._custom_scaler
+                    self._ml_labels = np.array(self._custom_labels)
+                    logger.info(
+                        "自定义合并模型已晋升为主静态分类器，类别: %s",
+                        self._custom_labels,
+                    )
 
     # ----------------------------------------------------------------
     # ML 模型加载与推理

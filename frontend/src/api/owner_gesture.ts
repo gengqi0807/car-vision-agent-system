@@ -115,6 +115,19 @@ export interface CustomGestureSampleListOut {
   total: number;
 }
 
+export interface RejectedItem {
+  filename: string;
+  reason: string;
+}
+
+export interface CustomGestureSampleUploadOut {
+  samples: CustomGestureSampleItem[];
+  rejected: RejectedItem[];
+  total_uploaded: number;
+  total_accepted: number;
+  total_rejected: number;
+}
+
 export interface CustomGestureTrainOut {
   status: string;
   message: string;
@@ -144,7 +157,7 @@ export const fetchCustomGestureSamplesApi = (name: string, limit = 50, offset = 
   );
 
 export const addCustomGestureSampleApi = (name: string, formData: FormData) =>
-  request.post<CustomGestureSampleItem>(
+  request.post<CustomGestureSampleUploadOut>(
     `/owner-gesture/custom-gesture/${encodeURIComponent(name)}/samples`,
     formData,
   );

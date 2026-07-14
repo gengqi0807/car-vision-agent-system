@@ -344,7 +344,9 @@ class OwnerGestureService:
         if self._stream_classifier is None:
             from app.models_infer.gesture_classifier import GestureClassifier
 
-            self._stream_classifier = GestureClassifier(domain="owner", load_custom=False)
+            self._stream_classifier = GestureClassifier(
+                domain="owner", load_custom=True, use_custom_primary=True
+            )
         return self._stream_classifier
 
     @property
@@ -442,7 +444,8 @@ class OwnerGestureService:
             )
 
         if input_mode == "camera":
-            # ---- 相机模式：仅使用有动作映射的原有手势，不使用自定义手势 ----
+            # ---- 相机模式：主静态分类器已包含自定义手势（晋升为主模型），
+            #      但仅「有动作映射」的手势会触发控车，自定义手势仅显示识别结果 ----
             raw_gesture_label, cls_conf = self._lock_camera_result(
                 runtime_session,
                 gesture=raw_gesture_label,
@@ -717,7 +720,9 @@ class OwnerGestureService:
             min_presence_confidence=settings.min_hand_presence_confidence,
             min_tracking_confidence=settings.min_hand_tracking_confidence,
         )
-        self._stream_classifier = GestureClassifier(domain="owner", load_custom=False)
+        self._stream_classifier = GestureClassifier(
+            domain="owner", load_custom=True, use_custom_primary=True
+        )
 
     def _infer_camera_hands(self, frame: np.ndarray) -> list[list[dict]]:
         if not self._camera_runtime_ready:
@@ -773,7 +778,8 @@ class OwnerGestureService:
                     )
                     primary_hand = primary_hand or []  # 无手时兜底，避免下游 len(None) 异常
                     observed_gesture = raw_gesture
-                    # ---- 实时视频流：仅使用有动作映射的原有手势，不使用自定义手势 ----
+                    # ---- 实时视频流：主静态分类器已包含自定义手势（晋升为主模型），
+                    #      但仅「有动作映射」的手势会触发控车，自定义手势仅显示识别结果 ----
                     raw_gesture, confidence = self._lock_camera_result(
                         self._stream_runtime_session,
                         gesture=raw_gesture,

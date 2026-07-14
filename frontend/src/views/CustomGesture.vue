@@ -10,14 +10,14 @@
       <button class="primary-btn" @click="showCreateDialog = true">+ 创建手势</button>
       <button
         class="primary-btn"
-        :disabled="trainLoading || gestures.length < 2"
+        :disabled="trainLoading || gestures.length < 1"
         @click="handleTrain()"
         style="margin-left: 12px; background: #e8a040;"
       >
         {{ trainLoading ? '训练中...' : '训练全部手势' }}
       </button>
-      <span v-if="gestures.length < 2 && gestures.length > 0" class="hint" style="margin-left: 16px;">
-        至少需要 2 个手势类别才能训练
+      <span v-if="gestures.length === 0" class="hint" style="margin-left: 16px;">
+        请先创建至少一个手势类别才能训练
       </span>
     </section>
 
@@ -55,30 +55,34 @@
       </h2>
 
       <div class="sample-actions">
-        <label class="upload-btn">
-          📷 上传图片采集关键点
+        <label class="upload-btn" :class="{ disabled: uploadLoading }">
+          {{ uploadLoading ? '上传中...' : '📷 上传图片采集关键点' }}
           <input
             type="file"
             accept="image/*"
+            multiple
             hidden
+            :disabled="uploadLoading"
             @change="handleImageUpload"
           />
         </label>
-        <span class="hint" style="margin-left: 12px;">上传手势图片后自动提取 21 关键点</span>
+        <span class="hint" style="margin-left: 12px;">支持一次选择多张图片，自动提取 21 关键点</span>
       </div>
 
-      <!-- 图片上传结果预览 -->
-      <div v-if="uploadPreview" class="upload-preview card">
-        <img :src="uploadPreview" alt="preview" class="preview-img" />
-        <div class="preview-meta">
-          <p v-if="uploadError" class="error-msg">{{ uploadError }}</p>
-          <p v-else>预览已选图片，确认后将自动提取关键点并保存为样本</p>
-          <button class="primary-btn" @click="confirmUploadSample" :disabled="uploadLoading">
-            {{ uploadLoading ? '提交中...' : '确认为样本' }}
-          </button>
-          <button class="secondary-btn" @click="cancelUploadPreview">取消</button>
-        </div>
+      <!-- 上传结果提示 -->
+      <div v-if="uploadResult" class="upload-result card">
+        <p class="result-summary">
+          <span class="result-accepted">✅ 成功 {{ uploadResult.total_accepted }} 张</span>
+          <span v-if="uploadResult.total_rejected > 0" class="result-rejected">❌ 跳过 {{ uploadResult.total_rejected }} 张</span>
+        </p>
+        <ul v-if="uploadResult.rejected.length" class="rejected-list">
+          <li v-for="r in uploadResult.rejected" :key="r.filename">
+            <strong>{{ r.filename }}</strong>: {{ r.reason }}
+          </li>
+        </ul>
+        <button class="secondary-btn" @click="uploadResult = null" style="margin-top: 8px;">关闭</button>
       </div>
+      <p v-if="uploadError" class="error-msg">{{ uploadError }}</p>
 
       <!-- 样本列表 -->
       <div class="samples-grid" v-if="samples.length">
@@ -154,6 +158,7 @@ import {
   triggerCustomGestureTrainApi,
   type CustomGestureItem,
   type CustomGestureSampleItem,
+  type CustomGestureSampleUploadOut,
   type CustomGestureTrainOut,
 } from "@/api/owner_gesture";
 
@@ -246,47 +251,29 @@ async function handleDeleteSample(sampleId: number) {
 }
 
 // ── 图片上传 + 关键点提取并入库 ──────────────────────────────────
-const uploadPreview = ref<string | null>(null);
-const uploadFile = ref<File | null>(null);
 const uploadLoading = ref(false);
 const uploadError = ref("");
+const uploadResult = ref<CustomGestureSampleUploadOut | null>(null);
 
-function handleImageUpload(event: Event) {
+async function handleImageUpload(event: Event) {
   const input = event.target as HTMLInputElement;
-  const file = input.files?.[0];
-  if (!file) return;
+  const files = input.files;
+  if (!files || files.length === 0) return;
 
-  uploadFile.value = file;
-  uploadError.value = "";
-
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    uploadPreview.value = e.target?.result as string;
-  };
-  reader.readAsDataURL(file);
-
-  input.value = "";
-}
-
-function cancelUploadPreview() {
-  uploadPreview.value = null;
-  uploadFile.value = null;
-  uploadError.value = "";
-}
-
-async function confirmUploadSample() {
-  if (!selectedGesture.value || !uploadFile.value) return;
+  if (!selectedGesture.value) return;
 
   uploadLoading.value = true;
   uploadError.value = "";
+  uploadResult.value = null;
 
   const formData = new FormData();
-  formData.append("file", uploadFile.value);
+  for (let i = 0; i < files.length; i++) {
+    formData.append("file", files[i]);
+  }
 
   try {
-    await addCustomGestureSampleApi(selectedGesture.value.name, formData);
-    uploadPreview.value = null;
-    uploadFile.value = null;
+    const res = await addCustomGestureSampleApi(selectedGesture.value.name, formData);
+    uploadResult.value = res.data;
     await loadSamples();
     await loadGestures();
   } catch (err: any) {
@@ -294,6 +281,7 @@ async function confirmUploadSample() {
       err?.response?.data?.detail || err.message || "上传失败，请重试";
   } finally {
     uploadLoading.value = false;
+    input.value = "";
   }
 }
 
@@ -450,26 +438,46 @@ onMounted(() => {
   &:hover {
     opacity: 0.85;
   }
+
+  &.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
 }
 
-.upload-preview {
-  display: flex;
-  gap: 16px;
-  align-items: center;
+.upload-result {
   margin-bottom: 16px;
 
-  .preview-img {
-    width: 160px;
-    height: auto;
-    border-radius: 8px;
-    object-fit: contain;
-    background: #f0f0f0;
+  .result-summary {
+    display: flex;
+    gap: 20px;
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 8px;
   }
 
-  .preview-meta {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
+  .result-accepted {
+    color: #4caf50;
+  }
+
+  .result-rejected {
+    color: #e57373;
+  }
+}
+
+.rejected-list {
+  font-size: 13px;
+  color: var(--text-soft);
+  padding-left: 18px;
+  margin: 4px 0;
+
+  li {
+    margin-bottom: 2px;
+    word-break: break-all;
+  }
+
+  strong {
+    color: var(--text);
   }
 }
 

@@ -624,3 +624,73 @@ def test_process_frame_image_mode_matches_verify_script_first_hand_logic(tmp_pat
     assert result.keypoints[0].x == left_hand[0]["x"]
     assert len(stored) == 1
     assert len(stored[0].hand_landmarks) == 42
+
+
+def test_use_custom_primary_promotes_custom_model_to_primary_static_classifier(monkeypatch):
+    custom_labels = ["fist", "palm", "thumb_up", "thumb_down", "thumb_index", "my_gesture"]
+
+    def fake_load_custom(self):
+        self._custom_model = object()
+        self._custom_scaler = object()
+        self._custom_labels = list(custom_labels)
+
+    monkeypatch.setattr(GestureClassifier, "_load_custom_model", fake_load_custom)
+    monkeypatch.setattr(GestureClassifier, "_load_ml_model", lambda self: None)
+    monkeypatch.setattr(GestureClassifier, "_load_dynamic_lstm", lambda self: None)
+
+    classifier = GestureClassifier(domain="owner", load_custom=True, use_custom_primary=True)
+
+    # 自定义合并模型应晋升为主静态分类器（_ml_model / _ml_scaler / _ml_labels）
+    assert classifier._ml_model is classifier._custom_model
+    assert classifier._ml_scaler is classifier._custom_scaler
+    assert classifier._ml_labels is not None
+    promoted = classifier._ml_labels.tolist()
+    assert "my_gesture" in promoted
+    assert "fist" in promoted
+
+
+def test_default_does_not_promote_custom_model(monkeypatch):
+    def fake_load_custom(self):
+        self._custom_model = object()
+        self._custom_scaler = object()
+        self._custom_labels = ["fist", "my_gesture"]
+
+    monkeypatch.setattr(GestureClassifier, "_load_custom_model", fake_load_custom)
+    monkeypatch.setattr(GestureClassifier, "_load_ml_model", lambda self: None)
+    monkeypatch.setattr(GestureClassifier, "_load_dynamic_lstm", lambda self: None)
+
+    classifier = GestureClassifier(domain="owner", load_custom=True, use_custom_primary=False)
+
+    # 默认不晋升：主静态分类器保持固有模型（此处被桩跳过为 None），自定义模型独立保留
+    assert classifier._ml_model is None
+    assert classifier._custom_model is not None
+
+
+def test_configure_stream_runtime_loads_custom_primary_classifier(monkeypatch):
+    # 捕获实时流启动时创建的 GestureClassifier 构造参数，
+    # 确保自定义合并模型被加载并晋升为主静态分类器（而非回退到固有模型）。
+    captured = {}
+
+    class FakeGestureClassifier:
+        def __init__(self, domain="owner", load_custom=False, use_custom_primary=False):
+            captured["domain"] = domain
+            captured["load_custom"] = load_custom
+            captured["use_custom_primary"] = use_custom_primary
+
+    monkeypatch.setattr(
+        gesture_classifier_module, "GestureClassifier", FakeGestureClassifier
+    )
+    monkeypatch.setattr(
+        "app.models_infer.mediapipe_hands.MediaPipeHands.reset", lambda: None
+    )
+    monkeypatch.setattr(
+        "app.models_infer.mediapipe_hands.MediaPipeHands.configure",
+        lambda **kwargs: None,
+    )
+
+    service = OwnerGestureService()
+    service._configure_stream_runtime()
+
+    assert captured.get("domain") == "owner"
+    assert captured.get("load_custom") is True
+    assert captured.get("use_custom_primary") is True
