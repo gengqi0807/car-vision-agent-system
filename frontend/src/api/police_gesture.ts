@@ -118,3 +118,8 @@ export const fetchPoliceGestureStreamStateApi = () =>
 
 export const fetchPoliceGestureStreamResultApi = () =>
   request.get<PoliceGestureFrameResult>("/police-gesture/stream/result");
+
+export const policeGestureVideoFeedUrl = () => {
+  const base = String(request.defaults.baseURL || "").replace(/\/$/, "");
+  return `${base}/police-gesture/stream/video-feed`;
+};

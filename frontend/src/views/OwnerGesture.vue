@@ -91,13 +91,11 @@
 
         <div class="preview-canvas-wrap">
           <div v-if="inputMode === 'camera'" class="preview-stage">
-            <iframe
+            <img
               v-if="cameraActive && cameraDisplayUrl"
               class="preview-image stream-player"
               :src="cameraDisplayUrl"
-              title="手势实时识别标注画面"
-              allow="autoplay; fullscreen"
-              allowfullscreen
+              alt="手势实时识别标注画面"
             />
             <div v-else-if="cameraActive" class="image-placeholder gesture-frame">
               后端正在生成标注画面
@@ -329,6 +327,7 @@ import {
   fetchOwnerGestureStreamResultApi,
   startOwnerGestureStreamApi,
   stopOwnerGestureStreamApi,
+  ownerGestureVideoFeedUrl,
   type OwnerControlPanelState,
   type OwnerGestureFrameResult,
 } from "@/api/owner_gesture";
@@ -489,7 +488,7 @@ const recognitionConfidence = computed(() => `${((result.value?.confidence ?? 0)
 
 const cameraDisplayUrl = computed(() => {
   if (inputMode.value !== "camera") return "";
-  return streamVideoUrl.value;
+  return streamVideoUrl.value || (cameraActive.value ? ownerGestureVideoFeedUrl() : "");
 });
 
 const imageDisplayUrl = computed(() => result.value?.annotated_image || sourcePreviewUrl.value || "");
@@ -742,12 +741,11 @@ async function startCamera() {
       throw new Error("请选择有效的摄像头编号");
     }
     const { data } = await startOwnerGestureStreamApi(String(cameraSource), 15);
-    if (!data.playback_url) throw new Error("后端未返回 MediaMTX 播放地址");
     cameraDeviceLabel.value = `正在打开摄像头 ${cameraSource}`;
     cameraActive.value = true;
     streamStarting = true;
     startStreamResultPolling();
-    await waitForOwnerGestureStreamPublished(data.playback_url);
+    await waitForOwnerGestureStreamPublished();
   } catch (err: any) {
     stopCamera();
     error.value = axios.isAxiosError(err)
@@ -800,7 +798,7 @@ function startStreamResultPolling() {
   void poll();
 }
 
-async function waitForOwnerGestureStreamPublished(playbackUrl: string) {
+async function waitForOwnerGestureStreamPublished() {
   const deadline = Date.now() + 30_000;
   while (cameraActive.value && Date.now() < deadline) {
     const { data } = await fetchOwnerGestureStreamStateApi();
@@ -810,7 +808,7 @@ async function waitForOwnerGestureStreamPublished(playbackUrl: string) {
       cameraDeviceLabel.value = data.source === "0" ? "内置摄像头" : data.source === "1" ? "4K USB Camera" : `视频源 ${data.source}`;
       await new Promise((resolve) => window.setTimeout(resolve, 900));
       if (!cameraActive.value) return;
-      streamVideoUrl.value = `${playbackUrl}?t=${Date.now()}`;
+      streamVideoUrl.value = `${ownerGestureVideoFeedUrl()}?t=${Date.now()}`;
       streamStarting = false;
       error.value = "";
       return;
@@ -1332,10 +1330,10 @@ onMounted(async () => {
   }, 1000);
   try {
     const { data } = await fetchOwnerGestureStreamStateApi();
-    if (data.running && data.playback_url) {
+    if (data.running) {
       cameraActive.value = true;
       cameraDeviceLabel.value = `摄像头 ${data.source}`;
-      streamVideoUrl.value = `${data.playback_url}?t=${Date.now()}`;
+      streamVideoUrl.value = `${ownerGestureVideoFeedUrl()}?t=${Date.now()}`;
       startStreamResultPolling();
     }
   } catch {

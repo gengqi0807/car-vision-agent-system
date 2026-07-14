@@ -23,6 +23,8 @@ class PoliceGestureStreamService:
         self._thread: threading.Thread | None = None
         self._state = StreamState(running=False)
         self._latest: GestureFrameResult | None = None
+        self._frame_condition = threading.Condition()
+        self._latest_jpeg: bytes | None = None
 
     @classmethod
     def instance(cls) -> "PoliceGestureStreamService":
@@ -49,6 +51,7 @@ class PoliceGestureStreamService:
                 playback_url=self._playback_url(),
                 started_at=datetime.now(timezone.utc),
             )
+            self._latest_jpeg = None
             self._thread = threading.Thread(target=self._worker, args=(source, fps), daemon=True)
             self._thread.start()
             return self._state
@@ -75,6 +78,22 @@ class PoliceGestureStreamService:
                 return self._latest.model_copy(deep=True)
         return GestureFrameResult(gesture="no_gesture", confidence=0.0, keypoints=[], updated_at=datetime.now(timezone.utc))
 
+    def mjpeg_frames(self):
+        last_frame: bytes | None = None
+        while True:
+            with self._frame_condition:
+                self._frame_condition.wait_for(
+                    lambda: (self._latest_jpeg is not None and self._latest_jpeg is not last_frame)
+                    or not self._is_running(),
+                    timeout=1.0,
+                )
+                frame = self._latest_jpeg
+            if frame is not None and frame is not last_frame:
+                last_frame = frame
+                yield b"--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\n\r\n" + frame + b"\r\n"
+            if not self._is_running() and frame is last_frame:
+                break
+
     def _worker(self, source: str, fps: int) -> None:
         capture, resolved_source = open_camera_source(source)
         ffmpeg: subprocess.Popen[bytes] | None = None
@@ -89,6 +108,16 @@ class PoliceGestureStreamService:
                     if not ok or frame is None:
                         raise RuntimeError("摄像头读取失败")
                     result = session.process_frame(frame)
+                    preview = result.annotated_frame
+                    height, width = preview.shape[:2]
+                    if max(height, width) > 960:
+                        scale = 960.0 / max(height, width)
+                        preview = cv2.resize(preview, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+                    ok, encoded = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    if ok:
+                        with self._frame_condition:
+                            self._latest_jpeg = encoded.tobytes()
+                            self._frame_condition.notify_all()
                     height, width = result.annotated_frame.shape[:2]
                     if ffmpeg is None:
                         ffmpeg = self._start_ffmpeg(width, height, fps)
@@ -118,6 +147,8 @@ class PoliceGestureStreamService:
                     ffmpeg.kill()
             with self._lock:
                 self._running = False
+            with self._frame_condition:
+                self._frame_condition.notify_all()
             CameraLeaseManager.release("交警手势识别")
 
     def _start_ffmpeg(self, width: int, height: int, fps: int) -> subprocess.Popen[bytes]:

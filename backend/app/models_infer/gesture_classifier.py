@@ -61,7 +61,12 @@ class GestureClassifier:
     # 动态手势稳定延迟：动作开始 N 秒后才输出结果，避免初期跳变
     DYNAMIC_SETTLE_SECONDS: float = 1.0
 
-    def __init__(self, domain: str = "owner"):
+    def __init__(
+        self,
+        domain: str = "owner",
+        load_custom: bool = True,
+        use_custom_primary: bool = False,
+    ):
         self.domain = domain
         self.tracker: HandGestureTracker | None = (
             HandGestureTracker() if domain == "owner" else None
@@ -93,10 +98,29 @@ class GestureClassifier:
         self._motion_history_max: int = 15
         self._motion_frames: int = 0          # 连续高运动帧计数
 
-        # 尝试加载训练好的 SVM 模型 + 动态 LSTM 模型
+        # 自定义手势 SVM（独立于现有手势分类器）
+        self._custom_model = None
+        self._custom_scaler = None
+        self._custom_labels: list | None = None
+
+        # 尝试加载训练好的 SVM 模型 + 动态 LSTM 模型 + 自定义手势模型
         if domain == "owner":
             self._load_ml_model()
             self._load_dynamic_lstm()
+            if load_custom:
+                self._load_custom_model()
+                # 自定义合并模型（固有类 + 自定义类）晋升为主静态分类器：
+                # "最新版 SVM 训练结果"即 custom_gesture_classifier_svm.joblib，
+                # 它已包含固有 5 类，因此实时流无需再单独维护固有模型文件。
+                # 若自定义模型不存在，则 _ml_model 仍保持固有模型（优雅回退）。
+                if use_custom_primary and self._custom_model is not None:
+                    self._ml_model = self._custom_model
+                    self._ml_scaler = self._custom_scaler
+                    self._ml_labels = np.array(self._custom_labels)
+                    logger.info(
+                        "自定义合并模型已晋升为主静态分类器，类别: %s",
+                        self._custom_labels,
+                    )
 
     # ----------------------------------------------------------------
     # ML 模型加载与推理
@@ -132,11 +156,75 @@ class GestureClassifier:
             logger.warning("初始化动态 LSTM 失败: %s", e)
             self._dynamic_lstm = None
 
-    def _classify_ml(self, keypoints: list[dict]) -> tuple[str, float] | None:
+    # ----------------------------------------------------------------
+    # 自定义手势 SVM（独立于现有手势分类器，不改变现有识别规则）
+    # ----------------------------------------------------------------
+
+    def _load_custom_model(self) -> None:
+        """尝试加载自定义手势 SVM 模型。加载失败不影响现有分类。"""
+        try:
+            from app.core.config import settings
+            model_path = settings.resolved_custom_gesture_classifier_model_path
+            if not os.path.exists(model_path):
+                return
+
+            import joblib
+            bundle = joblib.load(model_path)
+            if not bundle.get("is_custom"):
+                logger.debug("模型文件未标记为自定义手势，跳过加载")
+                return
+
+            self._custom_model = bundle["model"]
+            self._custom_scaler = bundle["scaler"]
+            self._custom_labels = bundle["label_names"].tolist()
+            logger.info("已加载自定义手势 SVM 模型，类别: %s", self._custom_labels)
+        except Exception as e:
+            logger.warning("加载自定义手势 SVM 模型失败: %s", e)
+            self._custom_model = None
+            self._custom_scaler = None
+            self._custom_labels = None
+
+    def classify_custom(self, keypoints: list[dict] | None) -> tuple[str, float] | None:
+        """使用自定义手势 SVM 预测手势。失败返回 None，由调用方回退到现有链路。
+
+        Returns:
+            (custom_gesture_name, confidence) 或 None
+        """
+        if self._custom_model is None or self._custom_scaler is None or self._custom_labels is None:
+            return None
+        if keypoints is None or len(keypoints) != 21:
+            return None
+
+        try:
+            from app.core.config import settings
+            from app.models_infer.hand_utils import normalize_hand_landmarks_array
+
+            feat = normalize_hand_landmarks_array(keypoints).reshape(1, -1)
+            feat_scaled = self._custom_scaler.transform(feat)
+
+            if hasattr(self._custom_model, "predict_proba"):
+                proba = self._custom_model.predict_proba(feat_scaled)[0]
+                idx = int(np.argmax(proba))
+                gesture = str(self._custom_labels[idx])
+                confidence = float(proba[idx])
+            else:
+                idx = int(self._custom_model.predict(feat_scaled)[0])
+                gesture = str(self._custom_labels[idx])
+                confidence = 0.75
+
+            threshold = settings.custom_gesture_confidence_threshold
+            if confidence >= threshold:
+                return gesture, confidence
+            return None
+        except Exception as e:
+            logger.debug("自定义手势 ML 推理失败: %s", e)
+            return None
+
+    def _classify_ml(self, keypoints: list[dict] | None) -> tuple[str, float] | None:
         """使用 SVM 模型预测手势。失败返回 None，由调用方回退到启发式规则。"""
         if self._ml_model is None or self._ml_scaler is None:
             return None
-        if len(keypoints) != 21:
+        if keypoints is None or len(keypoints) != 21:
             return None
 
         try:
@@ -163,7 +251,7 @@ class GestureClassifier:
     # 静态手势分类
     # ----------------------------------------------------------------
 
-    def classify_static(self, keypoints: list[dict]) -> tuple[str, float]:
+    def classify_static(self, keypoints: list[dict] | None) -> tuple[str, float]:
         """
         根据 21 个手部关键点判定静态手势。
         优先使用 ML 模型，不存在时回退到启发式规则。
@@ -171,7 +259,7 @@ class GestureClassifier:
         Returns:
             (gesture_name, confidence)
         """
-        if len(keypoints) != 21:
+        if keypoints is None or len(keypoints) != 21:
             return "unknown", 0.0
 
         # 优先: 训练好的 SVM/ML 模型

@@ -207,3 +207,12 @@ async def stop_police_gesture_stream() -> StreamState:
 @router.get("/stream/result", response_model=GestureFrameResult)
 async def current_police_gesture_stream_result() -> GestureFrameResult:
     return stream_service.current()
+
+
+@router.get("/stream/video-feed")
+async def police_gesture_stream_video_feed() -> StreamingResponse:
+    return StreamingResponse(
+        stream_service.mjpeg_frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "X-Accel-Buffering": "no"},
+    )

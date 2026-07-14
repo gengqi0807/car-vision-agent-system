@@ -344,7 +344,9 @@ class OwnerGestureService:
         if self._stream_classifier is None:
             from app.models_infer.gesture_classifier import GestureClassifier
 
-            self._stream_classifier = GestureClassifier(domain="owner")
+            self._stream_classifier = GestureClassifier(
+                domain="owner", load_custom=True, use_custom_primary=True
+            )
         return self._stream_classifier
 
     @property
@@ -426,8 +428,12 @@ class OwnerGestureService:
         previous_record = recent_records[0] if recent_records else None
         if input_mode == "image":
             primary_hand = hands[0] if hands else []
-            image_gesture = None
-            image_confidence = None
+            classify_custom = getattr(self.classifier, "classify_custom", None)
+            custom_result = classify_custom(primary_hand) if primary_hand and callable(classify_custom) else None
+            if custom_result is not None:
+                image_gesture, image_confidence = custom_result
+            else:
+                image_gesture, image_confidence = None, None
         elif input_mode != "camera":
             primary_hand, image_gesture, image_confidence = self._select_primary_hand(
                 hands,
@@ -452,6 +458,11 @@ class OwnerGestureService:
             )
 
         control_command, _ = self._map_gesture_to_command(raw_gesture_label)
+        if input_mode != "camera" and GESTURE_ACTION_MAP.get(raw_gesture_label, "idle") == "idle":
+            classify_custom = getattr(self.classifier, "classify_custom", None)
+            custom_result = classify_custom(primary_hand) if callable(classify_custom) else None
+            if custom_result is not None:
+                raw_gesture_label, cls_conf = custom_result
         action = GESTURE_ACTION_MAP.get(raw_gesture_label, "idle")
         gesture_label = self._normalize_public_gesture(raw_gesture_label)
         if input_mode == "camera" and runtime_session is not None:
@@ -708,7 +719,9 @@ class OwnerGestureService:
             min_presence_confidence=settings.min_hand_presence_confidence,
             min_tracking_confidence=settings.min_hand_tracking_confidence,
         )
-        self._stream_classifier = GestureClassifier(domain="owner")
+        self._stream_classifier = GestureClassifier(
+            domain="owner", load_custom=True, use_custom_primary=True
+        )
 
     def _infer_camera_hands(self, frame: np.ndarray) -> list[list[dict]]:
         if not self._camera_runtime_ready:
@@ -789,6 +802,7 @@ class OwnerGestureService:
                         inference_frame,
                         self.stream_classifier,
                     )
+                    primary_hand = primary_hand or []
                     observed_gesture = raw_gesture
                     raw_gesture, confidence = self._lock_camera_result(
                         self._stream_runtime_session,
@@ -844,6 +858,11 @@ class OwnerGestureService:
                             interpolation=cv2.INTER_AREA,
                         )
                     annotated_frame = np.ascontiguousarray(annotated_frame)
+                    stream_jpeg = self._encode_frame_to_jpeg(annotated_frame)
+                    if stream_jpeg is not None:
+                        with self._frame_condition:
+                            self._latest_stream_jpeg = stream_jpeg
+                            self._frame_condition.notify_all()
                     if ffmpeg_process.poll() is not None:
                         raise RuntimeError("手势标注流 FFmpeg 推流进程意外退出。")
                     assert ffmpeg_process.stdin is not None

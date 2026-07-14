@@ -38,6 +38,7 @@ const navItems = [
   { label: "车牌识别", to: "/plate-recognition", name: "plate-recognition" },
   { label: "交警手势", to: "/police-gesture", name: "police-gesture" },
   { label: "手势控车", to: "/owner-gesture", name: "owner-gesture" },
+  { label: "自定义手势", to: "/custom-gesture", name: "custom-gesture" },
   { label: "告警监控", to: "/alert-monitor", name: "alert-monitor" }
 ];
 

@@ -64,7 +64,7 @@
 
         <div class="preview-shell">
           <div v-if="mode === 'camera'" class="preview-stage camera-stage">
-            <iframe v-if="cameraPlaybackUrl" :src="cameraPlaybackUrl" class="preview-frame" allow="autoplay; fullscreen" />
+            <img v-if="cameraPlaybackUrl" :src="cameraPlaybackUrl" class="preview-frame" alt="交警手势实时识别画面" />
             <div v-else-if="!cameraActive" class="image-placeholder police-frame">
               交警手势实时识别
               <div class="small">点击“开启摄像头”开始实时检测</div>
@@ -164,6 +164,7 @@ import {
   fetchPoliceGestureStreamResultApi,
   fetchPoliceGestureStreamStateApi,
   fetchPoliceGestureVideoProgressApi,
+  policeGestureVideoFeedUrl,
   startPoliceGestureStreamApi,
   stopPoliceGestureStreamApi,
   type PoliceGestureFrameResult,
@@ -537,10 +538,9 @@ async function startCamera() {
       throw new Error("请选择有效的摄像头编号");
     }
     const { data } = await startPoliceGestureStreamApi(String(cameraSource), 15);
-    if (!data.playback_url) throw new Error("后端未返回 MediaMTX 播放地址");
     cameraActive.value = true;
     startStreamResultPolling();
-    await waitForStreamPublished(data.playback_url);
+    await waitForStreamPublished();
   } catch (err) {
     stopCamera();
     error.value = err instanceof Error ? err.message : "无法开启后端摄像头";
@@ -577,14 +577,14 @@ function stopStreamResultPolling() {
   streamResultTimer = null;
 }
 
-async function waitForStreamPublished(playbackUrl: string) {
+async function waitForStreamPublished() {
   const deadline = Date.now() + 15_000;
   while (cameraActive.value && Date.now() < deadline) {
     const { data } = await fetchPoliceGestureStreamStateApi();
     if (data.last_error) throw new Error(data.last_error);
     if (!data.running) throw new Error("交警手势推流已停止");
     if (data.published) {
-      cameraPlaybackUrl.value = `${playbackUrl}?t=${Date.now()}`;
+      cameraPlaybackUrl.value = `${policeGestureVideoFeedUrl()}?t=${Date.now()}`;
       return;
     }
     await new Promise((resolve) => window.setTimeout(resolve, 150));
@@ -600,9 +600,9 @@ onMounted(async () => {
   }
   try {
     const { data } = await fetchPoliceGestureStreamStateApi();
-    if (data.running && data.playback_url) {
+    if (data.running) {
       cameraActive.value = true;
-      cameraPlaybackUrl.value = `${data.playback_url}?t=${Date.now()}`;
+      cameraPlaybackUrl.value = `${policeGestureVideoFeedUrl()}?t=${Date.now()}`;
       startStreamResultPolling();
     }
   } catch {

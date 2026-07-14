@@ -82,3 +82,90 @@ export const ownerGestureVideoFeedUrl = () => {
   const base = String(request.defaults.baseURL || "").replace(/\/$/, "");
   return `${base}/owner-gesture/video-feed`;
 };
+
+// ── 自定义手势 API ────────────────────────────────────────────────
+
+export interface CustomGestureItem {
+  id: number;
+  name: string;
+  display_name: string;
+  description: string;
+  sample_count: number;
+  is_trained: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CustomGestureListOut {
+  gestures: CustomGestureItem[];
+  total: number;
+}
+
+export interface CustomGestureSampleItem {
+  id: number;
+  gesture_id: number;
+  keypoints: { x: number; y: number; z: number }[];
+  source_type: string;
+  filename: string;
+  created_at: string;
+}
+
+export interface CustomGestureSampleListOut {
+  samples: CustomGestureSampleItem[];
+  total: number;
+}
+
+export interface RejectedItem {
+  filename: string;
+  reason: string;
+}
+
+export interface CustomGestureSampleUploadOut {
+  samples: CustomGestureSampleItem[];
+  rejected: RejectedItem[];
+  total_uploaded: number;
+  total_accepted: number;
+  total_rejected: number;
+}
+
+export interface CustomGestureTrainOut {
+  status: string;
+  message: string;
+  n_samples: number;
+  n_classes: number;
+  class_names: string[];
+  model_path: string;
+  evaluation: Record<string, any>;
+}
+
+export const fetchCustomGesturesApi = () =>
+  request.get<CustomGestureListOut>("/owner-gesture/custom-gesture/");
+
+export const createCustomGestureApi = (payload: {
+  name: string;
+  display_name?: string;
+  description?: string;
+}) => request.post<CustomGestureItem>("/owner-gesture/custom-gesture/", payload);
+
+export const deleteCustomGestureApi = (name: string) =>
+  request.delete(`/owner-gesture/custom-gesture/${encodeURIComponent(name)}`);
+
+export const fetchCustomGestureSamplesApi = (name: string, limit = 50, offset = 0) =>
+  request.get<CustomGestureSampleListOut>(
+    `/owner-gesture/custom-gesture/${encodeURIComponent(name)}/samples`,
+    { params: { limit, offset } }
+  );
+
+export const addCustomGestureSampleApi = (name: string, formData: FormData) =>
+  request.post<CustomGestureSampleUploadOut>(
+    `/owner-gesture/custom-gesture/${encodeURIComponent(name)}/samples`,
+    formData,
+  );
+
+export const deleteCustomGestureSampleApi = (sampleId: number) =>
+  request.delete(`/owner-gesture/custom-gesture/samples/${sampleId}`);
+
+export const triggerCustomGestureTrainApi = (gestureNames?: string[]) =>
+  request.post<CustomGestureTrainOut>("/owner-gesture/custom-gesture/train", {
+    gesture_names: gestureNames || [],
+  });
