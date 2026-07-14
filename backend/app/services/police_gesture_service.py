@@ -88,8 +88,6 @@ VIDEO_GESTURE_TEXT: dict[str, str] = {
 @dataclass
 class _CameraRuntimeState:
     session: PoliceGestureVideoSession
-    last_persisted_gesture: str | None = None
-    last_persisted_at: float = 0.0
 
 
 
@@ -233,17 +231,17 @@ class PoliceGestureService:
         updated_at = datetime.utcnow()
         annotated_image = self._encode_camera_frame_to_data_url(visual_result.annotated_frame)
 
-        if self._should_persist_camera_record(runtime_state, gesture=gesture_label, confidence=cls_conf):
+        completed_gesture = visual_result.completed_gesture
+        completed_confidence = round(float(visual_result.completed_confidence or 0.0), 4)
+        if self._is_recordable_completed_gesture(completed_gesture, completed_confidence):
             self._save_record(
-                gesture_label,
-                cls_conf,
+                completed_gesture,
+                completed_confidence,
                 filename,
                 keypoints_payload=[{"x": kp.x, "y": kp.y, "score": kp.score} for kp in keypoints],
                 user_id=user_id,
                 session_id=active_session_id,
             )
-            runtime_state.last_persisted_gesture = gesture_label
-            runtime_state.last_persisted_at = time.monotonic()
 
         return GestureFrameResult(
             gesture=gesture_label,
@@ -287,8 +285,6 @@ class PoliceGestureService:
         total_frames = 0
         best_result = self._empty_video_result()
         last_result = self._empty_video_result()
-        last_emitted_gesture = NO_VIDEO_GESTURE
-        last_emitted_frame = -10_000
         preview_interval_seconds = 1.0 / max(settings.police_video_preview_max_fps, 0.1)
         last_preview_sent_at = 0.0
         inference_count = 0
@@ -371,20 +367,14 @@ class PoliceGestureService:
                     }
                     if self._should_replace_best(best_result, last_result):
                         best_result = last_result
-                    if self._should_emit_video_event(
-                        last_result=last_result,
-                        last_emitted_gesture=last_emitted_gesture,
-                        processed_frame_count=current_frame_index,
-                        last_emitted_frame=last_emitted_frame,
-                        min_gap_frames=6,
-                    ):
-                        last_emitted_gesture = last_result["gesture"]
-                        last_emitted_frame = current_frame_index
+                    completed_gesture = frame_result.completed_gesture
+                    completed_confidence = round(float(frame_result.completed_confidence or 0.0), 4)
+                    if self._is_recordable_completed_gesture(completed_gesture, completed_confidence):
                         self._append_video_event(
                             resolved_task_id,
                             source_filename=filename,
-                            gesture=last_result["gesture"],
-                            confidence=last_result["confidence"],
+                            gesture=completed_gesture,
+                            confidence=completed_confidence,
                             frame_index=current_frame_index,
                             fps=fps,
                         )
@@ -575,21 +565,24 @@ class PoliceGestureService:
                 self._camera_sessions[key] = state
             return state
 
-    def _should_persist_camera_record(
-        self,
-        runtime_state: _CameraRuntimeState,
-        *,
-        gesture: str,
-        confidence: float,
-    ) -> bool:
-        if gesture in {NO_VIDEO_GESTURE, NO_POSE_GESTURE, "", "unknown"}:
+    @staticmethod
+    def _is_recordable_completed_gesture(gesture: str | None, confidence: float) -> bool:
+        if gesture in {
+            None,
+            "",
+            NO_VIDEO_GESTURE,
+            NO_POSE_GESTURE,
+            "no_pose",
+            "unknown",
+            "other",
+            "其他",
+            "其他手势",
+            "无手势",
+        }:
             return False
         if confidence < max(settings.alert_low_confidence_threshold, 0.72):
             return False
-        now = time.monotonic()
-        if runtime_state.last_persisted_gesture != gesture:
-            return True
-        return now - runtime_state.last_persisted_at >= 1.5
+        return True
 
     def get_video_progress(self, task_id: str) -> PoliceGestureVideoProgress:
         with self._progress_lock:
@@ -624,22 +617,6 @@ class PoliceGestureService:
         target_inference_fps = max(float(settings.police_video_target_inference_fps), 0.1)
         adaptive_interval = max(int(round(fps / target_inference_fps)), 1)
         return max(base_interval, adaptive_interval)
-
-    def _should_emit_video_event(
-        self,
-        *,
-        last_result: dict,
-        last_emitted_gesture: str,
-        processed_frame_count: int,
-        last_emitted_frame: int,
-        min_gap_frames: int,
-    ) -> bool:
-        gesture = last_result["gesture"]
-        if gesture == NO_VIDEO_GESTURE:
-            return False
-        if float(last_result.get("confidence", 0.0) or 0.0) < max(settings.alert_low_confidence_threshold, 0.72):
-            return False
-        return gesture != last_emitted_gesture
 
     def _append_video_event(
         self,

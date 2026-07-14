@@ -79,6 +79,8 @@ class LocalPoliceGestureResult:
     keypoints: list[dict[str, float]]
     annotated_frame: np.ndarray
     display_label: str
+    completed_gesture: str | None = None
+    completed_confidence: float = 0.0
 
 
 class PoliceGestureVideoSession:
@@ -122,6 +124,8 @@ class PoliceGestureVideoSession:
         self.action_flash_text = ""
         self.action_flash_remaining = 0
         self.action_flash_frames = 30
+        self.completed_gesture: str | None = None
+        self.completed_confidence = 0.0
 
     def __enter__(self) -> PoliceGestureVideoSession:
         return self
@@ -443,6 +447,8 @@ class PoliceGestureVideoSession:
             keypoints=keypoints,
             annotated_frame=annotated,
             display_label=display_label,
+            completed_gesture=self._consume_completed_gesture(),
+            completed_confidence=self.completed_confidence,
         )
 
     def _update_action_state(self, feat: dict[str, Any]) -> None:
@@ -451,6 +457,8 @@ class PoliceGestureVideoSession:
             if not both_hip:
                 self.action_state = "active"
                 self.action_frame_count = 0
+                self.completed_gesture = None
+                self.completed_confidence = 0.0
                 self.dl_window.clear()
                 self.dl_filtered_gesture = "无手势"
                 self.dl_filtered_confidence = 0.0
@@ -471,6 +479,9 @@ class PoliceGestureVideoSession:
 
     def _reset_action_state(self, *, show_flash: bool = False) -> None:
         was_active = self.action_state == "active"
+        if show_flash and was_active:
+            self.completed_gesture = normalize_gesture(self.dl_filtered_gesture)
+            self.completed_confidence = round(float(self.dl_filtered_confidence), 4)
         self.action_state = "idle"
         self.action_frame_count = 0
         self.hip_both_frames = 0
@@ -484,6 +495,11 @@ class PoliceGestureVideoSession:
         if show_flash and was_active:
             self.action_flash_text = "动作结束"
             self.action_flash_remaining = self.action_flash_frames
+
+    def _consume_completed_gesture(self) -> str | None:
+        completed_gesture = self.completed_gesture
+        self.completed_gesture = None
+        return completed_gesture
 
     def _update_filtered_dl_result(self, raw_gesture: str, raw_confidence: float) -> None:
         if self.action_state != "active":
