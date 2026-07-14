@@ -42,13 +42,9 @@
         <div class="preview-shell">
           <div v-if="mode === 'camera'" class="preview-stage camera-stage">
             <iframe v-if="cameraPlaybackUrl" :src="cameraPlaybackUrl" class="preview-frame" allow="autoplay; fullscreen" />
-            <div v-if="!cameraActive" class="image-placeholder police-frame">
+            <div v-else-if="!cameraActive" class="image-placeholder police-frame">
               交警手势实时识别
               <div class="small">点击“开启摄像头”开始实时检测</div>
-            </div>
-            <div v-else class="image-placeholder police-frame">
-              交警手势实时识别
-              <div class="small">摄像头已开启，等待后端返回首帧标注结果</div>
             </div>
           </div>
 

@@ -717,7 +717,7 @@ async function startCamera() {
     await stopOwnerGestureStreamApi().catch(() => undefined);
     const { data } = await startOwnerGestureStreamApi("auto", 15);
     if (!data.playback_url) throw new Error("后端未返回 MediaMTX 播放地址");
-    cameraDeviceLabel.value = "4K USB Camera（断开时自动使用内置摄像头）";
+    cameraDeviceLabel.value = "正在自动选择摄像头";
     cameraActive.value = true;
     streamStarting = true;
     startStreamResultPolling();
@@ -768,19 +768,20 @@ function startStreamResultPolling() {
     } catch {
       if (cameraActive.value && !streamStarting) error.value = "无法获取后端手势识别结果";
     } finally {
-      if (cameraActive.value) streamResultTimer = window.setTimeout(poll, 200);
+      if (cameraActive.value) streamResultTimer = window.setTimeout(poll, 500);
     }
   };
   void poll();
 }
 
 async function waitForOwnerGestureStreamPublished(playbackUrl: string) {
-  const deadline = Date.now() + 12_000;
+  const deadline = Date.now() + 30_000;
   while (cameraActive.value && Date.now() < deadline) {
     const { data } = await fetchOwnerGestureStreamStateApi();
     if (data.last_error) throw new Error(data.last_error);
     if (!data.running) throw new Error("后端手势推流已停止");
     if (data.published) {
+      cameraDeviceLabel.value = data.source === "0" ? "内置摄像头" : data.source === "1" ? "4K USB Camera" : `视频源 ${data.source}`;
       await new Promise((resolve) => window.setTimeout(resolve, 900));
       if (!cameraActive.value) return;
       streamVideoUrl.value = `${playbackUrl}?t=${Date.now()}`;
@@ -788,7 +789,7 @@ async function waitForOwnerGestureStreamPublished(playbackUrl: string) {
       error.value = "";
       return;
     }
-    await new Promise((resolve) => window.setTimeout(resolve, 150));
+    await new Promise((resolve) => window.setTimeout(resolve, 400));
   }
   throw new Error("等待 MediaMTX 手势流就绪超时");
 }

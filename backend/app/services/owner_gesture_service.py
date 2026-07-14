@@ -734,6 +734,8 @@ class OwnerGestureService:
 
         frame_interval = 1.0 / max(fps, 1)
         ffmpeg_process: subprocess.Popen[bytes] | None = None
+        publisher_width = 0
+        publisher_height = 0
         next_publish_probe_at = 0.0
         published_frame_count = 0
 
@@ -752,6 +754,26 @@ class OwnerGestureService:
                     continue
 
                 try:
+                    if ffmpeg_process is None:
+                        initial_frame = self._resize_stream_frame(frame_bgr)
+                        height, width = initial_frame.shape[:2]
+                        publisher_width = width
+                        publisher_height = height
+                        ffmpeg_process = self._start_owner_stream_publisher(
+                            width=width,
+                            height=height,
+                            fps=fps,
+                        )
+                        if ffmpeg_process.poll() is not None or ffmpeg_process.stdin is None:
+                            raise RuntimeError("手势标注流 FFmpeg 推流进程启动失败。")
+                        for _ in range(2):
+                            ffmpeg_process.stdin.write(initial_frame.tobytes())
+                            published_frame_count += 1
+                        ffmpeg_process.stdin.flush()
+                        if self._probe_owner_stream_ready():
+                            with self._stream_lock:
+                                self._stream_state = self._stream_state.model_copy(update={"published": True})
+
                     inference_frame = self._prepare_frame_for_inference(frame_bgr)
                     raw_gesture, _, confidence, hand_count, primary_hand = verify_process_frame(
                         inference_frame,
@@ -798,13 +820,20 @@ class OwnerGestureService:
                         ),
                     )
                     annotated_frame = self._resize_stream_frame(annotated_frame)
-                    if ffmpeg_process is None:
-                        height, width = annotated_frame.shape[:2]
-                        ffmpeg_process = self._start_owner_stream_publisher(
-                            width=width,
-                            height=height,
-                            fps=fps,
+                    if (
+                        publisher_width > 0
+                        and publisher_height > 0
+                        and (
+                            annotated_frame.shape[1] != publisher_width
+                            or annotated_frame.shape[0] != publisher_height
                         )
+                    ):
+                        annotated_frame = cv2.resize(
+                            annotated_frame,
+                            (publisher_width, publisher_height),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    annotated_frame = np.ascontiguousarray(annotated_frame)
                     if ffmpeg_process.poll() is not None:
                         raise RuntimeError("手势标注流 FFmpeg 推流进程意外退出。")
                     assert ffmpeg_process.stdin is not None
