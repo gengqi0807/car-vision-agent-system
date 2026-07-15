@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 
 import cv2
 
 from app.core.config import settings
+from app.core.database import SessionLocal
 from app.schemas.gesture import GestureFrameResult, Keypoint, StreamState
 from app.services.mediamtx_runtime import MediaMTXRuntime
 from app.services.camera_source import open_camera_source
 from app.services.camera_lease import CameraLeaseManager
+from app.services.monitor_service import MonitorService
 from app.services.police_gesture_local_runtime import PoliceGestureVideoSession
+
+
+logger = logging.getLogger(__name__)
 
 
 class PoliceGestureStreamService:
@@ -120,9 +128,64 @@ class PoliceGestureStreamService:
             if not self._is_running() and frame is last_frame:
                 break
 
+    @staticmethod
+    def _is_effective_gesture(gesture: str | None) -> bool:
+        return gesture not in {
+            None,
+            "",
+            "no_gesture",
+            "unknown",
+            "other",
+            "no_pose",
+        }
+
+    @staticmethod
+    def _is_success_confidence(confidence: float) -> bool:
+        return float(confidence) >= settings.police_gesture_success_confidence_threshold
+
+    @staticmethod
+    def _is_low_confidence(confidence: float) -> bool:
+        return 0.0 < float(confidence) < settings.police_gesture_low_confidence_threshold
+
+    @staticmethod
+    def _should_reset_low_confidence_streak(last_low_confidence_at: float | None, current_time: float) -> bool:
+        if last_low_confidence_at is None:
+            return True
+        return (current_time - last_low_confidence_at) > settings.police_gesture_low_confidence_window_seconds
+
+    def _capture_monitor_log_sync(
+        self,
+        *,
+        event_type: str,
+        title: str,
+        summary: str,
+        confidence: float | None = None,
+        details: dict | None = None,
+        trigger_alert: bool = False,
+        level: str = "info",
+    ) -> None:
+        with SessionLocal() as session:
+            asyncio.run(
+                MonitorService(session).capture_event(
+                    category="police_gesture",
+                    source="police-gesture",
+                    event_type=event_type,
+                    title=title,
+                    summary=summary,
+                    level=level,
+                    status="processed" if confidence and confidence > 0 else "empty",
+                    confidence=confidence,
+                    details=details,
+                    trigger_alert=trigger_alert,
+                )
+            )
+
     def _worker(self, source: str, fps: int) -> None:
         capture, resolved_source = open_camera_source(source)
         ffmpeg: subprocess.Popen[bytes] | None = None
+        low_confidence_streak = 0
+        last_low_confidence_at: float | None = None
+        no_gesture_started_at = time.monotonic()
         try:
             with self._lock:
                 self._capture = capture
@@ -136,12 +199,92 @@ class PoliceGestureStreamService:
                     if not ok or frame is None:
                         raise RuntimeError("摄像头读取失败")
                     result = session.process_frame(frame)
+                    now = time.monotonic()
+                    if self._is_effective_gesture(result.gesture):
+                        no_gesture_started_at = now
+                    elif now - no_gesture_started_at >= settings.police_gesture_no_gesture_alert_seconds:
+                        self._capture_monitor_log_sync(
+                            event_type="police_gesture_no_gesture_timeout",
+                            title="交警手势长时间无动作",
+                            summary=(
+                                f"实时监控已开启，但连续 {settings.police_gesture_no_gesture_alert_seconds} 秒"
+                                " 未识别到有效动作。"
+                            ),
+                            details={
+                                "source": resolved_source,
+                                "mode": "realtime",
+                            },
+                            trigger_alert=True,
+                            level="warning",
+                        )
+                        no_gesture_started_at = now
+
+                    completed_gesture = result.completed_gesture
+                    completed_confidence = round(float(result.completed_confidence or 0.0), 4)
+                    if self._is_effective_gesture(completed_gesture):
+                        no_gesture_started_at = now
+                        if self._is_success_confidence(completed_confidence):
+                            low_confidence_streak = 0
+                            last_low_confidence_at = None
+                            self._capture_monitor_log_sync(
+                                event_type="police_gesture_success",
+                                title="交警手势识别成功",
+                                summary=(
+                                    f"实时监控成功识别动作 {completed_gesture}，"
+                                    f"置信率 {completed_confidence:.2f}。"
+                                ),
+                                confidence=completed_confidence,
+                                details={
+                                    "source": resolved_source,
+                                    "mode": "realtime",
+                                    "gesture": completed_gesture,
+                                },
+                                trigger_alert=False,
+                                level="info",
+                            )
+                        elif self._is_low_confidence(completed_confidence):
+                            if self._should_reset_low_confidence_streak(last_low_confidence_at, now):
+                                low_confidence_streak = 0
+                            low_confidence_streak += 1
+                            last_low_confidence_at = now
+                            reached_streak_threshold = (
+                                low_confidence_streak >= settings.police_gesture_low_confidence_streak
+                            )
+                            self._capture_monitor_log_sync(
+                                event_type=(
+                                    "police_gesture_low_confidence_alert"
+                                    if reached_streak_threshold
+                                    else "police_gesture_low_confidence"
+                                ),
+                                title=(
+                                    "交警手势连续低置信率告警"
+                                    if reached_streak_threshold
+                                    else "交警手势低置信率"
+                                ),
+                                summary=(
+                                    f"实时监控识别到动作 {completed_gesture}，"
+                                    f"但置信率仅 {completed_confidence:.2f}，"
+                                    f"连续低置信次数 {low_confidence_streak}。"
+                                ),
+                                confidence=completed_confidence,
+                                details={
+                                    "source": resolved_source,
+                                    "mode": "realtime",
+                                    "gesture": completed_gesture,
+                                    "low_confidence_streak": low_confidence_streak,
+                                },
+                                trigger_alert=reached_streak_threshold,
+                                level="warning",
+                            )
+                            if reached_streak_threshold:
+                                low_confidence_streak = 0
+                                last_low_confidence_at = None
+                        else:
+                            low_confidence_streak = 0
+                            last_low_confidence_at = None
                     preview = result.annotated_frame
-                    height, width = preview.shape[:2]
-                    if max(height, width) > 960:
-                        scale = 960.0 / max(height, width)
-                        preview = cv2.resize(preview, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
-                    ok, encoded = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    # Keep the browser preview as close as possible to the original camera frame.
+                    ok, encoded = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
                     if ok:
                         with self._frame_condition:
                             self._latest_jpeg = encoded.tobytes()

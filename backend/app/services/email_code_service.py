@@ -10,6 +10,7 @@ from threading import Lock
 from fastapi import HTTPException, status
 
 from app.core.config import settings
+from app.utils.email_sender import send_email_message
 from app.utils.crypto import normalize_email
 
 
@@ -88,19 +89,11 @@ class EmailCodeService:
         )
 
         try:
-            if settings.smtp_use_ssl:
-                with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=15) as server:
-                    server.login(settings.smtp_user, settings.smtp_password)
-                    server.send_message(message)
-            else:
-                with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as server:
-                    server.starttls()
-                    server.login(settings.smtp_user, settings.smtp_password)
-                    server.send_message(message)
+            send_email_message(message)
         except smtplib.SMTPAuthenticationError as exc:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="邮箱认证失败，请确认已开启 163 SMTP 服务，并在 SMTP_PASSWORD 中填写客户端授权码",
+                detail="邮箱认证失败，请确认已开启 SMTP 服务，并在 SMTP_PASSWORD 中填写客户端授权码",
             ) from exc
         except (OSError, smtplib.SMTPException) as exc:
             raise HTTPException(

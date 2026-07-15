@@ -42,6 +42,24 @@
           </button>
         </div>
 
+        <div v-if="mode === 'camera'" class="camera-tuning-panel">
+          <label class="camera-tuning-control camera-zoom-control">
+            <span>画面缩放 {{ cameraZoomLabel }}</span>
+            <input v-model="cameraZoomLevel" type="range" min="0.7" max="2.5" step="0.1" />
+          </label>
+          <label class="camera-tuning-control">
+            <span>显示框大小</span>
+            <select v-model="cameraViewportSize">
+              <option value="standard">标准</option>
+              <option value="large">放大</option>
+              <option value="xlarge">超大</option>
+            </select>
+          </label>
+          <button type="button" class="mode-btn reset-tuning-btn" @click="resetCameraTuning">
+            恢复默认
+          </button>
+        </div>
+
         <label v-else class="upload-zone">
           <input
             class="hidden-input"
@@ -63,8 +81,15 @@
         </div>
 
         <div class="preview-shell">
-          <div v-if="mode === 'camera'" class="preview-stage camera-stage">
-            <img v-if="cameraPlaybackUrl" :src="cameraPlaybackUrl" class="preview-frame" alt="交警手势实时识别画面" />
+          <div v-if="mode === 'camera'" class="preview-stage camera-stage" :style="cameraViewportStyle">
+            <div v-if="cameraPlaybackUrl" class="camera-frame-viewport">
+              <img
+                :src="cameraPlaybackUrl"
+                class="preview-frame camera-preview-frame"
+                :style="cameraPreviewStyle"
+                alt="交警手势实时识别画面"
+              />
+            </div>
             <div v-else-if="!cameraActive" class="image-placeholder police-frame">
               交警手势实时识别
               <div class="small">点击“开启摄像头”开始实时检测</div>
@@ -187,6 +212,8 @@ const cameraActive = ref(false);
 const cameraSourceChoice = ref("0");
 const customCameraSource = ref(4);
 const cameraPlaybackUrl = ref("");
+const cameraZoomLevel = ref("1.0");
+const cameraViewportSize = ref<"standard" | "large" | "xlarge">("large");
 let streamResultTimer: number | null = null;
 
 const GESTURE_LABELS: Record<string, string> = {
@@ -231,6 +258,20 @@ const cameraStatusText = computed(() => {
     return `实时识别中 · 当前动作 ${formatGesture(cameraResult.value.gesture)}`;
   }
   return "实时模式已启动，等待第一帧结果";
+});
+const cameraZoomLabel = computed(() => `${Number(cameraZoomLevel.value).toFixed(1)}x`);
+const cameraPreviewStyle = computed(() => ({
+  transform: `scale(${Number(cameraZoomLevel.value)})`
+}));
+const cameraViewportStyle = computed(() => {
+  const heightMap: Record<"standard" | "large" | "xlarge", string> = {
+    standard: "360px",
+    large: "480px",
+    xlarge: "620px"
+  };
+  return {
+    "--camera-frame-height": heightMap[cameraViewportSize.value]
+  };
 });
 let videoProgressTimer: number | null = null;
 
@@ -526,6 +567,11 @@ function resolveBackendOrigin() {
   return `${protocol}//${host}`;
 }
 
+function resetCameraTuning() {
+  cameraZoomLevel.value = "1.0";
+  cameraViewportSize.value = "large";
+}
+
 async function startCamera() {
   if (cameraActive.value) return;
   mode.value = "camera";
@@ -690,6 +736,17 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
 }
 
+.camera-tuning-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid rgba(180, 146, 116, 0.22);
+  border-radius: 12px;
+  background: rgba(255, 249, 242, 0.72);
+}
+
 .camera-source-control {
   display: inline-flex;
   align-items: center;
@@ -712,6 +769,34 @@ onBeforeUnmount(() => {
 .camera-source-control input {
   width: 84px;
   min-width: 84px;
+}
+
+.camera-tuning-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted-soft);
+  font-size: 13px;
+}
+
+.camera-tuning-control select {
+  height: 38px;
+  min-width: 112px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-muted);
+}
+
+.camera-zoom-control {
+  flex: 1 1 260px;
+}
+
+.camera-zoom-control input[type="range"] {
+  flex: 1;
+  min-width: 160px;
+  accent-color: var(--accent);
 }
 
 .mode-btn {
@@ -744,6 +829,13 @@ onBeforeUnmount(() => {
   color: #49372d;
 }
 
+.reset-tuning-btn {
+  flex: 0 0 auto;
+  color: #5b4639;
+  background: rgba(132, 96, 62, 0.12);
+  border: 1px solid rgba(132, 96, 62, 0.18);
+}
+
 .upload-zone {
   display: grid;
   gap: 4px;
@@ -767,6 +859,15 @@ onBeforeUnmount(() => {
 .camera-stage {
   position: relative;
   width: 100%;
+  min-height: var(--camera-frame-height, 480px);
+}
+
+.camera-frame-viewport {
+  width: 100%;
+  height: var(--camera-frame-height, 480px);
+  overflow: hidden;
+  border-radius: 12px;
+  background: #111;
 }
 
 .police-frame {
@@ -791,6 +892,16 @@ onBeforeUnmount(() => {
   object-fit: contain;
   border-radius: 10px;
   background: #f4eadf;
+}
+
+.camera-preview-frame {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  max-height: none;
+  object-fit: contain;
+  transform-origin: center center;
+  transition: transform 0.18s ease-out;
 }
 
 .summary-row {

@@ -6,15 +6,24 @@ const EVENT_TYPE_LABELS: Record<string, string> = {
   email_login: "邮箱登录",
   update_profile: "更新资料",
   plate_recognition_success: "车牌识别成功",
+  plate_recognition_low_confidence: "车牌识别低置信率",
+  plate_recognition_low_confidence_alert: "车牌识别连续低置信率告警",
   plate_recognition_no_detection: "车牌未识别到结果",
   plate_recognition_failure: "车牌识别失败",
   plate_recognition_timeout: "车牌识别超时",
   owner_gesture_success: "车主手势识别成功",
   owner_gesture_low_confidence: "车主手势低置信度",
   owner_gesture_decode_error: "车主手势图像解析失败",
+  owner_gesture_no_gesture_timeout: "车主手势长时间无动作告警",
+  custom_gesture_create_success: "自定义手势创建成功",
+  custom_gesture_dataset_upload_success: "自定义手势数据集上传成功",
+  custom_gesture_train_success: "自定义手势训练成功",
   police_gesture_success: "交警手势识别成功",
   police_gesture_low_confidence: "交警手势低置信度",
-  police_gesture_decode_error: "交警手势图像解析失败"
+  police_gesture_low_confidence_alert: "交警手势连续低置信率告警",
+  police_gesture_no_gesture_timeout: "交警手势长时间无动作告警",
+  police_gesture_decode_error: "交警手势图像解析失败",
+  plate_image_no_detection: "车牌图片未识别到车牌",
 };
 
 const STATUS_LABELS: Record<string, string> = {
@@ -32,7 +41,7 @@ const STATUS_LABELS: Record<string, string> = {
   processed: "已处理",
   empty: "空结果",
   recorded: "已记录",
-  pending: "待处理"
+  pending: "待处理",
 };
 
 const OPERATION_TYPE_LABELS: Record<string, string> = {
@@ -42,13 +51,13 @@ const OPERATION_TYPE_LABELS: Record<string, string> = {
   update_profile: "更新资料",
   plate_recognition: "车牌识别",
   owner_gesture_recognition: "车主手势识别",
-  police_gesture_recognition: "交警手势识别"
+  police_gesture_recognition: "交警手势识别",
 };
 
 const TITLE_LABELS: Record<string, string> = {
   "Police gesture not recognized": "交警手势未识别",
   "Police gesture frame processed": "交警手势帧处理完成",
-  "Police gesture frame processing failed": "交警手势帧处理失败"
+  "Police gesture frame processing failed": "交警手势帧处理失败",
 };
 
 const TOKEN_LABELS: Record<string, string> = {
@@ -79,8 +88,8 @@ const TOKEN_LABELS: Record<string, string> = {
   SwitchNextFeature: "切换下一个功能",
   AnswerCall: "接听电话",
   HangUpCall: "挂断电话",
-  ReturnHome: "返回主页",
-  None: "无"
+  ReturnHome: "返回首页",
+  None: "无",
 };
 
 function escapeRegExp(value: string) {
@@ -101,7 +110,7 @@ function replaceKnownTokens(text: string) {
   return localized
     .split("Cannot decode image bytes.").join("无法解析图像字节数据。")
     .split("gesture=").join("手势=")
-    .split("confidence=").join("置信度=")
+    .split("confidence=").join("置信率=")
     .split("poses=").join("姿态数=")
     .split("processed:").join("已处理：");
 }
@@ -138,7 +147,7 @@ export function localizeLogSummary(value: string) {
       "$1 未识别出有效的交警手势。手势=$2，姿态数=$3。"
     )
     .replace(
-      /^(.+?) 已处理： 手势=(.+), 置信度=([\d.]+), 姿态数=(\d+)\.$/,
-      "$1 已处理完成：手势=$2，置信度=$3，姿态数=$4。"
+      /^(.+?) 已处理： 手势=(.+), 置信率=([\d.]+), 姿态数=(\d+)\.$/,
+      "$1 已处理完成：手势=$2，置信率=$3，姿态数=$4。"
     );
 }

@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.agents.alert_agent import AlertAgent
+from app.agents.notifier import Notifier
 from app.models.monitor_log import MonitorLog
 
 
@@ -13,6 +14,7 @@ class MonitorService:
     def __init__(self, db: Session) -> None:
         self.db = db
         self.alert_agent = AlertAgent(db)
+        self.notifier = Notifier()
 
     async def capture_event(
         self,
@@ -46,6 +48,19 @@ class MonitorService:
         self.db.add(entry)
         self.db.commit()
         self.db.refresh(entry)
+
+        self.notifier.notify_monitor_log(
+            {
+                "level": level,
+                "source": source,
+                "event_type": event_type,
+                "title": title,
+                "summary": summary,
+                "status": status,
+                "confidence": confidence,
+                "details": details,
+            }
+        )
 
         if trigger_alert:
             await self.alert_agent.observe(entry, details=details)

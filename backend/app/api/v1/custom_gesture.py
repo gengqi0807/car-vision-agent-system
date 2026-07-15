@@ -22,6 +22,7 @@ from app.schemas.custom_gesture import (
     CustomGestureTrainRequest,
     KeypointItem,
 )
+from app.services.monitor_service import MonitorService
 from app.services.custom_gesture_service import (
     add_sample,
     create_custom_gesture,
@@ -40,6 +41,29 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/custom-gesture", tags=["custom-gesture"])
 
 
+async def _capture_custom_gesture_log(
+    db: Session,
+    *,
+    event_type: str,
+    title: str,
+    summary: str,
+    user_id: int | None,
+    details: dict | None = None,
+) -> None:
+    await MonitorService(db).capture_event(
+        category="owner_gesture",
+        source="owner-gesture",
+        event_type=event_type,
+        title=title,
+        summary=summary,
+        level="info",
+        status="processed",
+        user_id=user_id,
+        details=details,
+        trigger_alert=False,
+    )
+
+
 # ── 手势 CRUD ────────────────────────────────────────────────────
 
 @router.get("/", response_model=CustomGestureListOut)
@@ -52,13 +76,29 @@ def get_gestures(
 
 
 @router.post("/", response_model=CustomGestureOut)
-def create_gesture(
+async def create_gesture(
     payload: CustomGestureCreate,
     db: Session = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     try:
-        return create_custom_gesture(db, payload)
+        result = create_custom_gesture(db, payload)
+        await _capture_custom_gesture_log(
+            db,
+            event_type="custom_gesture_create_success",
+            title="自定义手势创建成功",
+            summary=(
+                f"已成功创建自定义手势 {result.display_name or result.name} "
+                f"({result.name})，当前样本数 {result.sample_count} 张。"
+            ),
+            user_id=current_user.id,
+            details={
+                "gesture_name": result.name,
+                "gesture_display_name": result.display_name,
+                "sample_count": result.sample_count,
+            },
+        )
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -106,7 +146,7 @@ async def create_sample(
     gesture_name: str,
     file: list[UploadFile] = File(...),
     db: Session = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     """上传手势图片（支持单张或多张），服务端自动抽取 21 个手部关键点并保存为样本。
     不合规定的图片直接丢弃并在响应中返回原因。"""
@@ -156,13 +196,34 @@ async def create_sample(
             rejected.append(CustomGestureSampleRejected(filename=filename, reason=str(exc)))
 
     total_uploaded = len(file)
-    return CustomGestureSampleBatchOut(
+    response = CustomGestureSampleBatchOut(
         samples=samples,
         rejected=rejected,
         total_uploaded=total_uploaded,
         total_accepted=len(samples),
         total_rejected=len(rejected),
     )
+    if response.total_accepted > 0:
+        gesture_after_upload = get_custom_gesture_by_name(db, gesture_name)
+        await _capture_custom_gesture_log(
+            db,
+            event_type="custom_gesture_dataset_upload_success",
+            title="自定义手势数据集上传成功",
+            summary=(
+                f"手势 {gesture_name} 成功上传 {response.total_accepted} 张样本，"
+                f"当前数据集共 {gesture_after_upload.sample_count if gesture_after_upload else response.total_accepted} 张。"
+            ),
+            user_id=current_user.id,
+            details={
+                "gesture_name": gesture_name,
+                "accepted_count": response.total_accepted,
+                "rejected_count": response.total_rejected,
+                "dataset_sample_count": (
+                    gesture_after_upload.sample_count if gesture_after_upload else response.total_accepted
+                ),
+            },
+        )
+    return response
 
 
 @router.delete("/samples/{sample_id}")
@@ -180,13 +241,31 @@ def delete_sample_endpoint(
 # ── 训练 ──────────────────────────────────────────────────────────
 
 @router.post("/train", response_model=CustomGestureTrainOut)
-def trigger_train(
+async def trigger_train(
     payload: CustomGestureTrainRequest | None = None,
     db: Session = Depends(get_db),
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     """触发自定义手势 SVM 训练。
     可选指定 gesture_names 来只训练部分手势；不指定则训练全部。
     """
     names = payload.gesture_names if payload and payload.gesture_names else None
-    return run_train(gesture_names=names if names else None)
+    result = run_train(gesture_names=names if names else None)
+    if result.status == "success":
+        await _capture_custom_gesture_log(
+            db,
+            event_type="custom_gesture_train_success",
+            title="自定义手势训练成功",
+            summary=(
+                f"已成功训练 {len(result.class_names)} 个自定义手势，"
+                f"共使用 {result.n_samples} 张样本。手势名称：{', '.join(result.class_names)}。"
+            ),
+            user_id=current_user.id,
+            details={
+                "gesture_names": result.class_names,
+                "gesture_count": len(result.class_names),
+                "sample_count": result.n_samples,
+                "model_path": result.model_path,
+            },
+        )
+    return result

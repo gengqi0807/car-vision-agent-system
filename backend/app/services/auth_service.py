@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.logger import get_logger
 from app.core.security import create_access_token, hash_password, verify_password
+from app.agents.notifier import Notifier
 from app.models.alert_log import AlertLog
 from app.models.monitor_log import MonitorLog
 from app.models.user import User
@@ -31,6 +32,7 @@ class AuthService:
     def __init__(self, db: Session):
         self.db = db
         self.email_code_service = EmailCodeService()
+        self.notifier = Notifier()
 
     def register(self, payload: RegisterRequest) -> UserProfile:
         self._ensure_unique_user_fields(payload.username, payload.email, payload.phone)
@@ -334,6 +336,16 @@ class AuthService:
                 status=response_status,
                 user_id=user_id,
             )
+        )
+        self.notifier.notify_monitor_log(
+            {
+                "level": level,
+                "source": "auth",
+                "event_type": operation_type,
+                "title": title,
+                "summary": summary,
+                "status": response_status,
+            }
         )
 
     def _log_alert_event(

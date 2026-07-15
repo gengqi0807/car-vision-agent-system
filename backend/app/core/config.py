@@ -159,6 +159,10 @@ class Settings(BaseSettings):
     plate_push_playback_base_url: str = Field(default="http://127.0.0.1:8889")
     plate_push_fps: int = Field(default=25)
     plate_push_bitrate: str = Field(default="2M")
+    plate_success_confidence_threshold: float = Field(default=0.72)
+    plate_low_confidence_threshold: float = Field(default=0.55)
+    plate_low_confidence_streak: int = Field(default=3)
+    plate_low_confidence_window_seconds: int = Field(default=12)
     owner_gesture_mediamtx_bin: str = Field(
         default=r"D:\tool\mediamtx\mediamtx_v1.19.2_windows_amd64\mediamtx.exe"
     )
@@ -170,6 +174,8 @@ class Settings(BaseSettings):
     owner_gesture_playback_base_url: str = Field(default="http://127.0.0.1:8889")
     owner_gesture_push_bitrate: str = Field(default="2M")
     owner_gesture_startup_warmup_enabled: bool = Field(default=True)
+    police_gesture_startup_warmup_enabled: bool = Field(default=True)
+    owner_gesture_no_gesture_alert_seconds: int = Field(default=20)
     external_camera_index: int = Field(default=1, ge=0)
     local_camera_index: int = Field(default=0, ge=0)
 
@@ -210,6 +216,11 @@ class Settings(BaseSettings):
     police_video_preview_buffer_max_frames: int = Field(default=60)
     police_video_reader_queue_max_frames: int = Field(default=48)
     police_video_processor_batch_size: int = Field(default=8)
+    police_gesture_success_confidence_threshold: float = Field(default=0.72)
+    police_gesture_low_confidence_threshold: float = Field(default=0.60)
+    police_gesture_low_confidence_streak: int = Field(default=3)
+    police_gesture_low_confidence_window_seconds: int = Field(default=12)
+    police_gesture_no_gesture_alert_seconds: int = Field(default=20)
 
     @property
     def sqlalchemy_database_url(self) -> str:

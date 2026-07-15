@@ -32,6 +32,7 @@ from app.schemas.plate import (
     PlateVideoJobStatusResponse,
     PlateVideoRecognitionResponse,
 )
+from app.services.monitor_service import MonitorService
 
 logger = get_logger(__name__)
 
@@ -159,6 +160,9 @@ class PlateService:
         self._recent_history_by_plate: dict[str, float] = {}
         self._recent_live_stream_history_by_plate: dict[str, float] = {}
         self._recent_history_lock = Lock()
+        self._plate_monitor_lock = Lock()
+        self._plate_low_confidence_streaks: dict[str, tuple[int, float]] = {}
+        self._plate_image_no_detection_streak = 0
         self._runtime_warmed = False
 
     def warmup_runtime(self, *, silent: bool = True) -> None:
@@ -179,9 +183,17 @@ class PlateService:
         source_path = self._persist_upload(image_bytes, filename) if settings.plate_save_uploads else None
         detections = self._coalesce_plate_results_by_number(self._recognize_image_detections(image_bytes))
         detections = [self._stabilize_image_detection_color(item) for item in detections]
+        self._handle_plate_low_confidence_detections(
+            detections,
+            mode="image",
+            source_label=filename,
+        )
 
         if detections:
-            self._save_history(detections, source_path)
+            self._reset_plate_image_no_detection_streak()
+            self._save_history(detections, source_path, mode="image", source_label=filename)
+        else:
+            self._handle_plate_image_no_detection(filename)
 
         return PlateRecognitionResponse(frame_id=filename, detections=detections)
 
@@ -441,15 +453,24 @@ class PlateService:
                         source_detections,
                         fresh_detections,
                         _,
-                    ) = self._process_video_frame_with_tracking(
-                        local_frame,
-                        state=state,
-                        render=False,
-                    )
+                ) = self._process_video_frame_with_tracking(
+                    local_frame,
+                    state=state,
+                    render=False,
+                )
                     if fresh_detections:
+                        self._handle_plate_low_confidence_detections(
+                            fresh_detections,
+                            mode="stream",
+                            source_label=source_label,
+                        )
                         now = time.monotonic()
                         if now - state.last_history_saved_at >= settings.plate_stream_history_interval_seconds:
-                            self._save_live_stream_history(fresh_detections, state.tracks)
+                            self._save_live_stream_history(
+                                fresh_detections,
+                                state.tracks,
+                                source_label=source_label,
+                            )
                             state.last_history_saved_at = now
                     current_time = time.monotonic()
                     with recognition_lock:
@@ -894,6 +915,11 @@ class PlateService:
                     render=should_publish_progress or should_write_output_frame,
                 )
                 if fresh_detections:
+                    self._handle_plate_low_confidence_detections(
+                        fresh_detections,
+                        mode="video",
+                        source_label=filename,
+                    )
                     detection_pass_count += 1
                     detection_hit_count += 1
                     self._merge_best_detections(best_detections, fresh_detections, recognized=True)
@@ -947,7 +973,7 @@ class PlateService:
 
         detections = self._finalize_video_detections(best_detections)
         if detections:
-            self._save_history(detections, None)
+            self._save_history(detections, None, mode="video", source_label=filename)
 
         logger.info(
             "Video detection stage finished: %s | processed_frames=%d detection_passes=%d unique_plates=%d elapsed=%.1fs profile={tracking=%.1fs recognize=%.1fs probe=%.1fs unread_ocr=%.1fs render=%.1fs}",
@@ -2021,13 +2047,18 @@ class PlateService:
                 aggressive=aggressive_detection,
                 heavy_scan=should_use_heavy_scan,
             )
+            self._handle_plate_low_confidence_detections(
+                fresh_detections,
+                mode="stream",
+                source_label="legacy-stream",
+            )
             state.tracks = self._merge_recognized_tracks(source_frame, state.tracks, fresh_detections, state.frame_index)
             state.last_recognition_frame = state.frame_index
 
             if save_history and fresh_detections:
                 now = time.monotonic()
                 if now - state.last_history_saved_at >= settings.plate_stream_history_interval_seconds:
-                    self._save_history(fresh_detections, None)
+                    self._save_history(fresh_detections, None, mode="stream", source_label="legacy-stream")
                     state.last_history_saved_at = now
 
         active_detections = self._tracks_to_detections(state.tracks)
@@ -5594,7 +5625,180 @@ class PlateService:
             return 0.0
         return intersection / union
 
-    def _save_history(self, detections: list[PlateDetection], source_path: str | None) -> None:
+    @staticmethod
+    def _is_plate_success_confidence(confidence: float) -> bool:
+        return float(confidence) >= settings.plate_success_confidence_threshold
+
+    @staticmethod
+    def _is_plate_low_confidence(confidence: float) -> bool:
+        return 0.0 < float(confidence) < settings.plate_low_confidence_threshold
+
+    def _reset_plate_image_no_detection_streak(self) -> None:
+        with self._plate_monitor_lock:
+            self._plate_image_no_detection_streak = 0
+
+    def _reset_plate_low_confidence_streak(self, plate_number: str) -> None:
+        with self._plate_monitor_lock:
+            self._plate_low_confidence_streaks.pop(plate_number, None)
+
+    def _capture_plate_monitor_log_sync(
+        self,
+        *,
+        event_type: str,
+        title: str,
+        summary: str,
+        confidence: float | None = None,
+        details: dict | None = None,
+        trigger_alert: bool = False,
+        level: str = "info",
+    ) -> None:
+        with SessionLocal() as session:
+            asyncio.run(
+                MonitorService(session).capture_event(
+                    category="plate_recognition",
+                    source="plate-recognition",
+                    event_type=event_type,
+                    title=title,
+                    summary=summary,
+                    level=level,
+                    status="processed" if confidence and confidence > 0 else "empty",
+                    confidence=confidence,
+                    details=details,
+                    trigger_alert=trigger_alert,
+                )
+            )
+
+    def _handle_plate_low_confidence_detections(
+        self,
+        detections: list[PlateDetection],
+        *,
+        mode: str,
+        source_label: str,
+    ) -> None:
+        if not detections:
+            return
+
+        current_time = time.monotonic()
+        for detection in detections:
+            plate_number = (detection.plate_number or "").strip()
+            if not plate_number:
+                continue
+
+            confidence = float(detection.confidence or 0.0)
+            if self._is_plate_success_confidence(confidence):
+                self._reset_plate_low_confidence_streak(plate_number)
+                continue
+
+            if not self._is_plate_low_confidence(confidence):
+                self._reset_plate_low_confidence_streak(plate_number)
+                continue
+
+            with self._plate_monitor_lock:
+                last_state = self._plate_low_confidence_streaks.get(plate_number)
+                if (
+                    last_state is None
+                    or current_time - last_state[1] > settings.plate_low_confidence_window_seconds
+                ):
+                    streak = 1
+                else:
+                    streak = last_state[0] + 1
+                self._plate_low_confidence_streaks[plate_number] = (streak, current_time)
+
+            reached_threshold = streak >= settings.plate_low_confidence_streak
+            self._capture_plate_monitor_log_sync(
+                event_type=(
+                    "plate_recognition_low_confidence_alert"
+                    if reached_threshold
+                    else "plate_recognition_low_confidence"
+                ),
+                title=(
+                    "车牌识别连续低置信率告警"
+                    if reached_threshold
+                    else "车牌识别低置信率"
+                ),
+                summary=(
+                    f"{mode} 模式识别到车牌 {plate_number}，"
+                    f"但置信率仅 {confidence:.2f}，"
+                    f"短时间连续低置信次数 {streak}。"
+                ),
+                confidence=confidence,
+                details={
+                    "plate_number": plate_number,
+                    "plate_color": detection.plate_color,
+                    "vehicle_type": detection.vehicle_type,
+                    "mode": mode,
+                    "source_label": source_label,
+                    "low_confidence_streak": streak,
+                },
+                trigger_alert=reached_threshold,
+                level="warning",
+            )
+            if reached_threshold:
+                self._reset_plate_low_confidence_streak(plate_number)
+
+    def _handle_plate_image_no_detection(self, filename: str) -> None:
+        with self._plate_monitor_lock:
+            self._plate_image_no_detection_streak += 1
+            streak = self._plate_image_no_detection_streak
+            is_critical = streak >= 3
+            if is_critical:
+                self._plate_image_no_detection_streak = 0
+
+        self._capture_plate_monitor_log_sync(
+            event_type="plate_image_no_detection",
+            title="车牌图片未识别到车牌",
+            summary=(
+                f"{filename} 未识别到任何车牌，当前连续未识别次数 {streak}。"
+            ),
+            details={
+                "filename": filename,
+                "mode": "image",
+                "no_detection_streak": streak,
+            },
+            trigger_alert=True,
+            level="critical" if is_critical else "warning",
+        )
+
+    def _emit_plate_success_logs(
+        self,
+        detections: list[PlateDetection],
+        *,
+        mode: str,
+        source_label: str,
+    ) -> None:
+        for detection in detections:
+            plate_number = (detection.plate_number or "").strip()
+            if not plate_number or not self._is_plate_success_confidence(detection.confidence):
+                continue
+
+            self._reset_plate_low_confidence_streak(plate_number)
+            self._capture_plate_monitor_log_sync(
+                event_type="plate_recognition_success",
+                title="车牌识别成功",
+                summary=(
+                    f"{mode} 模式成功识别车牌 {plate_number}，"
+                    f"置信率 {float(detection.confidence):.2f}。"
+                ),
+                confidence=float(detection.confidence),
+                details={
+                    "plate_number": plate_number,
+                    "plate_color": detection.plate_color,
+                    "vehicle_type": detection.vehicle_type,
+                    "mode": mode,
+                    "source_label": source_label,
+                },
+                trigger_alert=False,
+                level="info",
+            )
+
+    def _save_history(
+        self,
+        detections: list[PlateDetection],
+        source_path: str | None,
+        *,
+        mode: str = "image_or_video",
+        source_label: str = "",
+    ) -> None:
         detections = self._coalesce_plate_results_by_number(detections)
         now = time.monotonic()
         filtered_detections: list[PlateDetection] = []
@@ -5634,11 +5838,14 @@ class PlateService:
         with SessionLocal() as session:
             session.add_all(records)
             session.commit()
+        self._emit_plate_success_logs(filtered_detections, mode=mode, source_label=source_label or (source_path or ""))
 
     def _save_live_stream_history(
         self,
         detections: list[PlateDetection],
         tracks: list[PlateTrack],
+        *,
+        source_label: str = "",
     ) -> None:
         detections = self._select_stable_live_stream_history_detections(detections, tracks)
         if not detections:
@@ -5685,6 +5892,7 @@ class PlateService:
         with SessionLocal() as session:
             session.add_all(records)
             session.commit()
+        self._emit_plate_success_logs(filtered_detections, mode="stream", source_label=source_label)
 
     def _select_stable_live_stream_history_detections(
         self,

@@ -326,6 +326,7 @@ interface ImageBatchResult {
 }
 
 const PLATE_MODE_STORAGE_KEY = "plate-recognition-mode";
+const PLATE_VIDEO_JOB_STORAGE_KEY = "plate-recognition-active-video-job";
 const PLATE_STREAM_INPUT_STORAGE_KEY = "plate-stream-input";
 const PLATE_STREAM_PRESET_STORAGE_KEY = "plate-stream-preset";
 const PLATE_STREAM_SOURCE_TYPE_STORAGE_KEY = "plate-stream-source-type";
@@ -344,6 +345,27 @@ function readStoredValue(key: string) {
     return "";
   }
   return window.sessionStorage.getItem(key) ?? "";
+}
+
+function readStoredVideoJobId() {
+  if (typeof window === "undefined") {
+    return "";
+  }
+  return window.localStorage.getItem(PLATE_VIDEO_JOB_STORAGE_KEY) ?? "";
+}
+
+function storeVideoJobId(jobId: string) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.localStorage.setItem(PLATE_VIDEO_JOB_STORAGE_KEY, jobId);
+}
+
+function clearStoredVideoJobId() {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.localStorage.removeItem(PLATE_VIDEO_JOB_STORAGE_KEY);
 }
 
 function readStoredStreamSourceType(): "rtsp" | "camera" {
@@ -811,6 +833,7 @@ function resetVideoState() {
   videoResult.value = null;
   videoJob.value = null;
   activeVideoJobId = "";
+  clearStoredVideoJobId();
 }
 
 function stopVideoJobPolling() {
@@ -838,6 +861,7 @@ async function refreshVideoJobStatus(jobId: string) {
     };
     isLoading.value = false;
     loadingText.value = "";
+    clearStoredVideoJobId();
     stopVideoJobPolling();
     await loadHistory();
     return;
@@ -859,6 +883,7 @@ async function refreshVideoJobStatus(jobId: string) {
 function startVideoJobPolling(jobId: string) {
   stopVideoJobPolling();
   activeVideoJobId = jobId;
+  storeVideoJobId(jobId);
   videoJobTimer = window.setInterval(async () => {
     try {
       await refreshVideoJobStatus(jobId);
@@ -880,6 +905,48 @@ function startVideoJobPolling(jobId: string) {
       requestError.value = extractErrorMessage(error, "无法获取视频处理进度，请确认后端仍在运行。");
     }
   }, 1200);
+}
+
+async function restoreVideoJob() {
+  const jobId = readStoredVideoJobId();
+  if (!jobId) {
+    return;
+  }
+
+  mode.value = "video";
+  requestError.value = "";
+  isLoading.value = true;
+  loadingText.value = "正在恢复视频处理进度，请稍候...";
+  activeVideoJobId = jobId;
+
+  try {
+    await refreshVideoJobStatus(jobId);
+    if (videoJob.value?.status === "failed") {
+      clearStoredVideoJobId();
+      activeVideoJobId = "";
+      return;
+    }
+    if (!videoResult.value) {
+      startVideoJobPolling(jobId);
+    }
+  } catch (error) {
+    const responseStatus =
+      typeof error === "object" && error && "response" in error
+        ? (error as { response?: { status?: number } }).response?.status
+        : undefined;
+    if (responseStatus === 404) {
+      clearStoredVideoJobId();
+      activeVideoJobId = "";
+      videoJob.value = null;
+      videoResult.value = null;
+      isLoading.value = false;
+      loadingText.value = "";
+      requestError.value = "之前的视频处理任务已失效，请重新上传视频。";
+      return;
+    }
+    requestError.value = extractErrorMessage(error, "无法恢复视频处理进度，请确认后端仍在运行。");
+    startVideoJobPolling(jobId);
+  }
 }
 
 function setMode(nextMode: Mode) {
@@ -1077,11 +1144,15 @@ async function handleVideoFileChange(event: Event) {
       detections: [],
       unread_samples: []
     };
+    activeVideoJobId = data.job_id;
+    storeVideoJobId(data.job_id);
     await refreshVideoJobStatus(data.job_id);
     if (!videoResult.value) {
       startVideoJobPolling(data.job_id);
     }
   } catch (error) {
+    clearStoredVideoJobId();
+    activeVideoJobId = "";
     videoResult.value = null;
     videoJob.value = null;
     requestError.value = extractErrorMessage(error, "视频识别失败，请确认视频格式可读取并稍后重试。");
@@ -1217,6 +1288,7 @@ function stopStatusPolling() {
 onMounted(async () => {
   await loadHistory();
   await refreshStreamStatus();
+  await restoreVideoJob();
   startStatusPolling();
 });
 

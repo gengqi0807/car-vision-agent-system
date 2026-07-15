@@ -251,6 +251,16 @@ class AlertService:
             )
         )
         self.db.commit()
+        self.notifier.notify_monitor_log(
+            {
+                "level": "info",
+                "source": source,
+                "event_type": "behavior_event",
+                "title": title,
+                "summary": summary,
+                "status": "recorded",
+            }
+        )
         return record
 
     def record_behavior_once(

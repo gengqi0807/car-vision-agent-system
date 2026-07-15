@@ -6,7 +6,12 @@ from email.message import EmailMessage
 from urllib import request
 
 from app.core.config import settings
+from app.core.logger import get_logger
+from app.utils.email_sender import send_email_message
 from app.utils.websocket_manager import websocket_manager
+
+
+logger = get_logger(__name__)
 
 
 class Notifier:
@@ -22,38 +27,52 @@ class Notifier:
             }
         )
 
-        if settings.alert_email_recipients:
-            results.append(self._send_email(message))
+        recipients = self._resolve_email_recipients()
+        if recipients:
+            results.append(self._send_email(message, recipients=recipients, default_subject="系统告警"))
 
         if settings.alert_webhook_url:
             results.append(self._send_webhook(message))
 
         return results
 
-    def _send_email(self, message: dict) -> dict:
+    def notify_monitor_log(self, message: dict) -> list[dict]:
+        recipients = self._resolve_email_recipients()
+        if not recipients:
+            return []
+        return [self._send_email(message, recipients=recipients, default_subject="系统日志")]
+
+    def _resolve_email_recipients(self) -> list[str]:
+        recipients = {item.strip() for item in settings.alert_email_recipients if item and item.strip()}
+        return sorted(recipients)
+
+    def _send_email(self, message: dict, *, recipients: list[str], default_subject: str) -> dict:
         if not settings.smtp_user or not settings.smtp_password:
             return {
                 "channel": "email",
-                "target": ",".join(settings.alert_email_recipients),
+                "target": ",".join(recipients),
                 "success": False,
             }
 
         email = EmailMessage()
         email["From"] = f"{settings.smtp_sender_name} <{settings.smtp_user}>"
-        email["To"] = ", ".join(settings.alert_email_recipients)
+        email["To"] = ", ".join(recipients)
         level_text = {
-            "critical": "严重",
-            "warning": "警告",
-            "info": "提示",
+            "critical": "critical",
+            "warning": "warning",
+            "info": "info",
         }.get(str(message.get("level", "info")), str(message.get("level", "info")))
-        email["Subject"] = f"[{level_text}] {message.get('title', '系统告警')}"
+        email["Subject"] = f"[{level_text}] {message.get('title', default_subject)}"
         email.set_content(
             "\n".join(
                 [
                     f"Title: {message.get('title', '')}",
                     f"Source: {message.get('source', '')}",
                     f"Event Type: {message.get('event_type', '')}",
+                    f"Status: {message.get('status', '')}",
+                    f"Confidence: {message.get('confidence', '')}",
                     f"Summary: {message.get('summary', '')}",
+                    f"Details: {json.dumps(message.get('details', {}), ensure_ascii=False)}",
                     f"Root Cause: {message.get('root_cause', '')}",
                     f"Impact Scope: {message.get('impact_scope', '')}",
                     f"Suggested Action: {message.get('suggested_action', '')}",
@@ -62,22 +81,15 @@ class Notifier:
         )
 
         try:
-            if settings.smtp_use_ssl:
-                with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=15) as server:
-                    server.login(settings.smtp_user, settings.smtp_password)
-                    server.send_message(email)
-            else:
-                with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as server:
-                    server.starttls()
-                    server.login(settings.smtp_user, settings.smtp_password)
-                    server.send_message(email)
+            send_email_message(email)
             success = True
-        except Exception:
+        except Exception as exc:
+            logger.exception("Failed to send notification email to %s: %s", ",".join(recipients), exc)
             success = False
 
         return {
             "channel": "email",
-            "target": ",".join(settings.alert_email_recipients),
+            "target": ",".join(recipients),
             "success": success,
         }
 

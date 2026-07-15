@@ -19,7 +19,10 @@ class AlertAgent:
         "plate_recognition_failure",
         "plate_recognition_timeout",
     }
+    _plate_low_confidence_event_types = {"plate_recognition_low_confidence_alert"}
     _owner_low_confidence_event_types = {"owner_gesture_low_confidence"}
+    _police_low_confidence_event_types = {"police_gesture_low_confidence_alert"}
+    _police_no_gesture_event_types = {"police_gesture_no_gesture_timeout"}
     _ignored_streak_event_types = {"behavior_event"}
 
     def __init__(self, db: Session) -> None:
@@ -133,6 +136,47 @@ class AlertAgent:
                     "threshold": settings.alert_low_confidence_window_size,
                     "observed_confidence": confidence,
                     "confidence_threshold": settings.alert_low_confidence_threshold,
+                    "observed_at": log_entry.created_at.isoformat(),
+                    "details": details,
+                },
+            }
+
+        if event_type in self._plate_low_confidence_event_types:
+            return {
+                "level": "warning",
+                "title": "车牌识别连续低置信率告警",
+                "root_cause": "车牌识别在短时间内连续多次得到低置信率结果，说明当前画面质量、目标清晰度或识别链路稳定性存在波动。",
+                "impact_scope": "会影响图片识别、视频识别和实时推流识别阶段的车牌结果稳定性，增加误识别或漏识别风险。",
+                "suggested_action": "请检查光照、车牌清晰度、拍摄角度与遮挡情况，并结合历史样本确认是否需要优化取景或输入质量。",
+                "analysis": {
+                    "observed_confidence": confidence,
+                    "observed_at": log_entry.created_at.isoformat(),
+                    "details": details,
+                },
+            }
+
+        if event_type in self._police_low_confidence_event_types:
+            return {
+                "level": "warning",
+                "title": "交警手势连续低置信率告警",
+                "root_cause": "交警手势识别在短时间内连续多次低于置信率阈值，说明当前画面质量、动作姿态或模型稳定性存在持续波动。",
+                "impact_scope": "会影响实时监控和视频识别阶段的交警手势判断稳定性，增加误识别或漏识别风险。",
+                "suggested_action": "请检查光照、人物站位、摄像头角度和模型运行状态，并结合回放画面确认是否存在遮挡或动作不完整。",
+                "analysis": {
+                    "observed_confidence": confidence,
+                    "observed_at": log_entry.created_at.isoformat(),
+                    "details": details,
+                },
+            }
+
+        if event_type in self._police_no_gesture_event_types:
+            return {
+                "level": "warning",
+                "title": "交警手势长时间无动作告警",
+                "root_cause": "交警手势模块在设定时长内未识别到任何有效动作，可能由画面空置、人体未入镜、遮挡严重或识别链路异常导致。",
+                "impact_scope": "会导致实时监控或视频分析阶段缺少可用的交警手势结果，影响后续监测与展示。",
+                "suggested_action": "请检查摄像头取景范围、人物是否完整入镜，并确认姿态模型与推流链路运行正常。",
+                "analysis": {
                     "observed_at": log_entry.created_at.isoformat(),
                     "details": details,
                 },

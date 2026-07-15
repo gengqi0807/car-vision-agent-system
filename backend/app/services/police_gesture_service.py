@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from collections import deque
 from dataclasses import dataclass
@@ -104,6 +105,8 @@ class PoliceGestureService:
     _video_cancel_events: dict[str, threading.Event] = {}
     _unrecognized_behavior_window_seconds = 30
     _video_event_min_gap_multiplier = 3
+    _warmup_lock = threading.Lock()
+    _runtime_warmed = False
 
     def __init__(self) -> None:
         self._backend_dir = Path(__file__).resolve().parents[2]
@@ -124,6 +127,21 @@ class PoliceGestureService:
         if self._legacy_classifier is None:
             self._legacy_classifier = GestureClassifier(domain="police")
         return self._legacy_classifier
+
+    def warmup_runtime(self) -> None:
+        if self._runtime_warmed:
+            return
+        with self._warmup_lock:
+            if self._runtime_warmed:
+                return
+
+            dummy_frame = np.zeros((256, 256, 3), dtype=np.uint8)
+            _ = self.legacy_pose.infer(dummy_frame)
+            _ = self.legacy_classifier
+            _ = self._runtime.recognize_image(dummy_frame)
+            with self._runtime.create_camera_session() as session:
+                _ = session.process_frame(dummy_frame)
+            self._runtime_warmed = True
 
     async def process_frame(
         self,
@@ -185,10 +203,11 @@ class PoliceGestureService:
                     window_seconds=self._unrecognized_behavior_window_seconds,
                 )
         else:
+            is_success = self._is_success_confidence(cls_conf)
             await self._capture_monitor_log(
                 event_type=(
                     "police_gesture_success"
-                    if cls_conf >= settings.alert_low_confidence_threshold
+                    if is_success
                     else "police_gesture_low_confidence"
                 ),
                 title="交警手势帧处理完成",
@@ -204,8 +223,8 @@ class PoliceGestureService:
                     "frame_height": int(frame.shape[0]),
                     "gesture": gesture_label,
                 },
-                trigger_alert=cls_conf < settings.alert_low_confidence_threshold,
-                level="info" if cls_conf >= settings.alert_low_confidence_threshold else "warning",
+                trigger_alert=False,
+                level="info" if is_success else "warning",
             )
 
         return GestureFrameResult(
@@ -292,6 +311,9 @@ class PoliceGestureService:
         last_preview_sent_at = 0.0
         inference_count = 0
         inference_elapsed_seconds = 0.0
+        low_confidence_streak = 0
+        last_low_confidence_at: float | None = None
+        no_gesture_started_at = 0.0
 
         try:
             source_path.write_bytes(video_bytes)
@@ -352,6 +374,7 @@ class PoliceGestureService:
                 return annotated_frame
 
             with self._runtime.create_video_session() as session:
+                no_gesture_started_at = time.monotonic()
                 while True:
                     if cancel_event is not None and cancel_event.is_set():
                         raise InterruptedError("视频识别已由用户终止。")
@@ -384,6 +407,94 @@ class PoliceGestureService:
                             fps=fps,
                         )
 
+                    now = time.monotonic()
+                    if self._is_effective_gesture(frame_result.gesture):
+                        no_gesture_started_at = now
+                    elif now - no_gesture_started_at >= settings.police_gesture_no_gesture_alert_seconds:
+                        self._capture_monitor_log_sync(
+                            event_type="police_gesture_no_gesture_timeout",
+                            title="交警手势长时间无动作",
+                            summary=(
+                                f"{filename} 在视频识别过程中连续 "
+                                f"{settings.police_gesture_no_gesture_alert_seconds} 秒未识别到有效动作。"
+                            ),
+                            details={
+                                "filename": filename,
+                                "task_id": resolved_task_id,
+                                "frame_index": current_frame_index,
+                                "mode": "video",
+                            },
+                            trigger_alert=True,
+                            level="warning",
+                        )
+                        no_gesture_started_at = now
+
+                    if self._is_effective_gesture(completed_gesture):
+                        no_gesture_started_at = now
+                        if self._is_success_confidence(completed_confidence):
+                            low_confidence_streak = 0
+                            last_low_confidence_at = None
+                            self._capture_monitor_log_sync(
+                                event_type="police_gesture_success",
+                                title="交警手势识别成功",
+                                summary=(
+                                    f"{filename} 成功识别动作 {self._gesture_label(completed_gesture)}，"
+                                    f"置信率 {completed_confidence:.2f}。"
+                                ),
+                                confidence=completed_confidence,
+                                details={
+                                    "filename": filename,
+                                    "task_id": resolved_task_id,
+                                    "frame_index": current_frame_index,
+                                    "gesture": completed_gesture,
+                                    "mode": "video",
+                                },
+                                trigger_alert=False,
+                                level="info",
+                            )
+                        elif self._is_low_confidence(completed_confidence):
+                            if self._should_reset_low_confidence_streak(last_low_confidence_at, now):
+                                low_confidence_streak = 0
+                            low_confidence_streak += 1
+                            last_low_confidence_at = now
+                            reached_streak_threshold = (
+                                low_confidence_streak >= settings.police_gesture_low_confidence_streak
+                            )
+                            self._capture_monitor_log_sync(
+                                event_type=(
+                                    "police_gesture_low_confidence_alert"
+                                    if reached_streak_threshold
+                                    else "police_gesture_low_confidence"
+                                ),
+                                title=(
+                                    "交警手势连续低置信率告警"
+                                    if reached_streak_threshold
+                                    else "交警手势低置信率"
+                                ),
+                                summary=(
+                                    f"{filename} 识别到动作 {self._gesture_label(completed_gesture)}，"
+                                    f"但置信率仅 {completed_confidence:.2f}，"
+                                    f"连续低置信次数 {low_confidence_streak}。"
+                                ),
+                                confidence=completed_confidence,
+                                details={
+                                    "filename": filename,
+                                    "task_id": resolved_task_id,
+                                    "frame_index": current_frame_index,
+                                    "gesture": completed_gesture,
+                                    "mode": "video",
+                                    "low_confidence_streak": low_confidence_streak,
+                                },
+                                trigger_alert=reached_streak_threshold,
+                                level="warning",
+                            )
+                            if reached_streak_threshold:
+                                low_confidence_streak = 0
+                                last_low_confidence_at = None
+                        else:
+                            low_confidence_streak = 0
+                            last_low_confidence_at = None
+
                     annotated = annotate_and_write_frame(current_frame_index, frame_result.annotated_frame)
                     preview_publisher.submit(
                         current_frame_index,
@@ -399,7 +510,6 @@ class PoliceGestureService:
                             (inference_elapsed_seconds * 1000 / inference_count) if inference_count > 0 else 0.0,
                         )
 
-                    now = time.monotonic()
                     should_push_preview = (
                         processed_frame_count == 1
                         or now - last_preview_sent_at >= preview_interval_seconds
@@ -643,9 +753,58 @@ class PoliceGestureService:
             "无手势",
         }:
             return False
-        if confidence < max(settings.alert_low_confidence_threshold, 0.72):
+        if confidence < settings.police_gesture_success_confidence_threshold:
             return False
         return True
+
+    @staticmethod
+    def _is_effective_gesture(gesture: str | None) -> bool:
+        return gesture not in {
+            None,
+            "",
+            NO_VIDEO_GESTURE,
+            NO_POSE_GESTURE,
+            "no_pose",
+            "unknown",
+            "other",
+        }
+
+    @staticmethod
+    def _is_success_confidence(confidence: float) -> bool:
+        return float(confidence) >= settings.police_gesture_success_confidence_threshold
+
+    @staticmethod
+    def _is_low_confidence(confidence: float) -> bool:
+        return 0.0 < float(confidence) < settings.police_gesture_low_confidence_threshold
+
+    @staticmethod
+    def _should_reset_low_confidence_streak(last_low_confidence_at: float | None, current_time: float) -> bool:
+        if last_low_confidence_at is None:
+            return True
+        return (current_time - last_low_confidence_at) > settings.police_gesture_low_confidence_window_seconds
+
+    def _capture_monitor_log_sync(
+        self,
+        *,
+        event_type: str,
+        title: str,
+        summary: str,
+        confidence: float | None = None,
+        details: dict | None = None,
+        trigger_alert: bool = False,
+        level: str = "info",
+    ) -> None:
+        asyncio.run(
+            self._capture_monitor_log(
+                event_type=event_type,
+                title=title,
+                summary=summary,
+                confidence=confidence,
+                details=details,
+                trigger_alert=trigger_alert,
+                level=level,
+            )
+        )
 
     def get_video_progress(self, task_id: str) -> PoliceGestureVideoProgress:
         with self._progress_lock:

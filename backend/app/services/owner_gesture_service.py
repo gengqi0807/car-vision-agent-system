@@ -269,7 +269,7 @@ class OwnerGestureService:
     _max_annotated_edge = 1024
     _hold_frame_count = 2
     _trigger_cooldown = timedelta(seconds=2)
-    _idle_behavior_interval = timedelta(seconds=30)
+    _idle_behavior_interval = timedelta(seconds=settings.owner_gesture_no_gesture_alert_seconds)
     _camera_grace_frames = 8
     _continuous_volume_interval_seconds = 0.55
     _default_panel_state = {
@@ -525,6 +525,7 @@ class OwnerGestureService:
                 gesture=gesture_label,
                 confidence=cls_conf,
                 action=action,
+                draw_summary=False,
             )
 
         response_keypoints_source = primary_hand if primary_hand else raw_kps
@@ -533,6 +534,7 @@ class OwnerGestureService:
             for kp in response_keypoints_source
         ]
         updated_at = datetime.utcnow()
+        idle_behavior_due = False
         if input_mode == "camera" and runtime_session is not None:
             panel_state = self._update_runtime_session(
                 runtime_session,
@@ -851,11 +853,33 @@ class OwnerGestureService:
                         control_command=control_command,
                         observed_gesture=observed_gesture,
                     )
+                    observed_at = datetime.now(timezone.utc)
+                    idle_behavior_due = self._consume_idle_behavior_interval(
+                        self._stream_runtime_session,
+                        gesture=gesture,
+                        control_command=control_command if should_fire else None,
+                        observed_at=observed_at,
+                    )
+                    if idle_behavior_due:
+                        self._capture_monitor_log_sync(
+                            event_type="owner_gesture_no_gesture_timeout",
+                            title="车主手势长时间无动作",
+                            summary=(
+                                f"实时监控已开启，但连续 "
+                                f"{settings.owner_gesture_no_gesture_alert_seconds} 秒未识别到有效手势。"
+                            ),
+                            details={
+                                "source": resolved_source,
+                                "mode": "realtime",
+                            },
+                            trigger_alert=True,
+                            level="warning",
+                        )
 
                     panel_state = self._update_live_panel_state(
                         gesture=gesture,
                         control_command=control_command if should_fire else None,
-                        updated_at=datetime.now(timezone.utc),
+                        updated_at=observed_at,
                     )
                     annotated_frame = verify_draw_result(
                         inference_frame.copy(),
@@ -905,7 +929,7 @@ class OwnerGestureService:
                         control_command=control_command if should_fire else None,
                         triggered=should_fire,
                         panel_state=panel_state,
-                        updated_at=datetime.now(timezone.utc),
+                        updated_at=observed_at,
                     )
 
                     with self._stream_lock:
@@ -1676,6 +1700,7 @@ class OwnerGestureService:
         confidence: float,
         action: str | None = None,
         control_command: str | None = None,
+        draw_summary: bool = True,
     ) -> np.ndarray:
         annotated = frame.copy()
         height, width = annotated.shape[:2]
@@ -1686,9 +1711,10 @@ class OwnerGestureService:
         point_radius = 4 if longest_edge < 900 else 5 if longest_edge < 1400 else 7
         line_thickness = 1 if longest_edge < 900 else 2
 
-        overlay = annotated.copy()
-        cv2.rectangle(overlay, (0, 0), (width, header_height), (0, 0, 0), -1)
-        annotated = cv2.addWeighted(overlay, 0.45, annotated, 0.55, 0)
+        if draw_summary:
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, (0, 0), (width, header_height), (0, 0, 0), -1)
+            annotated = cv2.addWeighted(overlay, 0.45, annotated, 0.55, 0)
 
         for hand in hands:
             points: list[tuple[int, int]] = []
@@ -1710,6 +1736,9 @@ class OwnerGestureService:
             for index, point in enumerate(points):
                 color = (0, 255, 255) if index in {4, 8, 12, 16, 20} else (255, 255, 255)
                 cv2.circle(annotated, point, point_radius, color, -1, cv2.LINE_AA)
+
+        if not draw_summary:
+            return annotated
 
         gesture_text = GESTURE_DISPLAY_MAP.get(gesture, gesture)
         if action is None:
@@ -2122,6 +2151,29 @@ class OwnerGestureService:
                 details=details,
                 trigger_alert=trigger_alert,
             )
+
+    def _capture_monitor_log_sync(
+        self,
+        *,
+        event_type: str,
+        title: str,
+        summary: str,
+        confidence: float | None = None,
+        details: dict | None = None,
+        trigger_alert: bool = False,
+        level: str = "info",
+    ) -> None:
+        asyncio.run(
+            self._capture_monitor_log(
+                event_type=event_type,
+                title=title,
+                summary=summary,
+                confidence=confidence,
+                details=details,
+                trigger_alert=trigger_alert,
+                level=level,
+            )
+        )
 
     async def _capture_error(self, filename: str, event_type: str, summary: str) -> None:
         with SessionLocal() as session:

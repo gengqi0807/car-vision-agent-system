@@ -294,6 +294,7 @@
               <span class="behavior-source">{{ getSourceLabel(log.source) }}</span>
               <div class="title">{{ localizeLogTitle(log.title) }}</div>
               <div class="desc clamp-2">{{ localizeLogSummary(log.summary) }}</div>
+              <div v-if="formatMonitorDetailText(log)" class="desc detail-line">{{ formatMonitorDetailText(log) }}</div>
               <div class="desc">
                 {{ localizeEventType(log.event_type) }} · {{ localizeStatus(log.status) || "无状态" }}
                 <template v-if="typeof log.confidence === 'number'"> · 置信度 {{ log.confidence.toFixed(2) }}</template>
@@ -724,6 +725,34 @@ function getSourceLabel(source: string) {
     return "用户认证";
   }
   return source;
+}
+
+function formatMonitorDetailText(log: MonitorLogRecord) {
+  const details = log.details ?? {};
+  const parts: string[] = [];
+
+  const pushPart = (label: string, value: unknown) => {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      parts.push(`${label}${value}`);
+      return;
+    }
+    if (typeof value === "string" && value.trim()) {
+      parts.push(`${label}${value.trim()}`);
+    }
+  };
+
+  pushPart("手势名称：", details.gesture_display_name ?? details.gesture_name);
+  pushPart("成功上传：", details.accepted_count);
+  pushPart("拒绝：", details.rejected_count);
+  pushPart("当前数据集：", details.dataset_sample_count ?? details.sample_count);
+  pushPart("训练手势数：", details.gesture_count);
+
+  const gestureNames = details.gesture_names;
+  if (Array.isArray(gestureNames) && gestureNames.length > 0) {
+    parts.push(`训练手势：${gestureNames.join("、")}`);
+  }
+
+  return parts.join(" | ");
 }
 
 function buildBarHeight(value: number) {
